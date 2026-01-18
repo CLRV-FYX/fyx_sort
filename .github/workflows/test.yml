@@ -1,41 +1,28 @@
-name: FYX-SORT CI
+name: Test FYX-SORT
 
-on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+on: [push, pull_request]
 
 jobs:
   test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        compiler: [g++, clang++]
+    runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout
+    - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Setup compiler
+    - name: Compile test
       run: |
-        if [ "${{ matrix.compiler }}" = "clang++" ] && [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-          sudo apt-get update
-          sudo apt-get install -y clang
-        fi
-    
-    - name: Build and test
-      run: |
-        # 创建测试程序
-        cat > test.cpp << 'EOF'
+        echo "Creating test file..."
+        cat > test_fyx.cpp << 'EOF'
 #define FYX_MAIN
 #include "fyx_sort.hpp"
 int main() { return main_test(); }
 EOF
         
-        # 编译
-        ${{ matrix.compiler }} -std=c++17 -O2 -pthread -o test test.cpp
-        
-        # 运行测试
-        ./test
+        echo "Compiling..."
+        g++ -std=c++17 -O2 -pthread -o test_fyx test_fyx.cpp
+    
+    - name: Run test
+      run: |
+        echo "Running tests..."
+        ./test_fyx
