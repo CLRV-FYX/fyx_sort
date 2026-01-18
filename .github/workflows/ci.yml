@@ -2,7 +2,7 @@ name: FYX-SORT Benchmark vs IPS⁴o
 
 on:
   push:
-    branches: [ main, dev ]
+    branches: [ main ]
   pull_request:
     branches: [ main ]
 
@@ -25,23 +25,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++ clang
 
-      - name: Download IPS⁴o (temporary, MIT licensed)
-        shell: bash
+      - name: Download IPS⁴o (temporary)
         run: |
           curl -fsSL -o ips4o.hpp https://raw.githubusercontent.com/SaschaWitt/ips4o/master/include/ips4o.hpp
 
       - name: Build and run benchmark (Linux/macOS)
         if: runner.os != 'Windows'
-        shell: bash
         run: |
-          g++ -O3 -march=native -std=c++17 -DNDEBUG -pthread -DFYX_MAIN -I. benchmark.cpp -o bench
+          g++ -O3 -march=native -std=c++17 -DNDEBUG -pthread -I. benchmark.cpp -o bench
           ./bench
 
       - name: Build and run benchmark (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: |
-          cl /EHsc /std:c++17 /O2 /DNDEBUG /DFYX_MAIN /I. benchmark.cpp
+          cl /EHsc /std:c++17 /O2 /DNDEBUG /I. benchmark.cpp
           .\benchmark.exe
 
       - name: Upload benchmark report
