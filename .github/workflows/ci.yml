@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        compiler: 
+          - {name: gcc, cmd: g++}
+          - {name: clang, cmd: clang++}
+        exclude:
+          # Windows 上不用 gcc/clang，用 MSVC
+          - os: windows-latest
+            compiler: {name: gcc, cmd: g++}
+          - os: windows-latest
+            compiler: {name: clang, cmd: clang++}
+          # macOS 上不用 MSVC
+        include:
+          # Windows 上添加 MSVC
+          - os: windows-latest
+            compiler: {name: msvc, cmd: cl}
+          # 添加不同版本的 GCC
+          - os: ubuntu-latest
+            compiler: {name: gcc-11, cmd: g++-11}
+          - os: ubuntu-latest
+            compiler: {name: gcc-12, cmd: g++-12}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Setup environment
+      run: |
+        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+          sudo apt-get update
+          if [ "${{ matrix.compiler.name }}" = "gcc-11" ]; then
+            sudo apt-get install -y g++-11
+          elif [ "${{ matrix.compiler.name }}" = "gcc-12" ]; then
+            sudo apt-get install -y g++-12
+          fi
+        fi
+    
+    - name: Compile test
+      shell: bash
+      run: |
+        echo "Testing with ${{ matrix.compiler.name }} on ${{ matrix.os }}"
+        
+        if [ "${{ matrix.os }}" = "windows-latest" ] && [ "${{ matrix.compiler.name }}" = "msvc" ]; then
+          # MSVC on Windows
+          cl /std:c++17 /EHsc /O2 /DFYX_MAIN /I. fyx_sort.hpp /Fe:test_fyx.exe
+        else
+          # GCC/Clang on Linux/macOS
+          ${{ matrix.compiler.cmd }} -std=c++17 -O2 -DFYX_MAIN -o test_fyx fyx_sort.hpp
+        fi
+    
+    - name: Run tests
+      shell: bash
+      run: |
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          ./test_fyx.exe
+        else
+          ./test_fyx
+        fi
+    
+    - name: Upload test artifacts (on failure)
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-failure-${{ matrix.os }}-${{ matrix.compiler.name }}
+        path: |
+          test_fyx
+          test_fyx.exe
