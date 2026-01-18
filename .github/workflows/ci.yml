@@ -1,4 +1,4 @@
-name: FYX-SORT Build and Benchmark
+name: FYX-SORT Benchmark
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build-and-test:
     strategy:
       fail-fast: false
       matrix:
@@ -23,13 +23,13 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y g++
 
-      - name: Build and run (Linux/macOS)
+      - name: Build and run benchmark (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
-          c++ -O3 -march=native -std=c++17 -DNDEBUG -pthread -DFYX_MAIN -I. fyx_sort.hpp -o fyx_bench
+          g++ -O3 -march=native -std=c++17 -DNDEBUG -pthread -DFYX_MAIN -I. fyx_sort.hpp -o fyx_bench
           ./fyx_bench
 
-      - name: Build and run (Windows)
+      - name: Build and run benchmark (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: |
