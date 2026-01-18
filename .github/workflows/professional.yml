@@ -1,4 +1,4 @@
-name: Professional CI
+name: Professional CI/CD
 
 on:
   push:
@@ -6,276 +6,588 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: '0 2 * * 0'  # 每周日早上2点运行
+    # 每周日早上2点运行（UTC时间）
+    - cron: '0 2 * * 0'
+  workflow_dispatch:  # 允许手动触发
+    inputs:
+      reason:
+        description: '手动触发的原因'
+        required: false
+        default: 'Manual trigger'
 
+# 并发控制：同一分支的多个运行会被取消，只保留最新的
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# 环境变量可以在所有作业中使用
+env:
+  BUILD_TYPE: Release
+  CC: gcc
+  CXX: g++
+
 jobs:
-  unit-tests:
+  # 代码质量和安全检查
+  lint-and-security:
+    name: Lint & Security
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     
-    - name: Install dependencies
+    - name: Check file headers
       run: |
+        echo "📄 检查文件头..."
+        if ! grep -q "Apache License" fyx_sort.hpp; then
+          echo "❌ 文件头缺少许可证声明"
+          exit 1
+        fi
+        echo "✅ 文件头检查通过"
+    
+    - name: Run clang-tidy
+      if: always()
+      run: |
+        echo "🔍 运行 clang-tidy..."
         sudo apt-get update
-        sudo apt-get install -y g++-12 gcovr lcov
+        sudo apt-get install -y clang-tidy-15
+        # 只检查主要文件
+        clang-tidy-15 fyx_sort.hpp -- \
+          -std=c++17 -I. -DFYX_MAIN \
+          -Wall -Wextra -Werror 2>&1 | tee clang-tidy-report.txt || true
+    
+    - name: Upload clang-tidy report
+      uses: actions/upload-artifact@v4
+      with:
+        name: clang-tidy-report
+        path: clang-tidy-report.txt
+        retention-days: 7
+
+  # 编译测试 - 跨平台多配置
+  build-and-test:
+    name: Build & Test (${{ matrix.os }} - ${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    needs: lint-and-security
+    strategy:
+      fail-fast: false  # 一个失败不会停止其他配置
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        compiler: [gcc, clang, msvc]
+        exclude:
+          - os: windows-latest
+            compiler: gcc
+          - os: windows-latest
+            compiler: clang
+          - os: macos-latest
+            compiler: msvc
+        include:
+          # 添加更多C++标准版本
+          - os: ubuntu-latest
+            compiler: gcc
+            cpp_std: 17
+          - os: ubuntu-latest
+            compiler: gcc
+            cpp_std: 20
+          - os: ubuntu-latest
+            compiler: clang
+            cpp_std: 17
+          - os: windows-latest
+            compiler: msvc
+            cpp_std: 17
+          - os: macos-latest
+            compiler: clang
+            cpp_std: 17
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup compiler
+      run: |
+        echo "🔧 设置编译器: ${{ matrix.compiler }}"
+        
+        if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+          sudo apt-get update
+          if [[ "${{ matrix.compiler }}" == "gcc" ]]; then
+            sudo apt-get install -y g++-12
+            sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100
+            sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100
+          elif [[ "${{ matrix.compiler }}" == "clang" ]]; then
+            sudo apt-get install -y clang-15
+            sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 100
+            sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 100
+          fi
+        fi
+        
+        # 设置环境变量
+        echo "CXX_STD=c++${{ matrix.cpp_std }}" >> $GITHUB_ENV
+        
+        if [[ "${{ matrix.compiler }}" == "msvc" ]]; then
+          echo "COMPILER_CMD=cl" >> $GITHUB_ENV
+          echo "COMPILER_FLAGS=/std:c++${{ matrix.cpp_std }} /EHsc /O2" >> $GITHUB_ENV
+          echo "BINARY_EXT=.exe" >> $GITHUB_ENV
+        else
+          if [[ "${{ matrix.compiler }}" == "gcc" ]]; then
+            echo "COMPILER_CMD=g++" >> $GITHUB_ENV
+          else
+            echo "COMPILER_CMD=clang++" >> $GITHUB_ENV
+          fi
+          echo "COMPILER_FLAGS=-std=c++${{ matrix.cpp_std }} -O2 -Wall -Wextra" >> $GITHUB_ENV
+          echo "BINARY_EXT=" >> $GITHUB_ENV
+        fi
+    
+    - name: Compile test program
+      run: |
+        echo "📦 编译测试程序..."
+        
+        if [[ "${{ matrix.compiler }}" == "msvc" ]]; then
+          # Windows MSVC
+          "${{ env.COMPILER_CMD }}" ${{ env.COMPILER_FLAGS }} /DFYX_MAIN /I. \
+            fyx_sort.hpp /Fe:test_fyx${{ env.BINARY_EXT }}
+        else
+          # Linux/macOS GCC/Clang
+          "${{ env.COMPILER_CMD }}" ${{ env.COMPILER_FLAGS }} -DFYX_MAIN \
+            -o test_fyx${{ env.BINARY_EXT }} fyx_sort.hpp
+        fi
+        
+        echo "✅ 编译完成"
+    
+    - name: Run tests
+      run: |
+        echo "🧪 运行测试..."
+        
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          ./test_fyx.exe
+        else
+          timeout 30s ./test_fyx
+        fi
+        
+        echo "✅ 测试通过"
+    
+    - name: Upload test artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-binary-${{ matrix.os }}-${{ matrix.compiler }}-cpp${{ matrix.cpp_std }}
+        path: |
+          test_fyx*
+        retention-days: 3
+
+  # 代码覆盖率分析
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup coverage tools
+      run: |
+        echo "📊 设置覆盖率工具..."
+        sudo apt-get update
+        sudo apt-get install -y gcovr lcov g++-12
         
     - name: Compile with coverage
       run: |
         g++-12 -std=c++20 -O0 -g --coverage -fprofile-arcs -ftest-coverage \
           -DFYX_MAIN -o test_coverage fyx_sort.hpp
-    
+        
     - name: Run tests with coverage
       run: |
+        echo "🔍 运行覆盖率测试..."
         ./test_coverage
+        echo "✅ 覆盖率测试完成"
         
     - name: Generate coverage report
       run: |
+        echo "📈 生成覆盖率报告..."
+        
+        # 生成 LCOV 报告
+        lcov --capture --directory . --output-file coverage.info
+        lcov --remove coverage.info '/usr/*' --output-file coverage.info
+        lcov --list coverage.info
+        
+        # 生成 HTML 报告
+        genhtml coverage.info --output-directory coverage
+        
+        # 使用 gcovr 生成 XML 报告
         gcovr --exclude-throw-branches --exclude-unreachable-branches \
           --print-summary --xml-pretty --xml coverage.xml \
-          --html-details coverage.html
-          
-    - name: Upload coverage to Codecov
+          --html-details coverage-gcovr.html
+        
+        echo "📊 覆盖率统计:"
+        gcovr --branches --print-summary
+    
+    - name: Upload coverage report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: |
+          coverage/
+          coverage-gcovr.html
+          coverage.xml
+          coverage.info
+        retention-days: 30
+    
+    - name: Upload to Codecov
       uses: codecov/codecov-action@v3
       with:
         files: ./coverage.xml
         flags: unittests
-        
-    - name: Upload coverage report
-      uses: actions/upload-artifact@v3
-      with:
-        name: coverage-report
-        path: |
-          coverage.html
-          coverage.xml
+        name: codecov-umbrella
 
-  clang-tidy:
+  # 性能基准测试
+  benchmark:
+    name: Performance Benchmark
     runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    # 只在特定条件下运行，避免每次提交都运行
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v4
     
-    - name: Install clang-tidy
-      run: sudo apt-get install -y clang-tidy-14
-        
-    - name: Run clang-tidy
+    - name: Setup benchmark environment
       run: |
-        clang-tidy-14 fyx_sort.hpp -- \
-          -std=c++17 -I. -DFYX_MAIN 2>&1 | tee clang-tidy-report.txt
-        
-    - name: Upload clang-tidy report
-      uses: actions/upload-artifact@v3
-      with:
-        name: clang-tidy-report
-        path: clang-tidy-report.txt
-
-  cross-platform:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-20.04, ubuntu-22.04, windows-2022, macos-12]
-        include:
-          - os: ubuntu-20.04
-            compiler: g++-9
-          - os: ubuntu-22.04
-            compiler: g++-11
-          - os: windows-2022
-            compiler: cl
-          - os: macos-12
-            compiler: clang++
-            
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Setup Windows
-      if: matrix.os == 'windows-2022'
-      uses: ilammy/msvc-dev-cmd@v1
-      
-    - name: Install compiler (Linux)
-      if: startsWith(matrix.os, 'ubuntu')
-      run: |
+        echo "⚡ 设置基准测试环境..."
         sudo apt-get update
-        sudo apt-get install -y ${{ matrix.compiler }}
+        sudo apt-get install -y python3 python3-pip python3-venv
         
-    - name: Compile
-      shell: bash
+        # 创建虚拟环境
+        python3 -m venv venv
+        source venv/bin/activate
+        pip install matplotlib pandas numpy
+    
+    - name: Run benchmark script
+      id: benchmark
       run: |
-        echo "Testing on ${{ matrix.os }} with ${{ matrix.compiler }}"
+        source venv/bin/activate
         
-        if [ "${{ matrix.os }}" == "windows-2022" ]; then
-          cl /std:c++17 /O2 /DFYX_MAIN /I. fyx_sort.hpp /Fe:test_fyx.exe
-          ./test_fyx.exe
-        else
-          ${{ matrix.compiler }} -std=c++17 -O2 -DFYX_MAIN -o test_fyx fyx_sort.hpp
-          ./test_fyx
-        fi
+        echo "🏃 运行基准测试..."
+        
+        # 创建一个简单的基准测试脚本
+        cat > benchmark.py << 'PYTHON_EOF'
+#!/usr/bin/env python3
+"""
+FYX-SORT 性能基准测试
+"""
+import subprocess
+import json
+import time
+import statistics
+import sys
+from pathlib import Path
 
-  performance-benchmark:
-    runs-on: ubuntu-latest
-    needs: [unit-tests, cross-platform]
+def run_benchmark(name, compile_cmd, run_cmd, iterations=3):
+    """运行单个基准测试"""
+    print(f"\\n🔧 测试: {name}")
     
-    steps:
-    - uses: actions/checkout@v3
+    # 编译
+    print(f"  编译命令: {compile_cmd}")
+    compile_result = subprocess.run(compile_cmd, shell=True, capture_output=True)
+    if compile_result.returncode != 0:
+        print(f"  ❌ 编译失败: {compile_result.stderr.decode()}")
+        return None
     
-    - name: Install benchmark tools
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y python3-pip
-        pip3 install matplotlib pandas
+    # 运行多次取平均值
+    times = []
+    for i in range(iterations):
+        start = time.perf_counter()
+        run_result = subprocess.run(run_cmd, shell=True, capture_output=True)
+        end = time.perf_counter()
         
-    - name: Run performance comparison
-      run: |
-        cat > benchmark.py << 'EOF'
-        import subprocess
-        import time
-        import json
-        import statistics
+        if run_result.returncode == 0:
+            elapsed = (end - start) * 1000  # 转换为毫秒
+            times.append(elapsed)
+            print(f"  运行 {i+1}: {elapsed:.2f}ms")
+        else:
+            print(f"  运行 {i+1}: 失败 - {run_result.stderr.decode()}")
+    
+    if times:
+        avg = statistics.mean(times)
+        std = statistics.stdev(times) if len(times) > 1 else 0
+        print(f"  平均: {avg:.2f}ms ± {std:.2f}ms")
+        return {"avg": avg, "std": std, "times": times}
+    return None
+
+def main():
+    """主函数"""
+    print("🚀 开始 FYX-SORT 性能基准测试")
+    
+    results = {}
+    base_dir = Path(".")
+    
+    # 1. 编译测试程序
+    test_programs = {
+        "int_sort": "test_int.cpp",
+        "string_sort": "test_string.cpp",
+        "large_obj_sort": "test_large.cpp"
+    }
+    
+    # 创建测试程序
+    for test_name, filename in test_programs.items():
+        if test_name == "int_sort":
+            code = '''
+#include "fyx_sort.hpp"
+#include <vector>
+#include <random>
+#include <chrono>
+#include <iostream>
+
+int main() {
+    const size_t N = 1000000;
+    std::vector<int> data(N);
+    std::mt19937 rng(42);
+    for (auto& x : data) x = rng();
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    fyx::sort(data);
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::cout << ms.count();
+    return 0;
+}
+'''
+        elif test_name == "string_sort":
+            code = '''
+#include "fyx_sort.hpp"
+#include <vector>
+#include <string>
+#include <random>
+#include <chrono>
+#include <iostream>
+
+int main() {
+    const size_t N = 100000;
+    std::vector<std::string> data(N);
+    std::mt19937 rng(42);
+    
+    for (auto& s : data) {
+        s.resize(10 + rng() % 20);
+        for (char& c : s) c = 'a' + (rng() % 26);
+    }
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    fyx::sort(data);
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::cout << ms.count();
+    return 0;
+}
+'''
+        else:  # large_obj_sort
+            code = '''
+#include "fyx_sort.hpp"
+#include <vector>
+#include <random>
+#include <chrono>
+#include <iostream>
+
+struct LargeObject {
+    int key;
+    char data[256];
+    bool operator<(const LargeObject& other) const { return key < other.key; }
+};
+
+int main() {
+    const size_t N = 50000;
+    std::vector<LargeObject> data(N);
+    std::mt19937 rng(42);
+    
+    for (auto& obj : data) {
+        obj.key = rng();
+    }
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    fyx::sort(data);
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::cout << ms.count();
+    return 0;
+}
+'''
         
-        def benchmark(name, compile_cmd, run_cmd, iterations=3):
-            print(f"\n🔧 Benchmarking: {name}")
-            
-            # 编译
-            compile_result = subprocess.run(compile_cmd, shell=True, capture_output=True)
-            if compile_result.returncode != 0:
-                print(f"❌ Compilation failed: {compile_result.stderr.decode()}")
-                return None
-            
-            # 运行多次取平均值
-            times = []
-            for i in range(iterations):
-                start = time.perf_counter()
-                run_result = subprocess.run(run_cmd, shell=True, capture_output=True)
-                end = time.perf_counter()
-                
-                if run_result.returncode == 0:
-                    elapsed = end - start
-                    times.append(elapsed)
-                    print(f"  Run {i+1}: {elapsed:.2f}s")
-                else:
-                    print(f"  Run {i+1}: Failed")
-            
-            if times:
-                avg = statistics.mean(times)
-                std = statistics.stdev(times) if len(times) > 1 else 0
-                print(f"  Average: {avg:.2f}s ± {std:.2f}s")
-                return avg
-            return None
+        with open(base_dir / filename, "w") as f:
+            f.write(code)
+        print(f"✅ 创建测试程序: {filename}")
+    
+    # 2. 运行基准测试
+    for test_name, filename in test_programs.items():
+        compile_cmd = f"g++ -std=c++17 -O3 -march=native -I. {filename} -o {test_name}"
+        run_cmd = f"./{test_name}"
         
-        # 比较 FYX-SORT 和 std::sort
-        results = {}
-        
-        # 编译测试程序
-        with open("test_perf.cpp", "w") as f:
-            f.write("""
-            #include "fyx_sort.hpp"
-            #include <vector>
-            #include <random>
-            #include <chrono>
-            #include <iostream>
-            #include <algorithm>
-            
-            int main() {
-                const size_t N = 1000000;
-                std::vector<int> data(N);
-                std::mt19937 rng(42);
-                std::generate(data.begin(), data.end(), rng);
-                
-                // Test FYX-SORT
-                auto fyx_data = data;
-                auto start = std::chrono::high_resolution_clock::now();
-                fyx::sort(fyx_data);
-                auto end = std::chrono::high_resolution_clock::now();
-                auto fyx_time = std::chrono::duration<double>(end - start).count();
-                
-                // Test std::sort
-                auto std_data = data;
-                start = std::chrono::high_resolution_clock::now();
-                std::sort(std_data.begin(), std_data.end());
-                end = std::chrono::high_resolution_clock::now();
-                auto std_time = std::chrono::duration<double>(end - start).count();
-                
-                std::cout << fyx_time << " " << std_time;
-                return 0;
-            }
-            """)
+        result = run_benchmark(test_name, compile_cmd, run_cmd, 3)
+        if result:
+            results[test_name] = result
+    
+    # 3. 保存结果
+    with open("benchmark_results.json", "w") as f:
+        json.dump({
+            "timestamp": time.time(),
+            "commit": sys.argv[1] if len(sys.argv) > 1 else "unknown",
+            "results": results
+        }, f, indent=2)
+    
+    print(f"\\n📊 基准测试完成! 结果保存到 benchmark_results.json")
+    
+    # 输出摘要
+    print("\\n📈 性能摘要:")
+    for test_name, result in results.items():
+        print(f"  {test_name}: {result['avg']:.2f}ms ± {result['std']:.2f}ms")
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYTHON_EOF
         
         # 运行基准测试
-        compile_cmd = "g++ -std=c++17 -O3 -march=native -I. test_perf.cpp -o test_perf"
-        run_cmd = "./test_perf"
+        python3 benchmark.py "${{ github.sha }}"
+    
+    - name: Generate benchmark report
+      run: |
+        echo "📊 生成基准测试报告..."
+        source venv/bin/activate
         
-        result = subprocess.run(f"{compile_cmd} && {run_cmd}", shell=True, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            fyx_time, std_time = map(float, result.stdout.strip().split())
-            speedup = std_time / fyx_time if fyx_time > 0 else 0
-            results = {
-                "fyx_time": fyx_time,
-                "std_time": std_time,
-                "speedup": speedup,
-                "status": "success"
-            }
-            print(f"\n✅ Performance results:")
-            print(f"   FYX-SORT: {fyx_time:.3f}s")
-            print(f"   std::sort: {std_time:.3f}s")
-            print(f"   Speedup: {speedup:.2f}x")
-        else:
-            results = {"status": "failed", "error": result.stderr}
-            print(f"\n❌ Performance test failed: {result.stderr}")
-        
-        # 保存结果
-        with open("benchmark_results.json", "w") as f:
-            json.dump(results, f, indent=2)
-        EOF
-        
-        python3 benchmark.py
-        
-    - name: Upload benchmark data
-      uses: actions/upload-artifact@v3
+        # 简单的报告生成
+        if [ -f "benchmark_results.json" ]; then
+          python3 -c "
+import json
+import sys
+
+with open('benchmark_results.json') as f:
+    data = json.load(f)
+
+print('# 🚀 FYX-SORT 性能基准测试报告')
+print(f'**提交:** {data[\"commit\"][:8]}')
+print(f'**时间:** {data[\"timestamp\"]}')
+print('')
+print('## 测试结果')
+print('| 测试类型 | 平均时间 (ms) | 标准差 (ms) |')
+print('|----------|--------------|------------|')
+
+for test_name, result in data['results'].items():
+    avg = result['avg']
+    std = result['std']
+    print(f'| {test_name} | {avg:.2f} | {std:.2f} |')
+
+print('')
+print('## 说明')
+print('- **int_sort**: 排序 1,000,000 个随机整数')
+print('- **string_sort**: 排序 100,000 个随机字符串 (10-30字符)')
+print('- **large_obj_sort**: 排序 50,000 个大对象 (260字节)')
+          " | tee benchmark_summary.md
+        else
+          echo "❌ 基准测试结果文件不存在"
+        fi
+    
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
       with:
-        name: performance-results
+        name: benchmark-results
         path: |
           benchmark_results.json
+          benchmark_summary.md
+          *.cpp  # 测试程序源文件
+        retention-days: 30
 
-  deploy-docs:
+  # 发布工作流（只在打标签时运行）
+  release:
+    name: Create Release
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    needs: [unit-tests, performance-benchmark]
+    needs: [coverage, benchmark]
+    # 只在推送标签时运行
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    permissions:
+      contents: write  # 需要写权限来创建发布
+      packages: write
+      attestations: write
+      id-token: write
     
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Generate documentation
-      run: |
-        # 创建简单的 HTML 文档
-        mkdir -p docs
-        cat > docs/index.html << 'EOF'
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>FYX-SORT Documentation</title>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 40px; }
-                pre { background: #f4f4f4; padding: 10px; border-radius: 5px; }
-            </style>
-        </head>
-        <body>
-            <h1>FYX-SORT v2.0</h1>
-            <p>Last updated: $(date)</p>
-            <p>Commit: ${{ github.sha }}</p>
-            <h2>Quick Start</h2>
-            <pre><code>#include "fyx_sort.hpp"
-// That's it!</code></pre>
-        </body>
-        </html>
-        EOF
-        
-    - name: Deploy to GitHub Pages
-      uses: peaceiris/actions-gh-pages@v3
+    - name: Checkout code
+      uses: actions/checkout@v4
       with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        publish_dir: ./docs
+        fetch-depth: 0
+    
+    - name: Extract version
+      id: get_version
+      run: |
+        VERSION="${GITHUB_REF#refs/tags/v}"
+        echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+    
+    - name: Create release package
+      run: |
+        echo "📦 创建发布包 v${{ env.VERSION }}..."
+        
+        # 创建发布目录
+        mkdir -p fyx-sort-${{ env.VERSION }}
+        
+        # 复制必要文件
+        cp README.md LICENSE fyx_sort.hpp fyx-sort-${{ env.VERSION }}/
+        
+        # 创建压缩包
+        tar -czf fyx-sort-${{ env.VERSION }}.tar.gz fyx-sort-${{ env.VERSION }}
+        zip -r fyx-sort-${{ env.VERSION }}.zip fyx-sort-${{ env.VERSION }}
+        
+        # 创建单文件版本（便于直接包含）
+        cp fyx_sort.hpp fyx-sort-v${{ env.VERSION }}.hpp
+        
+        echo "✅ 发布包创建完成"
+    
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          fyx-sort-${{ env.VERSION }}.tar.gz
+          fyx-sort-${{ env.VERSION }}.zip
+          fyx-sort-v${{ env.VERSION }}.hpp
+        generate_release_notes: true
+        prerelease: ${{ contains(env.VERSION, '-') }}
+        draft: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 总结报告（总是运行）
+  summary:
+    name: Summary Report
+    runs-on: ubuntu-latest
+    needs: [lint-and-security, build-and-test, coverage, benchmark]
+    if: always()
+    
+    steps:
+    - name: Generate workflow summary
+      run: |
+        echo "# 📋 CI/CD 工作流摘要" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 基本信息" >> $GITHUB_STEP_SUMMARY
+        echo "- **工作流:** ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **触发事件:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **提交:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **分支:** ${{ github.ref }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "## 作业状态" >> $GITHUB_STEP_SUMMARY
+        echo "| 作业 | 状态 |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+        
+        # 这里无法动态获取作业状态，所以留空
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 下一步" >> $GITHUB_STEP_SUMMARY
+        echo "- 查看详细的测试报告和覆盖率" >> $GITHUB_STEP_SUMMARY
+        echo "- 下载生成的二进制文件和报告" >> $GITHUB_STEP_SUMMARY
+        echo "- 如有失败，请查看对应作业的日志" >> $GITHUB_STEP_SUMMARY
+        
+        echo "✅ 工作流执行完成" >> $GITHUB_STEP_SUMMARY
