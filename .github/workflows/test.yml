@@ -1,0 +1,369 @@
+name: FYX-SORT Test Suite
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        compiler: [g++, clang++, msvc]
+        exclude:
+          - os: windows-latest
+            compiler: clang++
+          - os: windows-latest
+            compiler: g++
+          - os: macos-latest
+            compiler: msvc
+          - os: ubuntu-latest
+            compiler: msvc
+    
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup C++ environment
+      shell: bash
+      run: |
+        echo "OS: ${{ runner.os }}"
+        echo "Compiler: ${{ matrix.compiler }}"
+        
+        # 设置编译器
+        case "${{ matrix.compiler }}" in
+          g++)
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              echo "Using MSYS2 g++"
+              choco install msys2 -y
+              echo "C:\msys64\usr\bin" >> $GITHUB_PATH
+            fi
+            ;;
+          clang++)
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              sudo apt-get update
+              sudo apt-get install -y clang-17 clang-tidy-17
+              echo "CC=clang-17" >> $GITHUB_ENV
+              echo "CXX=clang++-17" >> $GITHUB_ENV
+            elif [ "${{ runner.os }}" = "macOS" ]; then
+              brew install llvm
+              echo "CC=/usr/local/opt/llvm/bin/clang" >> $GITHUB_ENV
+              echo "CXX=/usr/local/opt/llvm/bin/clang++" >> $GITHUB_ENV
+            fi
+            ;;
+        esac
+    
+    - name: 编译测试程序
+      shell: bash
+      run: |
+        echo "编译带有测试程序的版本..."
+        
+        # 创建测试文件
+        cat > test_fyx_sort.cpp << 'EOF'
+#define FYX_MAIN
+#include "fyx_sort.hpp"
+
+// 添加额外的测试
+int extra_tests() {
+    std::cout << "\n=== 额外正确性测试 ===\n";
+    
+    // 测试1: 空容器
+    {
+        std::vector<int> empty;
+        fyx::sort(empty);
+        std::cout << "空容器测试: PASS\n";
+    }
+    
+    // 测试2: 单个元素
+    {
+        std::vector<int> single{42};
+        fyx::sort(single);
+        if (single[0] == 42) {
+            std::cout << "单个元素测试: PASS\n";
+        } else {
+            std::cout << "单个元素测试: FAIL\n";
+            return 1;
+        }
+    }
+    
+    // 测试3: 已排序数据
+    {
+        std::vector<int> sorted(1000);
+        std::iota(sorted.begin(), sorted.end(), 0);
+        auto copy = sorted;
+        fyx::sort(sorted);
+        if (sorted == copy) {
+            std::cout << "已排序数据测试: PASS\n";
+        } else {
+            std::cout << "已排序数据测试: FAIL\n";
+            return 1;
+        }
+    }
+    
+    // 测试4: 逆序数据
+    {
+        std::vector<int> reversed(1000);
+        std::iota(reversed.rbegin(), reversed.rend(), 0);
+        fyx::sort(reversed);
+        bool ok = true;
+        for (size_t i = 0; i < reversed.size(); ++i) {
+            if (reversed[i] != static_cast<int>(i)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            std::cout << "逆序数据测试: PASS\n";
+        } else {
+            std::cout << "逆序数据测试: FAIL\n";
+            return 1;
+        }
+    }
+    
+    // 测试5: 字符串排序
+    {
+        std::vector<std::string> words = {
+            "apple", "zebra", "banana", "cherry", "date",
+            "fig", "grape", "kiwi", "lemon", "mango"
+        };
+        auto sorted_words = fyx::sorted(words);
+        if (fyx::is_sorted(sorted_words)) {
+            std::cout << "字符串排序测试: PASS\n";
+        } else {
+            std::cout << "字符串排序测试: FAIL\n";
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+int main() {
+    // 运行原测试
+    int result = main_test();
+    
+    // 运行额外测试
+    result |= extra_tests();
+    
+    return result;
+}
+EOF
+        
+        # 复制头文件
+        cp fyx_sort.hpp test_fyx_sort.hpp || true
+        
+        # 编译命令
+        case "${{ matrix.compiler }}" in
+          g++)
+            g++ -std=c++17 -O2 -march=native -DFYX_MAIN -pthread -o test_fyx_sort test_fyx_sort.cpp
+            ;;
+          clang++)
+            clang++ -std=c++17 -O2 -march=native -DFYX_MAIN -pthread -o test_fyx_sort test_fyx_sort.cpp
+            ;;
+          msvc)
+            # Windows上使用MSVC
+            cl /std:c++17 /O2 /DFYX_MAIN /EHsc /Fe:test_fyx_sort.exe test_fyx_sort.cpp
+            ;;
+        esac
+    
+    - name: 运行测试
+      shell: bash
+      run: |
+        echo "运行测试程序..."
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          ./test_fyx_sort.exe
+        else
+          ./test_fyx_sort
+        fi
+        
+        # 检查退出代码
+        if [ $? -ne 0 ]; then
+          echo "测试失败!"
+          exit 1
+        else
+          echo "所有测试通过!"
+        fi
+    
+    - name: 静态分析（可选）
+      if: matrix.compiler == 'clang++' && matrix.os == 'ubuntu-latest'
+      shell: bash
+      run: |
+        echo "运行clang-tidy静态分析..."
+        clang-tidy-17 test_fyx_sort.cpp -- -std=c++17
+        
+        echo "运行cppcheck静态分析..."
+        sudo apt-get install -y cppcheck
+        cppcheck --enable=all --std=c++17 --suppress=missingIncludeSystem test_fyx_sort.cpp
+    
+    - name: 基准测试
+      shell: bash
+      run: |
+        echo "运行快速基准测试..."
+        
+        # 创建基准测试程序
+        cat > bench_fyx_sort.cpp << 'EOF'
+#include "fyx_sort.hpp"
+#include <iostream>
+#include <chrono>
+#include <random>
+#include <vector>
+#include <algorithm>
+
+void run_benchmark(const char* name, size_t n, auto generator) {
+    std::mt19937 rng(42);
+    
+    // 准备数据
+    std::vector<int> data(n);
+    for (auto& x : data) x = generator(rng);
+    
+    auto data1 = data;
+    auto data2 = data;
+    
+    // 测试FYX排序
+    auto start = std::chrono::high_resolution_clock::now();
+    fyx::sort(data1);
+    auto end = std::chrono::high_resolution_clock::now();
+    auto fyx_time = std::chrono::duration<double, std::milli>(end - start).count();
+    
+    // 测试std::sort
+    start = std::chrono::high_resolution_clock::now();
+    std::sort(data2.begin(), data2.end());
+    end = std::chrono::high_resolution_clock::now();
+    auto std_time = std::chrono::duration<double, std::milli>(end - start).count();
+    
+    // 验证结果
+    bool correct = true;
+    for (size_t i = 0; i < n; ++i) {
+        if (data1[i] != data2[i]) {
+            correct = false;
+            break;
+        }
+    }
+    
+    std::cout << name << " (n=" << n << "): ";
+    std::cout << "FYX=" << fyx_time << "ms, ";
+    std::cout << "std=" << std_time << "ms, ";
+    std::cout << "ratio=" << std_time / fyx_time << "x, ";
+    std::cout << (correct ? "PASS" : "FAIL") << std::endl;
+}
+
+int main() {
+    std::cout << "=== 快速基准测试 ===\n";
+    
+    // 随机数据
+    run_benchmark("随机整数", 1000000, [](auto& g) { return g(); });
+    
+    // 已排序数据
+    run_benchmark("已排序", 1000000, [](auto& g) { static int i = 0; return i++; });
+    
+    // 逆序数据
+    run_benchmark("逆序", 1000000, [](auto& g) { static int i = 1000000; return i--; });
+    
+    // 部分有序数据
+    run_benchmark("部分有序", 1000000, [](auto& g) { 
+        static int i = 0;
+        return (i++ % 100 < 90) ? i : g() % 1000000;
+    });
+    
+    std::cout << "\n基准测试完成!\n";
+    return 0;
+}
+EOF
+        
+        # 编译基准测试
+        case "${{ matrix.compiler }}" in
+          g++)
+            g++ -std=c++17 -O2 -march=native -pthread -o bench_fyx_sort bench_fyx_sort.cpp
+            ;;
+          clang++)
+            clang++ -std=c++17 -O2 -march=native -pthread -o bench_fyx_sort bench_fyx_sort.cpp
+            ;;
+          msvc)
+            cl /std:c++17 /O2 /EHsc /Fe:bench_fyx_sort.exe bench_fyx_sort.cpp
+            ;;
+        esac
+        
+        # 运行基准测试
+        echo "运行基准测试..."
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          ./bench_fyx_sort.exe
+        else
+          ./bench_fyx_sort
+        fi
+    
+    - name: 上传测试结果
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.os }}-${{ matrix.compiler }}
+        path: |
+          test_fyx_sort
+          test_fyx_sort.exe
+          bench_fyx_sort
+          bench_fyx_sort.exe
+          test_fyx_sort.cpp
+          bench_fyx_sort.cpp
+        retention-days: 7
+
+  code-quality:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: 检查代码格式
+      run: |
+        echo "检查头文件保护..."
+        if ! grep -q "^#ifndef FYX_SORT_HPP$" fyx_sort.hpp; then
+          echo "错误: 缺少头文件保护"
+          exit 1
+        fi
+        
+        echo "检查许可证头..."
+        if ! grep -q "许可证：MIT" fyx_sort.hpp; then
+          echo "警告: 许可证信息不完整"
+        fi
+        
+        echo "检查版本号..."
+        if ! grep -q "FYX_SORT_VERSION" fyx_sort.hpp; then
+          echo "警告: 版本号定义缺失"
+        fi
+    
+    - name: 行数统计
+      run: |
+        echo "代码统计:"
+        wc -l fyx_sort.hpp
+        echo "头文件大小:"
+        ls -lh fyx_sort.hpp
+
+  documentation:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: 生成文档预览
+      run: |
+        echo "生成README预览..."
+        echo "# FYX-SORT v2.0" > README_PREVIEW.md
+        echo "" >> README_PREVIEW.md
+        echo "## 特性" >> README_PREVIEW.md
+        echo "- 自适应算法选择" >> README_PREVIEW.md
+        echo "- 自动并行化" >> README_PREVIEW.md
+        echo "- 大对象优化" >> README_PREVIEW.md
+        echo "- STL兼容API" >> README_PREVIEW.md
+        echo "" >> README_PREVIEW.md
+        echo "## 用法示例" >> README_PREVIEW.md
+        echo '```cpp' >> README_PREVIEW.md
+        echo '#include "fyx_sort.hpp"' >> README_PREVIEW.md
+        echo 'std::vector<int> data = {5, 2, 8, 1, 9};' >> README_PREVIEW.md
+        echo 'fyx::sort(data);' >> README_PREVIEW.md
+        echo '```' >> README_PREVIEW.md
+        
+        echo "文档预览生成完成"
