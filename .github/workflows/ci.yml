@@ -1,4 +1,4 @@
-name: FYX-SORT Benchmark vs IPS⁴o
+name: FYX-SORT Benchmark
 
 on:
   push:
@@ -23,11 +23,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ clang
-
-      - name: Download IPS⁴o (temporary)
-        run: |
-          curl -fsSL -o ips4o.hpp https://raw.githubusercontent.com/SaschaWitt/ips4o/master/include/ips4o.hpp
+          sudo apt-get install -y g++
 
       - name: Build and run benchmark (Linux/macOS)
         if: runner.os != 'Windows'
