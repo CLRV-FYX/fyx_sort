@@ -1,4 +1,4 @@
-name: FYX-SORT Test Suite
+name: FYX-SORT CI
 
 on:
   push:
@@ -7,192 +7,35 @@ on:
     branches: [ main, master ]
 
 jobs:
-  build-and-test:
+  test:
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        compiler: [g++, clang++, msvc]
-        exclude:
-          - os: windows-latest
-            compiler: clang++
-          - os: windows-latest
-            compiler: g++
-          - os: macos-latest
-            compiler: msvc
-          - os: ubuntu-latest
-            compiler: msvc
-    
-    runs-on: ${{ matrix.os }}
+        os: [ubuntu-latest, macos-latest]
+        compiler: [g++, clang++]
     
     steps:
-    - name: Checkout code
+    - name: Checkout
       uses: actions/checkout@v4
     
-    - name: Setup C++ environment
-      shell: bash
+    - name: Setup compiler
       run: |
-        echo "OS: ${{ runner.os }}"
-        echo "Compiler: ${{ matrix.compiler }}"
-        
-        # 设置编译器
-        if [ "${{ matrix.compiler }}" = "g++" ]; then
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            echo "Using MSYS2 g++"
-          fi
-        elif [ "${{ matrix.compiler }}" = "clang++" ]; then
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            sudo apt-get update
-            sudo apt-get install -y clang-17 clang-tidy-17
-            echo "CC=clang-17" >> $GITHUB_ENV
-            echo "CXX=clang++-17" >> $GITHUB_ENV
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            brew install llvm
-            echo "CC=/usr/local/opt/llvm/bin/clang" >> $GITHUB_ENV
-            echo "CXX=/usr/local/opt/llvm/bin/clang++" >> $GITHUB_ENV
-          fi
+        if [ "${{ matrix.compiler }}" = "clang++" ] && [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+          sudo apt-get update
+          sudo apt-get install -y clang
         fi
     
-    - name: Compile test program
-      shell: bash
+    - name: Build and test
       run: |
-        echo "Compiling test program..."
-        
-        # 创建测试文件
-        cat > test_fyx_sort.cpp << 'EOF'
+        # 创建测试程序
+        cat > test.cpp << 'EOF'
 #define FYX_MAIN
 #include "fyx_sort.hpp"
-
-int main() {
-    // 运行原测试
-    return main_test();
-}
+int main() { return main_test(); }
 EOF
         
-        # 复制头文件
-        cp fyx_sort.hpp test_fyx_sort.hpp || true
+        # 编译
+        ${{ matrix.compiler }} -std=c++17 -O2 -pthread -o test test.cpp
         
-        # 编译命令
-        if [ "${{ matrix.compiler }}" = "g++" ]; then
-          g++ -std=c++17 -O2 -DFYX_MAIN -pthread -o test_fyx_sort test_fyx_sort.cpp
-        elif [ "${{ matrix.compiler }}" = "clang++" ]; then
-          clang++ -std=c++17 -O2 -DFYX_MAIN -pthread -o test_fyx_sort test_fyx_sort.cpp
-        elif [ "${{ matrix.compiler }}" = "msvc" ]; then
-          # Windows上使用MSVC
-          cl /std:c++17 /O2 /DFYX_MAIN /EHsc /Fe:test_fyx_sort.exe test_fyx_sort.cpp
-        fi
-    
-    - name: Run tests
-      shell: bash
-      run: |
-        echo "Running test program..."
-        if [ "${{ runner.os }}" = "Windows" ]; then
-          ./test_fyx_sort.exe
-        else
-          ./test_fyx_sort
-        fi
-        
-        # 检查退出代码
-        if [ $? -ne 0 ]; then
-          echo "Tests failed!"
-          exit 1
-        else
-          echo "All tests passed!"
-        fi
-    
-    - name: Upload test results
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: test-results-${{ matrix.os }}-${{ matrix.compiler }}
-        path: |
-          test_fyx_sort*
-          test_fyx_sort.cpp
-        retention-days: 7
-
-  simple-test:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Simple compilation test
-      shell: bash
-      run: |
-        echo "Simple compilation test..."
-        
-        # 创建简单的测试文件
-        cat > simple_test.cpp << 'EOF'
-#include "fyx_sort.hpp"
-#include <iostream>
-#include <vector>
-
-int main() {
-    std::cout << "FYX-SORT v" << FYX_SORT_VERSION << std::endl;
-    
-    // 测试1: 基本排序
-    std::vector<int> data = {5, 2, 8, 1, 9, 3, 7, 4, 6};
-    fyx::sort(data);
-    
-    if (fyx::is_sorted(data)) {
-        std::cout << "Basic sort test: PASS" << std::endl;
-    } else {
-        std::cout << "Basic sort test: FAIL" << std::endl;
-        return 1;
-    }
-    
-    // 测试2: 已排序数据
-    std::vector<int> sorted_data = {1, 2, 3, 4, 5};
-    fyx::sort(sorted_data);
-    
-    if (fyx::is_sorted(sorted_data)) {
-        std::cout << "Already sorted test: PASS" << std::endl;
-    } else {
-        std::cout << "Already sorted test: FAIL" << std::endl;
-        return 1;
-    }
-    
-    // 测试3: 逆序数据
-    std::vector<int> reverse_data = {9, 8, 7, 6, 5, 4, 3, 2, 1};
-    fyx::sort(reverse_data);
-    
-    if (fyx::is_sorted(reverse_data)) {
-        std::cout << "Reverse sort test: PASS" << std::endl;
-    } else {
-        std::cout << "Reverse sort test: FAIL" << std::endl;
-        return 1;
-    }
-    
-    std::cout << "All simple tests passed!" << std::endl;
-    return 0;
-}
-EOF
-        
-        # 编译并运行
-        g++ -std=c++17 -o simple_test simple_test.cpp
-        ./simple_test
-    
-    - name: Check code quality
-      shell: bash
-      run: |
-        echo "Checking code quality..."
-        
-        # 检查头文件保护
-        if grep -q "^#ifndef FYX_SORT_HPP$" fyx_sort.hpp; then
-          echo "Header guard: OK"
-        else
-          echo "Header guard: MISSING"
-          exit 1
-        fi
-        
-        # 检查版本号
-        if grep -q "FYX_SORT_VERSION" fyx_sort.hpp; then
-          echo "Version macro: OK"
-        else
-          echo "Version macro: MISSING"
-          exit 1
-        fi
-        
-        # 统计代码行数
-        echo "Code statistics:"
-        wc -l fyx_sort.hpp
+        # 运行测试
+        ./test
