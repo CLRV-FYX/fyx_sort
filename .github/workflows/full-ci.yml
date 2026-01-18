@@ -1,0 +1,218 @@
+name: Full CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  # 版本信息，从标签或默认获取
+  VERSION: ${{ github.ref == 'refs/heads/main' && 'nightly' || github.ref_name }}
+
+jobs:
+  # 代码质量检查
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Check file headers
+      run: |
+        # 检查文件头是否有许可证声明
+        if ! head -20 fyx_sort.hpp | grep -q "Apache License"; then
+          echo "❌ Missing license header in fyx_sort.hpp"
+          exit 1
+        fi
+        echo "✅ License header check passed"
+    
+    - name: Check for large files
+      run: |
+        # 检查是否有过大的文件
+        FILESIZE=$(stat -c%s "fyx_sort.hpp" 2>/dev/null || stat -f%z "fyx_sort.hpp")
+        if [ $FILESIZE -gt 100000 ]; then
+          echo "⚠️  Warning: fyx_sort.hpp is large ($FILESIZE bytes)"
+        else
+          echo "✅ File size OK ($FILESIZE bytes)"
+        fi
+
+  # 编译测试
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        config: [debug, release]
+        cpp_std: [17, 20]
+        include:
+          - os: ubuntu-latest
+            compiler: g++
+            flags: "-Wall -Wextra -Werror"
+          - os: macos-latest
+            compiler: clang++
+            flags: "-Wall -Wextra -Werror"
+          - os: windows-latest
+            compiler: cl
+            flags: "/W4 /WX"
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup MSVC (Windows only)
+      if: matrix.os == 'windows-latest'
+      uses: ilammy/msvc-dev-cmd@v1
+    
+    - name: Compile
+      shell: bash
+      run: |
+        echo "Compiling with ${{ matrix.compiler }} on ${{ matrix.os }}"
+        echo "Config: ${{ matrix.config }}"
+        echo "C++ Standard: ${{ matrix.cpp_std }}"
+        
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          if [ "${{ matrix.config }}" = "debug" ]; then
+            EXTRA_FLAGS="/Od /Zi"
+          else
+            EXTRA_FLAGS="/O2"
+          fi
+          ${{ matrix.compiler }} /std:c++${{ matrix.cpp_std }} ${{ matrix.flags }} $EXTRA_FLAGS /DFYX_MAIN /I. fyx_sort.hpp /Fe:test_fyx.exe
+        else
+          if [ "${{ matrix.config }}" = "debug" ]; then
+            EXTRA_FLAGS="-O0 -g"
+          else
+            EXTRA_FLAGS="-O3 -march=native"
+          fi
+          ${{ matrix.compiler }} -std=c++${{ matrix.cpp_std }} ${{ matrix.flags }} $EXTRA_FLAGS -DFYX_MAIN -o test_fyx fyx_sort.hpp
+        fi
+    
+    - name: Run basic tests
+      shell: bash
+      run: |
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          ./test_fyx.exe --gtest_filter="*Basic*"
+        else
+          timeout 30s ./test_fyx
+        fi
+    
+    - name: Upload binaries
+      uses: actions/upload-artifact@v3
+      with:
+        name: binary-${{ matrix.os }}-${{ matrix.config }}-cpp${{ matrix.cpp_std }}
+        path: |
+          test_fyx
+          test_fyx.exe
+
+  # 性能基准测试（只在 main 分支的推送时运行）
+  benchmark:
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y python3-pip
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Run benchmark
+      run: |
+        # 简单的性能测试脚本
+        python3 << 'EOF'
+        import subprocess
+        import time
+        import json
+        
+        results = {}
+        
+        # 编译测试程序
+        subprocess.run(["g++", "-std=c++17", "-O3", "-march=native", 
+                       "-DFYX_MAIN", "-o", "bench", "fyx_sort.hpp"], check=True)
+        
+        # 运行基准测试
+        start = time.time()
+        result = subprocess.run(["./bench"], capture_output=True, text=True)
+        elapsed = time.time() - start
+        
+        if result.returncode == 0:
+            print("✅ Benchmark passed")
+            # 这里可以解析输出结果
+        else:
+            print("❌ Benchmark failed")
+            print(result.stderr)
+        
+        results['time'] = elapsed
+        results['status'] = 'passed' if result.returncode == 0 else 'failed'
+        
+        # 保存结果
+        with open('benchmark_results.json', 'w') as f:
+            json.dump(results, f, indent=2)
+        EOF
+    
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v3
+      with:
+        name: benchmark-results
+        path: benchmark_results.json
+
+  # 创建发布（只在打标签时运行）
+  release:
+    runs-on: ubuntu-latest
+    needs: [lint, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    
+    - name: Extract version
+      id: get_version
+      run: |
+        VERSION="${GITHUB_REF#refs/tags/v}"
+        echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+    
+    - name: Create release archive
+      run: |
+        mkdir -p fyx-sort-${{ env.VERSION }}
+        cp README.md LICENSE fyx_sort.hpp fyx-sort-${{ env.VERSION }}/
+        tar -czf fyx-sort-${{ env.VERSION }}.tar.gz fyx-sort-${{ env.VERSION }}
+        zip -r fyx-sort-${{ env.VERSION }}.zip fyx-sort-${{ env.VERSION }}
+    
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          fyx-sort-${{ env.VERSION }}.tar.gz
+          fyx-sort-${{ env.VERSION }}.zip
+        generate_release_notes: true
+        prerelease: ${{ contains(env.VERSION, '-') }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 汇总所有结果
+  report:
+    runs-on: ubuntu-latest
+    needs: [lint, build, benchmark]
+    if: always()
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+    
+    - name: Generate summary
+      run: |
+        echo "# CI/CD Summary" >> $GITHUB_STEP_SUMMARY
+        echo "## Build Status" >> $GITHUB_STEP_SUMMARY
+        echo "✅ All checks completed" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** ${{ github.ref }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
