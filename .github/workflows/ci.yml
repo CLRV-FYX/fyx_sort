@@ -23,13 +23,13 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get install -y g++
 
-      - name: Build and run benchmark (Linux/macOS)
+      - name: Build and run (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           g++ -O3 -march=native -std=c++17 -DNDEBUG -pthread -DFYX_MAIN -I. fyx_sort.hpp -o fyx_bench
           ./fyx_bench
 
-      - name: Build and run benchmark (Windows)
+      - name: Build and run (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: |
