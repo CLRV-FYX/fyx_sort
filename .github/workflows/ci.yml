@@ -1,86 +1,37 @@
-name: FYX-SORT CI
+name: FYX-SORT Build and Benchmark
 
 on:
   push:
-    branches: [ main, dev ]
+    branches: [ main ]
   pull_request:
     branches: [ main ]
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        compiler:
-          - { name: "gcc",   cc: "gcc",   cxx: "g++",   flags: "-O3 -march=native" }
-          - { name: "clang", cc: "clang", cxx: "clang++", flags: "-O3 -march=native" }
-        exclude:
-          # MSVC 不适用 GCC/Clang
-          - os: windows-latest
-            compiler: { name: "gcc", cc: "gcc", cxx: "g++", flags: "-O3 -march=native" }
-          - os: windows-latest
-            compiler: { name: "clang", cc: "clang", cxx: "clang++", flags: "-O3 -march=native" }
-        include:
-          # Windows 使用 MSVC
-          - os: windows-latest
-            compiler: { name: "msvc", cc: "cl", cxx: "cl", flags: "/O2 /std:c++17" }
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies (Linux)
+      - name: Install GCC (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++ clang
-
-      - name: Set up environment (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          echo "CC=${{ matrix.compiler.cc }}" >> $GITHUB_ENV
-          echo "CXX=${{ matrix.compiler.cxx }}" >> $GITHUB_ENV
-          echo "CXXFLAGS=${{ matrix.compiler.flags }} -std=c++17 -DNDEBUG -pthread" >> $GITHUB_ENV
-
-      - name: Set up environment (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          echo "Using MSVC by default"
-        shell: cmd
-
-      - name: Build test (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          $CXX $CXXFLAGS -I. test_fyx_sort.cpp -o test_fyx_sort
-          ./test_fyx_sort
-
-      - name: Build test (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cl /EHsc /std:c++17 /O2 /DNDEBUG /I. test_fyx_sort.cpp
-          .\test_fyx_sort.exe
-
-  benchmark:
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/main'
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install g++
         run: sudo apt-get install -y g++
 
-      - name: Run benchmark
+      - name: Build and run (Linux/macOS)
+        if: runner.os != 'Windows'
         run: |
-          g++ -O3 -march=native -std=c++17 -DNDEBUG -pthread -I. test_fyx_sort.cpp -o bench
-          timeout 60s ./bench || echo "Benchmark completed or timed out."
+          c++ -O3 -march=native -std=c++17 -DNDEBUG -pthread -DFYX_MAIN -I. fyx_sort.hpp -o fyx_bench
+          ./fyx_bench
 
-      - name: Upload benchmark log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-log-${{ github.sha }}
-          path: benchmark.log
+      - name: Build and run (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          cl /EHsc /std:c++17 /O2 /DNDEBUG /DFYX_MAIN /I. fyx_sort.hpp
+          .\fyx_sort.exe
