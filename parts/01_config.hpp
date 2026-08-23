@@ -401,6 +401,10 @@ inline constexpr std::size_t kSampleBuckets   = 256;
 inline constexpr std::size_t kSampleBlock     = 1024;
 inline constexpr std::size_t kSampleThreshold = 1u << 17;     // 131072
 
+/// Hard ceiling on pool size.  Guards against absurd hardware_concurrency
+/// values and bounds the per-thread scratch the pool can pin.
+inline constexpr unsigned kMaxThreads = 256;
+
 /// Software prefetch distances, in elements, for the radix scatter loop.
 inline constexpr std::size_t kPrefetchL1 = 16;
 inline constexpr std::size_t kPrefetchL2 = 128;
