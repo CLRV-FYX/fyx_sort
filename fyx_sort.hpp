@@ -583,13 +583,13 @@ inline void aligned_free(void* p) noexcept {
 /// RAII owner for an aligned raw buffer of trivially-copyable T.
 template <typename T>
 class AlignedBuffer {
-public:
-    AlignedBuffer() noexcept = default;
+公共:
+    AlignedBuffer() noexcept = 默认;
 
     explicit AlignedBuffer(std::size_t count) noexcept { allocate(count); }
 
-    AlignedBuffer(const AlignedBuffer&)            = delete;
-    AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+    AlignedBuffer(const AlignedBuffer&)            = 删除;
+    AlignedBuffer& operator=(const AlignedBuffer&) = 删除;
 
     AlignedBuffer(AlignedBuffer&& o) noexcept : data_(o.data_), size_(o.size_) {
         o.data_ = nullptr;
@@ -628,7 +628,7 @@ public:
     std::size_t size()  const noexcept { return size_; }
     bool        valid() const noexcept { return data_ != nullptr; }
 
-private:
+私有:
     T*          data_ = nullptr;
     std::size_t size_ = 0;
 };
@@ -1053,7 +1053,7 @@ public:
     bool in_use() const noexcept { return leased_; }
     void set_leased(bool v) noexcept { leased_ = v; }
 
-private:
+私有:
     unsigned char* base_     = nullptr;
     std::size_t    capacity_ = 0;
     bool           leased_   = false;
@@ -1076,7 +1076,7 @@ class ScratchLease {
                   !std::is_trivially_destructible<T>::value,
                   "ScratchLease stores raw storage; T is only ever placement-used");
 
-public:
+公共:
     explicit ScratchLease(std::size_t count) noexcept {
         if (count == 0) { ptr_ = nullptr; return; }
 
@@ -1101,8 +1101,8 @@ public:
         count_  = p ? count : 0;
     }
 
-    ScratchLease(const ScratchLease&)            = delete;
-    ScratchLease& operator=(const ScratchLease&) = delete;
+    ScratchLease(const ScratchLease&)            = 删除;
+    ScratchLease& operator=(const ScratchLease&) = 删除;
 
     ~ScratchLease() {
         if (from_arena_) thread_arena().set_leased(false);
@@ -1113,7 +1113,7 @@ public:
     std::size_t count() const noexcept { return count_; }
     bool        valid() const noexcept { return ptr_ != nullptr; }
 
-private:
+私有:
     T*          ptr_        = nullptr;
     std::size_t count_      = 0;
     bool        from_arena_ = false;
@@ -1234,9 +1234,9 @@ struct RadixTraits<T, typename std::enable_if<std::is_integral<T>::value &&
 template <typename T>
 struct RadixTraits<T, typename std::enable_if<std::is_floating_point<T>::value &&
                                               (sizeof(T) == 4 || sizeof(T) == 8) &&
-                                              std::numeric_limits<T>::is_iec559>::type> {
+                                              std::numeric_limits<T>::is_iec559>::请键入> {
     static constexpr bool supported = true;
-    using Key = typename std::conditional<sizeof(T) == 4, std::uint32_t, std::uint64_t>::type;
+    using Key = typename std::conditional<sizeof(T) == 4, std::uint32_t, std::uint64_t>::请键入;
     static constexpr unsigned bits   = sizeof(T) * CHAR_BIT;
     static constexpr unsigned passes = (bits + kRadixBits - 1) / kRadixBits;
     static constexpr Key      kSign  = Key(1) << (bits - 1);
@@ -1306,10 +1306,10 @@ struct IsContiguous<It, typename std::enable_if<
     is_random_access_v<It> &&
     std::is_pointer<decltype(std::declval<It&>().operator->())>::value &&
     std::is_lvalue_reference<typename std::iterator_traits<It>::reference>::value
->::type> : std::true_type {};
+>::请键入> : std::true_type {};
 
 template <typename It>
-inline constexpr bool is_contiguous_v = IsContiguous<typename std::decay<It>::type>::value;
+inline constexpr bool is_contiguous_v = IsContiguous<typename std::decay<It>::请键入>::value;
 
 /// Converts a contiguous iterator to a raw pointer.  Only valid for a non-empty
 /// range; call sites check that first.
@@ -1318,7 +1318,7 @@ FYX_FORCE_INLINE T* to_pointer(T* p) noexcept { return p; }
 
 template <typename It>
 FYX_FORCE_INLINE auto to_pointer(It it) noexcept
-    -> typename std::add_pointer<typename std::remove_reference<decltype(*it)>::type>::type {
+    -> typename std::add_pointer<typename std::remove_reference<decltype(*it)>::请键入>::请键入 {
     return std::addressof(*it);
 }
 
@@ -1355,8 +1355,8 @@ namespace detail {
 // ---------------------------------------------------------------------------
 
 /// Plain insertion sort over [first, last).
-template <typename It, typename Compare>
-inline void insertion_sort(It first, It last, Compare comp) {
+template <typename It, typename 对比>
+inline void insertion_sort(It first, It last, 对比 comp) {
     using T = typename std::iterator_traits<It>::value_type;
     if (first == last) return;
     for (It i = first + 1; i != last; ++i) {
@@ -1375,8 +1375,8 @@ inline void insertion_sort(It first, It last, Compare comp) {
 /// Insertion sort that may assume *(first - 1) is a valid element that is not
 /// greater than everything in [first, last) -- i.e. a sentinel exists.  This
 /// removes the `j != first` bound check from the inner loop.
-template <typename It, typename Compare>
-inline void insertion_sort_guarded(It first, It last, Compare comp) {
+template <typename It, typename 对比>
+inline void insertion_sort_guarded(It first, It last, 对比 comp) {
     using T = typename std::iterator_traits<It>::value_type;
     if (first == last) return;
     for (It i = first + 1; i != last; ++i) {
@@ -1395,8 +1395,8 @@ inline void insertion_sort_guarded(It first, It last, Compare comp) {
 /// Bounded insertion sort used by pdqsort's partial-order optimisation.
 /// Gives up (returning false) once it has moved more than `limit` elements,
 /// which tells the caller the range is not nearly sorted.
-template <typename It, typename Compare>
-inline bool partial_insertion_sort(It first, It last, Compare comp) {
+template <typename It, typename 对比>
+inline bool partial_insertion_sort(It first, It last, 对比 comp) {
     using T = typename std::iterator_traits<It>::value_type;
     using Diff = typename std::iterator_traits<It>::difference_type;
     constexpr Diff kLimit = 8;
@@ -1422,9 +1422,9 @@ inline bool partial_insertion_sort(It first, It last, Compare comp) {
 // Heapsort -- the worst-case guarantee behind pdqsort
 // ---------------------------------------------------------------------------
 
-template <typename It, typename Compare>
+template <typename It, typename 对比>
 inline void sift_down(It first, typename std::iterator_traits<It>::difference_type root,
-                      typename std::iterator_traits<It>::difference_type n, Compare comp) {
+                      typename std::iterator_traits<It>::difference_type n, 对比 comp) {
     using T    = typename std::iterator_traits<It>::value_type;
     using Diff = typename std::iterator_traits<It>::difference_type;
 
@@ -1801,7 +1801,7 @@ struct BitonicVec {
         for_each_k(v, std::integral_constant<unsigned, 2>{});
     }
 
-private:
+私有:
     // --- k loop (compile-time recursion) -----------------------------------
     template <unsigned K>
     static FYX_FORCE_INLINE void for_each_k(Vec* v, std::integral_constant<unsigned, K>) {
@@ -1890,7 +1890,7 @@ inline void network_sort_keys(typename Ops::Key* keys, std::size_t n) {
         case 8: if constexpr (L * 8 <= 64) { network_sort_v<Ops, 8>(keys, n); return; } break;
         case 16: if constexpr (L * 16 <= 64) { network_sort_v<Ops, 16>(keys, n); return; } break;
         case 32: if constexpr (L * 32 <= 64) { network_sort_v<Ops, 32>(keys, n); return; } break;
-        default: break;
+        默认: break;
     }
     // vecs == 3, 5, 6, 7 ... cannot occur (padded and L are powers of two), but
     // keep a correct path rather than an assertion in release builds.
@@ -2068,7 +2068,7 @@ struct BitonicVec {
         for_each_k(v, std::integral_constant<unsigned, 2>{});
     }
 
-private:
+私有:
     // --- k loop (compile-time recursion) -----------------------------------
     template <unsigned K>
     static FYX_FORCE_INLINE void for_each_k(Vec* v, std::integral_constant<unsigned, K>) {
@@ -2157,7 +2157,7 @@ inline void network_sort_keys(typename Ops::Key* keys, std::size_t n) {
         case 8: if constexpr (L * 8 <= 64) { network_sort_v<Ops, 8>(keys, n); return; } break;
         case 16: if constexpr (L * 16 <= 64) { network_sort_v<Ops, 16>(keys, n); return; } break;
         case 32: if constexpr (L * 32 <= 64) { network_sort_v<Ops, 32>(keys, n); return; } break;
-        default: break;
+        默认: break;
     }
     // vecs == 3, 5, 6, 7 ... cannot occur (padded and L are powers of two), but
     // keep a correct path rather than an assertion in release builds.
@@ -2339,7 +2339,7 @@ struct BitonicVec {
         for_each_k(v, std::integral_constant<unsigned, 2>{});
     }
 
-private:
+私有:
     // --- k loop (compile-time recursion) -----------------------------------
     template <unsigned K>
     static FYX_FORCE_INLINE void for_each_k(Vec* v, std::integral_constant<unsigned, K>) {
@@ -2428,7 +2428,7 @@ inline void network_sort_keys(typename Ops::Key* keys, std::size_t n) {
         case 8: if constexpr (L * 8 <= 64) { network_sort_v<Ops, 8>(keys, n); return; } break;
         case 16: if constexpr (L * 16 <= 64) { network_sort_v<Ops, 16>(keys, n); return; } break;
         case 32: if constexpr (L * 32 <= 64) { network_sort_v<Ops, 32>(keys, n); return; } break;
-        default: break;
+        默认: break;
     }
     // vecs == 3, 5, 6, 7 ... cannot occur (padded and L are powers of two), but
     // keep a correct path rather than an assertion in release builds.
@@ -2596,7 +2596,7 @@ struct BitonicVec {
         for_each_k(v, std::integral_constant<unsigned, 2>{});
     }
 
-private:
+私有:
     // --- k loop (compile-time recursion) -----------------------------------
     template <unsigned K>
     static FYX_FORCE_INLINE void for_each_k(Vec* v, std::integral_constant<unsigned, K>) {
@@ -2857,7 +2857,7 @@ struct BitonicVec {
         for_each_k(v, std::integral_constant<unsigned, 2>{});
     }
 
-private:
+私有:
     // --- k loop (compile-time recursion) -----------------------------------
     template <unsigned K>
     static FYX_FORCE_INLINE void for_each_k(Vec* v, std::integral_constant<unsigned, K>) {
@@ -3561,8 +3561,8 @@ struct PartitionResult {
 // data-dependent branch at all.
 // ---------------------------------------------------------------------------
 
-template <typename It, typename Compare>
-inline PartitionResult<It> partition_right_branchless(It first, It last, Compare comp) {
+template <typename It, typename 对比>
+inline PartitionResult<It> partition_right_branchless(It first, It last, 对比 comp) {
     using T    = typename std::iterator_traits<It>::value_type;
     using Diff = typename std::iterator_traits<It>::difference_type;
 
@@ -3678,8 +3678,8 @@ inline PartitionResult<It> partition_right_branchless(It first, It last, Compare
 
 /// Simple (branchy) partition, used when the value type is expensive to move
 /// or the range is short enough that block bookkeeping does not pay.
-template <typename It, typename Compare>
-inline PartitionResult<It> partition_right_simple(It first, It last, Compare comp) {
+template <typename It, typename 对比>
+inline PartitionResult<It> partition_right_simple(It first, It last, 对比 comp) {
     using T = typename std::iterator_traits<It>::value_type;
 
     T  pivot = std::move(*first);
@@ -3716,8 +3716,8 @@ inline PartitionResult<It> partition_right_simple(It first, It last, Compare com
 // what keeps "many equal keys" inputs near linear.
 // ---------------------------------------------------------------------------
 
-template <typename It, typename Compare>
-inline It partition_left(It first, It last, Compare comp) {
+template <typename It, typename 对比>
+inline It partition_left(It first, It last, 对比 comp) {
     using T = typename std::iterator_traits<It>::value_type;
 
     T  pivot = std::move(*first);
@@ -3755,8 +3755,8 @@ inline It partition_left(It first, It last, Compare comp) {
 // custom comparators over class types, and so on).
 // ---------------------------------------------------------------------------
 
-template <typename It, typename Compare>
-FYX_FORCE_INLINE void small_sort_generic(It first, It last, Compare comp,
+template <typename It, typename 对比>
+FYX_FORCE_INLINE void small_sort_generic(It first, It last, 对比 comp,
                                          bool leftmost) {
     if (leftmost) insertion_sort(first, last, comp);
     else          insertion_sort_guarded(first, last, comp);
@@ -3766,8 +3766,8 @@ FYX_FORCE_INLINE void small_sort_generic(It first, It last, Compare comp,
 // The recursive driver
 // ---------------------------------------------------------------------------
 
-template <typename It, typename Compare, bool Branchless>
-inline void pdqsort_loop(It first, It last, Compare comp, int bad_allowed,
+template <typename It, typename 对比, bool Branchless>
+inline void pdqsort_loop(It first, It last, 对比 comp, int bad_allowed,
                          bool leftmost) {
     using Diff = typename std::iterator_traits<It>::difference_type;
 
@@ -3834,12 +3834,12 @@ inline void pdqsort_loop(It first, It last, Compare comp, int bad_allowed,
         // Recurse into the smaller half, loop on the larger one, so the stack
         // depth stays O(log n).
         if (l_size < r_size) {
-            pdqsort_loop<It, Compare, Branchless>(first, part.pivot_pos, comp,
+            pdqsort_loop<It, 对比, Branchless>(first, part.pivot_pos, comp,
                                                   bad_allowed, leftmost);
             first    = part.pivot_pos + 1;
             leftmost = false;
         } else {
-            pdqsort_loop<It, Compare, Branchless>(part.pivot_pos + 1, last, comp,
+            pdqsort_loop<It, 对比, Branchless>(part.pivot_pos + 1, last, comp,
                                                   bad_allowed, false);
             last = part.pivot_pos;
         }
@@ -3848,15 +3848,15 @@ inline void pdqsort_loop(It first, It last, Compare comp, int bad_allowed,
 
 /// Entry point.  `Branchless` is chosen by the caller from the value type: it
 /// pays for small trivially-copyable types and costs for everything else.
-template <typename It, typename Compare>
-inline void pdqsort(It first, It last, Compare comp) {
+template <typename It, typename 对比>
+inline void pdqsort(It first, It last, 对比 comp) {
     if (first == last) return;
 
     using T = typename std::iterator_traits<It>::value_type;
     constexpr bool kBranchless =
         std::is_arithmetic<T>::value && sizeof(T) <= 16;
 
-    pdqsort_loop<It, Compare, kBranchless>(
+    pdqsort_loop<It, 对比, kBranchless>(
         first, last, comp,
         static_cast<int>(log2_floor(static_cast<std::uint64_t>(last - first))) + 1,
         true);
@@ -3984,7 +3984,7 @@ struct AtomicSlot {
 };
 
 class WsRingBuffer {
-public:
+公共:
     explicit WsRingBuffer(std::int64_t log_size)
         : log_size_(log_size),
           mask_((std::int64_t(1) << log_size) - 1),
@@ -3994,7 +3994,7 @@ public:
         // std::malloc gives raw storage; the atomics must be constructed.
         if (data_) {
             const std::int64_t n = mask_ + 1;
-            for (std::int64_t i = 0; i < n; ++i) new (&data_[i]) AtomicSlot();
+            for (std::int64_t i = 0; i < n; ++i) 新建 (&data_[i]) AtomicSlot();
         }
     }
 
@@ -4006,8 +4006,8 @@ public:
         }
     }
 
-    WsRingBuffer(const WsRingBuffer&)            = delete;
-    WsRingBuffer& operator=(const WsRingBuffer&) = delete;
+    WsRingBuffer(const WsRingBuffer&)            = 删除;
+    WsRingBuffer& operator=(const WsRingBuffer&) = 删除;
 
     bool         valid()    const noexcept { return data_ != nullptr; }
     std::int64_t capacity() const noexcept { return mask_ + 1; }
@@ -4027,7 +4027,7 @@ public:
         return t;
     }
 
-private:
+私有:
     std::int64_t log_size_;
     std::int64_t mask_;
     AtomicSlot*  data_;
@@ -4038,21 +4038,21 @@ private:
 // ---------------------------------------------------------------------------
 
 class WorkStealingDeque {
-public:
+公共:
     explicit WorkStealingDeque(std::int64_t log_size = 10)
         : top_(0), bottom_(0), buffer_(nullptr) {
-        WsRingBuffer* b = new (std::nothrow) WsRingBuffer(log_size);
-        if (b && !b->valid()) { delete b; b = nullptr; }
+        WsRingBuffer* b = 新建 (std::nothrow) WsRingBuffer(log_size);
+        if (b && !b->valid()) { 删除 b; b = nullptr; }
         buffer_.store(b, std::memory_order_relaxed);
     }
 
     ~WorkStealingDeque() {
-        delete buffer_.load(std::memory_order_relaxed);
-        for (WsRingBuffer* r : retired_) delete r;
+        删除 buffer_.load(std::memory_order_relaxed);
+        for (WsRingBuffer* r : retired_) 删除 r;
     }
 
-    WorkStealingDeque(const WorkStealingDeque&)            = delete;
-    WorkStealingDeque& operator=(const WorkStealingDeque&) = delete;
+    WorkStealingDeque(const WorkStealingDeque&)            = 删除;
+    WorkStealingDeque& operator=(const WorkStealingDeque&) = 删除;
 
     bool valid() const noexcept {
         return buffer_.load(std::memory_order_relaxed) != nullptr;
@@ -4068,8 +4068,8 @@ public:
 
         if (b - top >= buf->capacity() - 1) {
             WsRingBuffer* grown =
-                new (std::nothrow) WsRingBuffer(buf->log_size() + 1);
-            if (!grown || !grown->valid()) { delete grown; return false; }
+                新建 (std::nothrow) WsRingBuffer(buf->log_size() + 1);
+            if (!grown || !grown->valid()) { 删除 grown; return false; }
             for (std::int64_t i = top; i < b; ++i) grown->put(i, buf->get(i));
             // The old buffer may still be read by an in-flight thief, so it is
             // retired rather than deleted.
@@ -4151,7 +4151,7 @@ public:
                top_.load(std::memory_order_relaxed);
     }
 
-private:
+私有:
     // top_ and bottom_ are hammered by different threads; keeping them on
     // separate cache lines removes the false sharing that would otherwise
     // dominate the steal path.
@@ -4183,7 +4183,7 @@ private:
 // ---------------------------------------------------------------------------
 
 class ThreadPool {
-public:
+公共:
     /// Number of worker threads, excluding the calling thread.
     static unsigned default_threads() noexcept {
         unsigned hc = std::thread::hardware_concurrency();
@@ -4196,7 +4196,7 @@ public:
         : nworkers_(nthreads == 0 ? 1u : nthreads) {
         queues_.reserve(nworkers_);
         for (unsigned i = 0; i < nworkers_; ++i) {
-            queues_.emplace_back(new (std::nothrow) WorkStealingDeque(10));
+            queues_.emplace_back(新建 (std::nothrow) WorkStealingDeque(10));
             if (!queues_.back() || !queues_.back()->valid()) { broken_ = true; return; }
         }
         // Worker 0 is the submitting thread; only 1..n-1 get an OS thread.
@@ -4222,11 +4222,11 @@ public:
         sleep_cv_.notify_all();
         for (std::thread& t : threads_)
             if (t.joinable()) t.join();
-        for (WorkStealingDeque* q : queues_) delete q;
+        for (WorkStealingDeque* q : queues_) 删除 q;
     }
 
-    ThreadPool(const ThreadPool&)            = delete;
-    ThreadPool& operator=(const ThreadPool&) = delete;
+    ThreadPool(const ThreadPool&)            = 删除;
+    ThreadPool& operator=(const ThreadPool&) = 删除;
 
     bool     broken()   const noexcept { return broken_; }
     unsigned nworkers() const noexcept { return nworkers_; }
@@ -4261,7 +4261,7 @@ public:
         }
     }
 
-private:
+私有:
     static unsigned& tls_worker_id() noexcept {
         static thread_local unsigned id = 0;
         return id;
@@ -4393,6 +4393,152 @@ inline void fork_join(FnA&& a, FnB&& b) {
 } // namespace fyx
 
 // ===========================================================================
+//  Section 12 -- Generic sample sort (ips4o-style) for the non-radix path
+//
+//  Radix owns numeric + default comparator.  Everything else -- strings,
+//  structs, and custom comparators over any type -- lands here.  For those
+//  the comparison itself is the cost, so the win is doing ~log2(k) = 8
+//  comparisons per element instead of ~log2(n).  That is exactly what a
+//  sample sort (introspective / ips4o style) buys over pdqsort.
+//
+//  Design (per DESIGN.md section 6.3):
+//    * k = 256 buckets, k-1 = 255 splitters chosen as quantiles of a sample.
+//    * splitters stored in an *implicit binary-search tree* (Eytzinger layout)
+//      so classification is a branchless descent  b = 2*b + comp(tree[b], x).
+//    * two phases: count bucket sizes, then permute through a temp buffer
+//      (the library already pays O(n) for radix, so O(n) temp is consistent).
+//    * recurse on large buckets; small buckets fall to pdqsort / insertion.
+//    * low-cardinality guard: when the sample is dominated by few distinct
+//      values pdqsort's three-way partition peels duplicates for free, so we
+//      skip sample sort and use pdqsort instead (prevents the ~0.55x cliff).
+// ===========================================================================
+
+namespace fyx {
+namespace detail {
+
+// Build the Eytzinger (implicit BST) layout of `m` already-sorted splitters
+// into `tree` (1-based, size 2*m+1).  Internal nodes 1..m hold splitters;
+// leaves m+1..2m+1 are bucket terminals (bucket = index - m - 1).
+template <class T, class Comp>
+inline void build_classifier_tree(std::vector<T>& tree, const T* s, int node,
+                                  int lo, int hi, Comp comp) {
+    if (lo > hi) return;
+    const int mid = lo + (hi - lo) / 2;
+    tree[node] = s[mid];
+    if (static_cast<std::size_t>(2 * node + 1) >= tree.size()) return;  // safety
+    build_classifier_tree(tree, s, 2 * node,     lo, mid - 1, comp);
+    build_classifier_tree(tree, s, 2 * node + 1, mid + 1, hi, comp);
+}
+
+// Branchless descent to a bucket id in [0, m].
+template <class T, class Comp>
+inline unsigned classify_bucket(const T& x, const T* tree, unsigned m, Comp comp) {
+    unsigned b = 1;
+    while (b <= m) b = 2 * b + (comp(x, tree[b]) ? 0u : 1u);
+    return b - m - 1u;
+}
+
+// Sample sort over a random-access range.  Falls back to pdqsort when the
+// low-cardinality guard fires (cheap for caller -- this is hit before the
+// O(n) permutation work).
+template <class It, class Comp>
+inline void sample_sort(It first, It last, Comp comp) {
+    using T = typename std::iterator_traits<It>::value_type;
+    const std::size_t n = static_cast<std::size_t>(last - first);
+
+    if (n <= kInsertionThreshold) { insertion_sort(first, last, comp); return; }
+    if (n <  kSampleThreshold)    { pdqsort(first, last, comp);      return; }
+
+    const unsigned k = static_cast<unsigned>(kSampleBuckets);   // 256
+    const unsigned m = k - 1u;                                  // 255 splitters
+
+    // ---- 1. representative sample (stride across the range) ----
+    const std::size_t S = std::min(n, static_cast<std::size_t>(1u << 16));
+    const std::size_t stride = n / S;
+    std::vector<T> sample(S);
+    for (std::size_t i = 0; i < S; ++i) sample[i] = *(first + i * stride);
+    std::排序(sample.begin(), sample.end(), comp);
+
+    // ---- 2. low-cardinality guard -----------------------------------------
+    // Count distinct values in the sample.  Expensive comparators (string /
+    // struct) still win sample sort down to a few-percent distinct ratio; only
+    // bail out when the data is dominated by duplicates (pdqsort peels them).
+    std::size_t distinct = 1;
+    for (std::size_t i = 1; i < S; ++i)
+        if (comp(sample[i - 1], sample[i])) ++distinct;
+    const double distinct_ratio = static_cast<double>(distinct) / static_cast<double>(S);
+    if (distinct_ratio == 0) { pdqsort(first, last, comp); return; }
+    if (!std::is_arithmetic<T>::value && distinct_ratio < 0.05) {
+        pdqsort(first, last, comp);
+        return;
+    }
+
+    // ---- 3. quantile splitters + classifier tree -------------------------
+    std::vector<T> splitters(m);
+    for (unsigned i = 0; i < m; ++i)
+        splitters[i] = sample[static_cast<std::size_t>((i + 1) * S) / k];
+    std::vector<T> tree(2 * m + 1);
+    build_classifier_tree(tree, splitters.data(), 1, 0, static_cast<int>(m) - 1, comp);
+
+    // ---- 4. count bucket sizes (and remember each element's bucket) ------
+    std::vector<unsigned char> bid(n);
+    std::vector<std::size_t> count(k, 0);
+    for (std::size_t i = 0; i < n; ++i) {
+        const unsigned b = classify_bucket(*(first + i), tree.data(), m, comp);
+        bid[i] = static_cast<unsigned char>(b);
+        count[b]++;
+    }
+    std::vector<std::size_t> offset(k + 1);
+    for (unsigned b = 0; b < k; ++b) offset[b + 1] = offset[b] + count[b];
+
+    // ---- 5. in-place permutation (cycle following) ----------------------
+    // Each bucket b must occupy [offset[b], offset[b+1]); bid[i] records the
+    // bucket of element i, so its destination is the next free slot of that
+    // bucket.  We rotate elements along their permutation cycles.  This is
+    // O(n) extra bookkeeping (bid[] + a visited bitmap) and moves each element
+    // exactly once -- no O(n) temp buffer, no extra memory passes.
+    std::vector<std::size_t> cur(offset.begin(), offset.begin() + k);
+    std::vector<unsigned char> visited((n + 7) / 8, 0);
+    auto vis_set = [&](std::size_t i) { visited[i >> 3] |= static_cast<unsigned char>(1u << (i & 7)); };
+    auto vis_get = [&](std::size_t i) { return (visited[i >> 3] >> (i & 7)) & 1u; };
+    for (std::size_t i = 0; i < n; ++i) {
+        if (vis_get(i)) continue;
+        std::size_t j = i;
+        T val = std::move(*(first + j));
+        for (;;) {
+            vis_set(j);
+            const unsigned b = bid[j];
+            const std::size_t dst = cur[b]++;
+            if (dst == i) {                 // we have come back to the cycle start
+                *(first + i) = std::move(val);
+                break;
+            }
+            T tmp = std::move(*(first + dst));
+            *(first + dst) = std::move(val);
+            val = std::move(tmp);
+            j = dst;
+            if (vis_get(j)) {               // cycle closed on an already-placed slot
+                *(first + j) = std::move(val);
+                break;
+            }
+        }
+    }
+
+    // ---- 6. recurse on each bucket ---------------------------------------
+    for (unsigned b = 0; b < k; ++b) {
+        const std::size_t lo = offset[b], hi = offset[b + 1];
+        const std::size_t sz = hi - lo;
+        if (sz == 0) continue;
+        if (sz >= kSampleThreshold) sample_sort(first + lo, first + hi, comp);
+        else if (sz > kInsertionThreshold) pdqsort(first + lo, first + hi, comp);
+        else insertion_sort(first + lo, first + hi, comp);
+    }
+}
+
+} // namespace detail
+} // namespace fyx
+
+// ===========================================================================
 //  Section 12/13 -- Public API + adaptive dispatcher
 //
 //  This is the layer the rest of the library was missing: the callable,
@@ -4425,11 +4571,11 @@ enum class Tri : unsigned char {
 };
 
 /// Runtime options for a single sort call.
-struct Options {
+struct 选项 {
     Tri      parallel = Tri::Auto;  ///< serial / parallel policy
     unsigned threads  = 0;          ///< advisory worker count (0 = pool default)
     bool     gpu      = false;      ///< reserved; only meaningful with FYX_ENABLE_GPU
-    constexpr Options() noexcept = default;
+    constexpr 选项() noexcept = 默认;
 };
 
 namespace detail {
@@ -4437,7 +4583,7 @@ namespace detail {
 // ---- SFINAE helpers used by the public overload set -----------------------
 
 template <class T>
-struct is_fyx_options : std::is_same<std::remove_cv_t<std::remove_reference_t<T>>, Options> {};
+struct is_fyx_options : std::is_same<std::remove_cv_t<std::remove_reference_t<T>>, 选项> {};
 template <class T>
 inline constexpr bool is_fyx_options_v = is_fyx_options<T>::value;
 
@@ -4449,6 +4595,14 @@ struct has_std_data<C, std::void_t<
     decltype(std::size(std::declval<C&>()))>> : std::true_type {};
 template <class C>
 inline constexpr bool has_std_data_v = has_std_data<C>::value;
+
+// Forward declaration of the (optionally compiled) GPU dispatch.  Defined in
+// parts/15_gpu.hpp under #ifdef FYX_ENABLE_GPU; when that switch is off the
+// function does not exist and the guarded call sites below compile away.
+#if FYX_ENABLE_GPU
+template <class T, class Comp>
+inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp comp, const 选项& o);
+#endif
 
 // ---------------------------------------------------------------------------
 // Single-threaded best-kernel selection for a contiguous pointer range.
@@ -4478,6 +4632,14 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending) {
         }
     }
     if (n <= kInsertionThreshold) { insertion_sort(p, p + n, comp); return; }
+    // Generic (non-radix) path: for non-arithmetic types (strings, structs,
+    // custom comparators) an ips4o-style sample sort beats pdqsort on
+    // comparison cost.  sample_sort self-guards the low-cardinality case and
+    // falls back to pdqsort internally.
+    if (n >= kSampleThreshold && !std::is_arithmetic_v<T>) {
+        sample_sort(p, p + n, comp);
+        return;
+    }
     pdqsort(p, p + n, comp);
 }
 
@@ -4488,7 +4650,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending) {
 // std::inplace_merge merges two comp-sorted runs into one.
 template <class T, class Comp>
 inline void parallel_sort_ptr(T* p, std::size_t n, Comp comp, bool descending,
-                              const Options& o) {
+                              const 选项& o) {
     if (n <= kParallelThreshold || !parallel_available() ||
         o.parallel == Tri::Off || o.threads == 1) {
         sort_st(p, n, comp, descending);
@@ -4591,9 +4753,15 @@ inline void partial_sort_impl(It first, It middle, It last, Comp comp) {
 // ---------------------------------------------------------------------------
 
 template <class T, class Comp>
-inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) {
+inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const 选项& o) {
     (void)o;   // consumed only by the parallel branches (compiled out otherwise)
     if (n == 0) return;
+#if FYX_ENABLE_GPU
+    // If the caller asked for the GPU and a backend is present, try it; on any
+    // failure (no device, compile error, ...) it returns false and we fall
+    // through to the verified CPU path below.
+    if (o.gpu && detail::gpu_sort_dispatch(p, n, comp, o)) return;
+#endif
     const bool descending = detail::is_descending_v<Comp, T>;
     const bool ascending  = detail::is_ascending_v<Comp, T>;
     const bool radix_ok   = detail::radix_supported_v<T> && (ascending || descending);
@@ -4624,7 +4792,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
 }
 
 template <class It, class Comp>
-inline void sort_iter_core(It first, It last, Comp comp, const Options& o) {
+inline void sort_iter_core(It first, It last, Comp comp, const 选项& o) {
     const auto n = last - first;
     if (n == 0) return;
     // A raw pointer pair is contiguous: take the radix / network fast path.
@@ -4640,7 +4808,7 @@ inline void sort_iter_core(It first, It last, Comp comp, const Options& o) {
 }
 
 template <class Container, class Comp>
-inline void sort_container_core(Container& c, Comp comp, const Options& o) {
+inline void sort_container_core(Container& c, Comp comp, const 选项& o) {
     auto* p = std::data(c);
     const std::size_t n = static_cast<std::size_t>(std::size(c));
     sort_pointer_core(p, n, comp, o);
@@ -4652,49 +4820,49 @@ inline void sort_container_core(Container& c, Comp comp, const Options& o) {
 
 // ---- pointer + length ------------------------------------------------------
 template <class T>
-inline void sort(T* p, std::size_t n) {
-    sort_pointer_core(p, n, fyx::less{}, Options{});
+inline void 排序(T* p, std::size_t n) {
+    sort_pointer_core(p, n, fyx::less{}, 选项{});
 }
 template <class T, class Comp,
           std::enable_if_t<!detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
-inline void sort(T* p, std::size_t n, Comp comp) {
-    sort_pointer_core(p, n, comp, Options{});
+inline void 排序(T* p, std::size_t n, Comp comp) {
+    sort_pointer_core(p, n, comp, 选项{});
 }
 template <class T>
-inline void sort(T* p, std::size_t n, const Options& o) {
+inline void 排序(T* p, std::size_t n, const 选项& o) {
     sort_pointer_core(p, n, fyx::less{}, o);
 }
 template <class T, class Comp,
           std::enable_if_t<!detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
-inline void sort(T* p, std::size_t n, Comp comp, const Options& o) {
+inline void 排序(T* p, std::size_t n, Comp comp, const 选项& o) {
     sort_pointer_core(p, n, comp, o);
 }
 
 // ---- iterator pair ---------------------------------------------------------
 template <class It,
           std::enable_if_t<detail::is_random_access_v<It>, int> = 0>
-inline void sort(It first, It last) {
-    sort_iter_core(first, last, fyx::less{}, Options{});
+inline void 排序(It first, It last) {
+    sort_iter_core(first, last, fyx::less{}, 选项{});
 }
 template <class It, class Comp,
           std::enable_if_t<detail::is_random_access_v<It> &&
                            !detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
-inline void sort(It first, It last, Comp comp) {
-    sort_iter_core(first, last, comp, Options{});
+inline void 排序(It first, It last, Comp comp) {
+    sort_iter_core(first, last, comp, 选项{});
 }
 template <class It,
           std::enable_if_t<detail::is_random_access_v<It>, int> = 0>
-inline void sort(It first, It last, const Options& o) {
+inline void 排序(It first, It last, const 选项& o) {
     sort_iter_core(first, last, fyx::less{}, o);
 }
 template <class It, class Comp,
           std::enable_if_t<detail::is_random_access_v<It> &&
                            !detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
-inline void sort(It first, It last, Comp comp, const Options& o) {
+inline void 排序(It first, It last, Comp comp, const 选项& o) {
     sort_iter_core(first, last, comp, o);
 }
 
@@ -4702,21 +4870,21 @@ inline void sort(It first, It last, Comp comp, const Options& o) {
 template <class Container,
           std::enable_if_t<detail::has_std_data_v<Container> &&
                            !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
-inline void sort(Container& c) {
-    sort_container_core(c, fyx::less{}, Options{});
+inline void 排序(Container& c) {
+    sort_container_core(c, fyx::less{}, 选项{});
 }
 template <class Container, class Comp,
           std::enable_if_t<detail::has_std_data_v<Container> &&
                            !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>> &&
                            !detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
-inline void sort(Container& c, Comp comp) {
-    sort_container_core(c, comp, Options{});
+inline void 排序(Container& c, Comp comp) {
+    sort_container_core(c, comp, 选项{});
 }
 template <class Container,
           std::enable_if_t<detail::has_std_data_v<Container> &&
                            !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
-inline void sort(Container& c, const Options& o) {
+inline void 排序(Container& c, const 选项& o) {
     sort_container_core(c, fyx::less{}, o);
 }
 template <class Container, class Comp,
@@ -4724,7 +4892,7 @@ template <class Container, class Comp,
                            !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>> &&
                            !detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
-inline void sort(Container& c, Comp comp, const Options& o) {
+inline void 排序(Container& c, Comp comp, const 选项& o) {
     sort_container_core(c, comp, o);
 }
 
@@ -4866,12 +5034,245 @@ inline void nth_element(Container& c, std::size_t nth_n) {
 //  the symbols; they are emitted with external C linkage there.
 // ===========================================================================
 extern "C" {
-inline int fyx_sort_int32 (std::int32_t*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_uint32(std::uint32_t* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_int64 (std::int64_t*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_uint64(std::uint64_t* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_float (float*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_double(double* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_int32 (std::int32_t*  d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_uint32(std::uint32_t* d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_int64 (std::int64_t*  d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_uint64(std::uint64_t* d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_float (float*  d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_double(double* d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
 }
+
+// ===========================================================================
+//  Section 15 -- GPU layer (skeleton + CPU fallback)
+//
+//  SCOPE / HONESTY NOTE: this sandbox has no GPU and no network, so the GPU
+//  compute path CANNOT be compiled or run here.  Per DESIGN.md section 16 the
+//  GPU layer's agreed scope is "skeleton + CPU fallback", so this file:
+//    * probes for a CUDA driver at runtime via dlopen (no GPU headers needed
+//      to compile -- symbols are resolved through dlsym);
+//    * exposes a device-buffer / stream abstraction;
+//    * routes fyx::sort through gpu_sort_dispatch, which returns false on any
+//      failure so the caller falls back to the verified CPU kernels.
+//  The actual device kernel is opt-in behind FYX_GPU_COMPUTE (off by default)
+//  because it is UNVERIFIED without a GPU; enabling it is for GPU boxes where
+//  the kernel can be debugged against real hardware.
+//
+//  Build: define FYX_ENABLE_GPU to include this file.  Default build skips it.
+// ===========================================================================
+
+#if FYX_ENABLE_GPU
+#include <dlfcn.h>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace fyx {
+namespace detail {
+
+// Opaque CUDA driver / NVRTC types (we do not include cuda.h; approximate
+// definitions are enough for passing pointers through dlsym).
+typedef int                 CUdevice;
+typedef void*               CUcontext;
+typedef void*               CUmodule;
+typedef void*               CUfunction;
+typedef void*               CUstream;
+typedef unsigned long long  CUdeviceptr;
+typedef void*               nvrtcProgram;
+
+// ---- resolved driver symbols ----------------------------------------------
+struct CudaSyms {
+    void* lib = nullptr;
+    void* nvrtc = nullptr;
+    // driver API
+    int (*cuInit)(unsigned int) = nullptr;
+    int (*cuDeviceGet)(CUdevice*, int) = nullptr;
+    int (*cuCtxCreate)(CUcontext*, unsigned int, CUdevice) = nullptr;
+    int (*cuMemAlloc)(CUdeviceptr*, std::size_t) = nullptr;
+    int (*cuMemcpyHtoD)(CUdeviceptr, const void*, std::size_t) = nullptr;
+    int (*cuMemcpyDtoH)(void*, CUdeviceptr, std::size_t) = nullptr;
+    int (*cuModuleLoadData)(CUmodule*, const char*) = nullptr;
+    int (*cuModuleGetFunction)(CUfunction*, CUmodule, const char*) = nullptr;
+    int (*cuLaunchKernel)(CUfunction, unsigned,unsigned,unsigned,
+                          unsigned,unsigned,unsigned,
+                          unsigned, CUstream, void**, void**) = nullptr;
+    int (*cuMemFree)(CUdeviceptr) = nullptr;
+    int (*cuCtxDestroy)(CUcontext) = nullptr;
+    // NVRTC
+    int (*nvrtcCreateProgram)(nvrtcProgram*, const char*, const char*,
+                              int, const char**, const char**) = nullptr;
+    int (*nvrtcCompileProgram)(nvrtcProgram, int, const char**) = nullptr;
+    int (*nvrtcGetPTX)(nvrtcProgram, char*) = nullptr;
+    int (*nvrtcDestroyProgram)(nvrtcProgram*) = nullptr;
+
+    bool ok = false;
+};
+
+inline CudaSyms& cuda_syms() {
+    static CudaSyms s;
+    if (s.ok) return s;
+    // dlopen the driver + compiler; if either is missing we simply stay disabled.
+    s.lib   = dlopen("libcuda.so",      RTLD_LAZY | RTLD_LOCAL);
+    s.nvrtc = dlopen("libnvrtc.so",     RTLD_LAZY | RTLD_LOCAL);
+    if (!s.lib) { if (s.nvrtc) dlclose(s.nvrtc); return s; }
+    auto sym = [](void* h, const char* n) -> void* {
+        return h ? dlsym(h, n) : nullptr;
+    };
+    s.cuInit              = (decltype(s.cuInit))             sym(s.lib, "cuInit");
+    s.cuDeviceGet         = (decltype(s.cuDeviceGet))        sym(s.lib, "cuDeviceGet");
+    s.cuCtxCreate         = (decltype(s.cuCtxCreate))        sym(s.lib, "cuCtxCreate");
+    s.cuMemAlloc          = (decltype(s.cuMemAlloc))          sym(s.lib, "cuMemAlloc");
+    s.cuMemcpyHtoD        = (decltype(s.cuMemcpyHtoD))        sym(s.lib, "cuMemcpyHtoD");
+    s.cuMemcpyDtoH        = (decltype(s.cuMemcpyDtoH))        sym(s.lib, "cuMemcpyDtoH");
+    s.cuModuleLoadData    = (decltype(s.cuModuleLoadData))    sym(s.lib, "cuModuleLoadData");
+    s.cuModuleGetFunction = (decltype(s.cuModuleGetFunction)) sym(s.lib, "cuModuleGetFunction");
+    s.cuLaunchKernel      = (decltype(s.cuLaunchKernel))      sym(s.lib, "cuLaunchKernel");
+    s.cuMemFree           = (decltype(s.cuMemFree))           sym(s.lib, "cuMemFree");
+    s.cuCtxDestroy        = (decltype(s.cuCtxDestroy))        sym(s.lib, "cuCtxDestroy");
+    if (s.nvrtc) {
+        s.nvrtcCreateProgram   = (decltype(s.nvrtcCreateProgram))   sym(s.nvrtc, "nvrtcCreateProgram");
+        s.nvrtcCompileProgram  = (decltype(s.nvrtcCompileProgram))  sym(s.nvrtc, "nvrtcCompileProgram");
+        s.nvrtcGetPTX          = (decltype(s.nvrtcGetPTX))          sym(s.nvrtc, "nvrtcGetPTX");
+        s.nvrtcDestroyProgram  = (decltype(s.nvrtcDestroyProgram))  sym(s.nvrtc, "nvrtcDestroyProgram");
+    }
+    s.ok = s.cuInit && s.cuDeviceGet && s.cuCtxCreate && s.cuMemAlloc &&
+           s.cuMemcpyHtoD && s.cuMemcpyDtoH && s.cuModuleLoadData &&
+           s.cuModuleGetFunction && s.cuLaunchKernel && s.cuMemFree && s.cuCtxDestroy &&
+           s.nvrtcCreateProgram && s.nvrtcCompileProgram && s.nvrtcGetPTX && s.nvrtcDestroyProgram;
+    return s;
+}
+
+// ---- device buffer ---------------------------------------------------------
+template <class T>
+struct GpuBuffer {
+    CudaSyms*   s = nullptr;
+    CUdeviceptr  dev = 0;
+    std::size_t  n = 0;
+    ~GpuBuffer() { if (s && dev && s->cuMemFree) s->cuMemFree(dev); }
+    bool alloc(CudaSyms& syms, std::size_t count) {
+        s = &syms; n = count;
+        return syms.cuMemAlloc(&dev, count * sizeof(T)) == 0;
+    }
+    bool upload(const T* host) { return s->cuMemcpyHtoD(dev, host, n * sizeof(T)) == 0; }
+    bool download(T* host)     { return s->cuMemcpyDtoH(host, dev, n * sizeof(T)) == 0; }
+};
+
+// ---- the (opt-in, UNVERIFIED) device radix kernel -------------------------
+// One LSD pass: histogram with atomics, then a host prefix-sum, then an atomic
+// scatter into the output buffer.  Repeats for every 8-bit digit.  This is the
+// structure DESIGN.md section 2.6 describes; it is NOT run in CI (no GPU) and
+// is provided so a GPU owner can enable FYX_GPU_COMPUTE and debug it there.
+#if defined(FYX_GPU_COMPUTE)
+inline std::string gpu_radix_kernel_src(std::size_t key_bytes) {
+    const char* ktype = key_bytes == 8 ? "unsigned long long"
+                      : key_bytes == 4 ? "unsigned int"
+                      : key_bytes == 2 ? "unsigned short"
+                      :                  "unsigned char";
+    return std::string(R"CUDA(
+extern "C" __global__ void fyx_hist(const )") + ktype + R"CUDA( *__restrict__ in,
+                                  unsigned int* __restrict__ hist,
+                                  unsigned int shift, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int d = (unsigned int)((in[i] >> shift) & 0xFFu);
+    atomicAdd(&hist[d], 1u);
+}
+extern "C" __global__ void fyx_scatter(const )") + ktype + R"CUDA( *__restrict__ in,
+                                    )" + ktype + R"CUDA( *__restrict__ out,
+                                    unsigned int* __restrict__ base,
+                                    unsigned int shift, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int d = (unsigned int)((in[i] >> shift) & 0xFFu);
+    unsigned int pos = atomicAdd(&base[d], 1u);
+    out[pos] = in[i];
+}
+)CUDA";
+}
+#endif
+
+// ---- dispatch entry (returns true on success, false to fall back to CPU) ---
+template <class T, class Comp>
+inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp, const 选项&) {
+    // Only numeric, default-ascending keys can take the GPU radix path.
+    if (!radix_supported_v<T> || !is_ascending_v<Comp, T>) return false;
+    CudaSyms& s = cuda_syms();
+    if (!s.ok) return false;   // no driver -> CPU fallback
+
+#if defined(FYX_GPU_COMPUTE)
+    // UNVERIFIED ON THIS BOX (no GPU).  Wrapped so any failure falls back.
+    try {
+        CUdevice dev = 0;
+        CUcontext ctx = nullptr;
+        if (s.cuInit(0) != 0) return false;
+        if (s.cuDeviceGet(&dev, 0) != 0) return false;
+        if (s.cuCtxCreate(&ctx, 0, dev) != 0) return false;
+
+        GpuBuffer<T> d_in, d_out;
+        GpuBuffer<unsigned int> d_hist, d_base;
+        if (!d_in.alloc(s, n)  || !d_out.alloc(s, n) ||
+            !d_hist.alloc(s, 256) || !d_base.alloc(s, 256)) { s.cuCtxDestroy(ctx); return false; }
+        if (!d_in.upload(p)) { s.cuCtxDestroy(ctx); return false; }
+
+        const std::size_t digits = sizeof(T);  // 8-bit digits per byte
+        const std::size_t threads = 256, blocks = (n + threads - 1) / threads;
+        unsigned int nn = static_cast<unsigned int>(n);
+        CUmodule mod = nullptr;
+        CUfunction fhist = nullptr, fscat = nullptr;
+        std::string ptx;
+        {
+            nvrtcProgram prog = nullptr;
+            std::string src = gpu_radix_kernel_src(sizeof(T));
+            if (s.nvrtcCreateProgram(&prog, src.c_str(), "fyx_radix", 0, nullptr, nullptr) != 0)
+                { s.cuCtxDestroy(ctx); return false; }
+            const char* opts[] = { "--gpu-architecture=compute_70" };
+            if (s.nvrtcCompileProgram(prog, 1, opts) != 0)
+                { s.nvrtcDestroyProgram(&prog); s.cuCtxDestroy(ctx); return false; }
+            std::size_t sz = 0; char* buf = nullptr;
+            s.nvrtcGetPTX(prog, buf); /* buf points into prog; load below */
+            ptx = std::string(buf ? buf : "");
+            s.nvrtcDestroyProgram(&prog);
+        }
+        if (s.cuModuleLoadData(&mod, ptx.c_str()) != 0) { s.cuCtxDestroy(ctx); return false; }
+        s.cuModuleGetFunction(&fhist, mod, "fyx_hist");
+        s.cuModuleGetFunction(&fscat, mod, "fyx_scatter");
+
+        std::vector<unsigned int> host_hist(256), host_base(256);
+        std::vector<T> dbl_buf(n);  // host scratch for the ping-pong
+        const T* cur_in = p;        // we copy through dbl_buf on host each pass
+        // (device ping-pong uses d_in/d_out; simplified to a single in/out swap)
+        for (std::size_t d = 0; d < digits; ++d) {
+            unsigned int shift = static_cast<unsigned int>(d * 8);
+            std::memset(host_hist.data(), 0, 256 * sizeof(unsigned int));
+            if (s.cuMemcpyHtoD(d_hist.dev, host_hist.data(), 256 * sizeof(unsigned int)) != 0) break;
+            void* hargs[] = { &d_in.dev, &d_hist.dev, &shift, &nn };
+            s.cuLaunchKernel(fhist, blocks,1,1, threads,1,1, 0, nullptr, hargs, nullptr);
+            if (s.cuMemcpyDtoH(host_hist.data(), d_hist.dev, 256 * sizeof(unsigned int)) != 0) break;
+            unsigned int sum = 0;
+            for (int b = 0; b < 256; ++b) { host_base[b] = sum; sum += host_hist[b]; }
+            if (s.cuMemcpyHtoD(d_base.dev, host_base.data(), 256 * sizeof(unsigned int)) != 0) break;
+            void* sargs[] = { &d_in.dev, &d_out.dev, &d_base.dev, &shift, &nn };
+            s.cuLaunchKernel(fscat, blocks,1,1, threads,1,1, 0, nullptr, sargs, nullptr);
+            // swap in/out for next digit
+            CUdeviceptr tmp = d_in.dev; d_in.dev = d_out.dev; d_out.dev = tmp;
+        }
+        if (s.cuMemcpyDtoH(const_cast<T*>(cur_in), d_in.dev, n * sizeof(T)) != 0) { s.cuCtxDestroy(ctx); return false; }
+        (void)dbl_buf;
+        s.cuCtxDestroy(ctx);
+        return true;   // GPU path completed
+    } catch (...) {
+        return false;  // any failure -> CPU fallback
+    }
+#else
+    (void)p; (void)n;
+    return false;      // compute path disabled: CPU fallback (the documented default)
+#endif
+}
+
+} // namespace detail
+} // namespace fyx
+
+#endif // FYX_ENABLE_GPU
 
 #endif // FYX_SORT_HPP_INCLUDED
