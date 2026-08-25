@@ -56,6 +56,69 @@ struct has_std_data<C, std::void_t<
 template <class C>
 inline constexpr bool has_std_data_v = has_std_data<C>::value;
 
+// Forward declaration of the (optionally compiled) GPU dispatch.  Defined in
+// parts/15_gpu.hpp under #ifdef FYX_ENABLE_GPU; when that switch is off the
+// function does not exist and the guarded call sites below compile away.
+#if FYX_ENABLE_GPU
+template <class T, class Comp>
+inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp comp, const Options& o);
+#endif
+
+// ---------------------------------------------------------------------------
+// Counting sort (武器二): for integers whose value *range* is small, an O(n +
+// range) pass beats both radix and comparison sorts.  Stable.  Returns false
+// (caller falls back to radix) when the range is too wide to count cheaply.
+// Only valid when the comparator is the default < or > (sorting by value
+// order); custom comparators must not use this.
+// ---------------------------------------------------------------------------
+template <class T>
+inline bool counting_sort(T* p, std::size_t n) {
+    using U = typename std::make_unsigned<T>::type;
+    const std::size_t kMaxRange = 1u << 20;   // 1M buckets cap
+
+    // Cheap sample to estimate the range; bail early on obviously-wide data.
+    T mn = p[0], mx = p[0];
+    const std::size_t stride = n > 4096 ? n / 4096 : 1;
+    for (std::size_t i = 0; i < n; i += stride) {
+        if (p[i] < mn) mn = p[i];
+        if (p[i] > mx) mx = p[i];
+    }
+    // Overflow-safe span check (handles signed extremes like INT64_MIN..MAX).
+    if (mn < T(0) && mx > T(0)) {
+        if (static_cast<U>(mx) > std::numeric_limits<U>::max() - static_cast<U>(-mn))
+            return false;
+    }
+    if (static_cast<std::size_t>(static_cast<U>(mx) - static_cast<U>(mn)) + 1 > kMaxRange)
+        return false;
+
+    // Exact full min/max.
+    mn = p[0]; mx = p[0];
+    for (std::size_t i = 1; i < n; ++i) {
+        if (p[i] < mn) mn = p[i];
+        if (p[i] > mx) mx = p[i];
+    }
+    const U lo = static_cast<U>(mn);
+    std::size_t range = static_cast<std::size_t>(static_cast<U>(mx) - lo) + 1;
+    if (range > kMaxRange) return false;
+
+    ScratchLease<std::size_t> lease(range);
+    if (!lease.valid()) return false;
+    std::size_t* c = lease.get();
+    for (std::size_t i = 0; i < range; ++i) c[i] = 0;
+    for (std::size_t i = 0; i < n; ++i) c[static_cast<U>(p[i]) - lo]++;
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < range; ++i) { std::size_t cnt = c[i]; c[i] = total; total += cnt; }
+    ScratchLease<T> out(n);
+    if (!out.valid()) return false;
+    T* o = out.get();
+    for (std::size_t i = 0; i < n; ++i) {
+        std::size_t idx = static_cast<U>(p[i]) - lo;
+        o[c[idx]++] = p[i];
+    }
+    for (std::size_t i = 0; i < n; ++i) p[i] = o[i];
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Single-threaded best-kernel selection for a contiguous pointer range.
 // `descending` is only consulted for radix-encodable types (where we may have
@@ -84,6 +147,14 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending) {
         }
     }
     if (n <= kInsertionThreshold) { insertion_sort(p, p + n, comp); return; }
+    // Generic (non-radix) path: for non-arithmetic types (strings, structs,
+    // custom comparators) an ips4o-style sample sort beats pdqsort on
+    // comparison cost.  sample_sort self-guards the low-cardinality case and
+    // falls back to pdqsort internally.
+    if (n >= kSampleThreshold && !std::is_arithmetic_v<T>) {
+        sample_sort(p, p + n, comp);
+        return;
+    }
     pdqsort(p, p + n, comp);
 }
 
@@ -200,6 +271,12 @@ template <class T, class Comp>
 inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) {
     (void)o;   // consumed only by the parallel branches (compiled out otherwise)
     if (n == 0) return;
+#if FYX_ENABLE_GPU
+    // If the caller asked for the GPU and a backend is present, try it; on any
+    // failure (no device, compile error, ...) it returns false and we fall
+    // through to the verified CPU path below.
+    if (o.gpu && detail::gpu_sort_dispatch(p, n, comp, o)) return;
+#endif
     const bool descending = detail::is_descending_v<Comp, T>;
     const bool ascending  = detail::is_ascending_v<Comp, T>;
     const bool radix_ok   = detail::radix_supported_v<T> && (ascending || descending);
@@ -472,10 +549,10 @@ inline void nth_element(Container& c, std::size_t nth_n) {
 //  the symbols; they are emitted with external C linkage there.
 // ===========================================================================
 extern "C" {
-inline int fyx_sort_int32 (std::int32_t*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_uint32(std::uint32_t* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_int64 (std::int64_t*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_uint64(std::uint64_t* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_float (float*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_double(double* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_int32 (std::int32_t*  d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_uint32(std::uint32_t* d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_int64 (std::int64_t*  d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_uint64(std::uint64_t* d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_float (float*  d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_double(double* d, std::size_t n) noexcept { try { fyx::排序(d, n); return 0; } catch (...) { return -1; } }
 }
