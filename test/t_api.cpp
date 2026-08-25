@@ -310,13 +310,13 @@ int main() {
             -std::numeric_limits<float>::denorm_min(),
             std::numeric_limits<float>::denorm_min(),
             3.14159f, -2.71828f, 1e30f, -1e30f};
-        std::vector<float> g = v; fyx::sort(g);
+        std::vector<float> g = v; fyx::排序(g);
         bool ok = true; size_t i = 0;
         for (; i < g.size() && g[i] == g[i]; ++i) if (i && g[i-1] > g[i]) ok = false;
         for (size_t j = i; j < g.size(); ++j) if (g[j] == g[j]) ok = false;  // NaN at end
         CHECK(ok, "float NaN at end + finite nondecreasing");
         std::vector<float> z = {0.0f,-0.0f,0.0f,-0.0f};
-        fyx::sort(z);
+        fyx::排序(z);
         bool zok = std::signbit(z[0]) && std::signbit(z[1]) && !std::signbit(z[2]) && !std::signbit(z[3]);
         CHECK(zok, "-0 before +0");
     }
@@ -327,7 +327,7 @@ int main() {
         std::mt19937_64 rng(23);
         std::vector<int32_t> a(1000);
         for (auto& x : a) x = static_cast<int32_t>(rng() % 5000);
-        std::vector<int32_t> ref = a; std::sort(ref.begin(), ref.end());
+        std::vector<int32_t> ref = a; std::排序(ref.begin(), ref.end());
         int rc = fyx_sort_int32(a.data(), a.size());
         CHECK(rc == 0, "fyx_sort_int32 return code");
         CHECK(a == ref, "fyx_sort_int32 result");
@@ -335,9 +335,28 @@ int main() {
     {
         std::vector<double> a(500); std::mt19937_64 rng(29);
         for (auto& x : a) x = static_cast<double>(rng()%1000)/7.0;
-        std::vector<double> ref = a; std::sort(ref.begin(), ref.end());
+        std::vector<double> ref = a; std::排序(ref.begin(), ref.end());
         CHECK(fyx_sort_double(a.data(), a.size()) == 0, "fyx_sort_double rc");
         CHECK(a == ref, "fyx_sort_double result");
+    }
+
+    // ---- Options.gpu path (falls back to CPU when no GPU backend) ----------
+    printf("  Options.gpu=true (CPU fallback)\n");
+    {
+        std::mt19937_64 rng(41);
+        for (std::size_t n : {0u, 1u, 50u, 1000u, 50000u}) {
+            std::vector<int> a(n);
+            for (std::size_t i = 0; i < n; ++i) a[i] = static_cast<int>(rng() % 100000);
+            std::vector<int> ref = a; std::排序(ref.begin(), ref.end());
+            选项 og; og.gpu = true; og.parallel = Tri::Off;
+            fyx::排序(a, og);
+            CHECK(a == ref, (std::string("gpu-option i32 n=") + std::to_string(n)).c_str());
+            std::vector<double> d(n);
+            for (std::size_t i = 0; i < n; ++i) d[i] = static_cast<double>(rng() % 1000) / 7.0;
+            std::vector<double> dr = d; std::排序(dr.begin(), dr.end());
+            fyx::排序(d, og);
+            CHECK(d == dr, (std::string("gpu-option f64 n=") + std::to_string(n)).c_str());
+        }
     }
 
     printf("checks=%d failures=%d\n", checks, failures);
