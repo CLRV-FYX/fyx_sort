@@ -56,6 +56,30 @@ struct has_std_data<C, std::void_t<
 template <class C>
 inline constexpr bool has_std_data_v = has_std_data<C>::value;
 
+template <class It>
+struct is_std_reverse_iterator : std::false_type {};
+template <class It>
+struct is_std_reverse_iterator<std::reverse_iterator<It>> : std::true_type {};
+
+template <class It, class = void>
+struct iterator_base_pointer {
+    static constexpr bool value = false;
+};
+
+template <class It>
+struct iterator_base_pointer<It, std::void_t<decltype(std::declval<It>().base()), decltype(*std::declval<It>())>> {
+    using raw_base = std::remove_reference_t<decltype(std::declval<It>().base())>;
+    using pointee  = std::remove_pointer_t<raw_base>;
+    static constexpr bool value = std::is_pointer<raw_base>::value &&
+        !std::is_const<pointee>::value &&
+        std::is_lvalue_reference<decltype(*std::declval<It>())>::value &&
+        !is_std_reverse_iterator<typename std::decay<It>::type>::value;
+    static raw_base get(It it) noexcept { return it.base(); }
+};
+
+template <class It>
+inline constexpr bool has_mutable_base_pointer_v = iterator_base_pointer<It>::value;
+
 // Forward declaration of the (optionally compiled) GPU dispatch.  Defined in
 // parts/15_gpu.hpp under #ifdef FYX_ENABLE_GPU; when that switch is off the
 // function does not exist and the guarded call sites below compile away.
@@ -517,6 +541,70 @@ inline bool apply_profile_fast_exit(T* p, std::size_t n,
 template <class T>
 inline bool try_integer_sparse_count_sort(T* p, std::size_t n, bool descending) {
     if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        if (n < kCountingMinN) return false;
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        constexpr std::size_t Cap  = 1024;
+        constexpr std::size_t Mask = Cap - 1;
+
+        std::array<Key, Cap> keys{};
+        std::array<std::size_t, Cap> counts{};
+        std::array<unsigned char, Cap> used{};
+        std::vector<Key> distinct;
+        distinct.reserve(kCountingClassLimit);
+
+        for (std::size_t i = 0; i < n; ++i) {
+            const Key k = RT::encode(p[i]);
+            std::size_t h = low_card_hash_key(k) & Mask;
+            for (;;) {
+                if (!used[h]) {
+                    if (distinct.size() >= kCountingClassLimit) return false;
+                    used[h] = 1;
+                    keys[h] = k;
+                    counts[h] = 1;
+                    distinct.push_back(k);
+                    break;
+                }
+                if (keys[h] == k) { ++counts[h]; break; }
+                h = (h + 1) & Mask;
+            }
+        }
+
+        if (distinct.size() <= 1) return true;
+        std::sort(distinct.begin(), distinct.end());
+
+        auto lookup_count = [&](Key k) noexcept -> std::size_t {
+            std::size_t h = low_card_hash_key(k) & Mask;
+            while (used[h]) {
+                if (keys[h] == k) return counts[h];
+                h = (h + 1) & Mask;
+            }
+            return 0;
+        };
+
+        std::size_t out = 0;
+        if (!descending) {
+            for (Key k : distinct) {
+                const T v = RT::decode(k);
+                for (std::size_t c = lookup_count(k); c != 0; --c) p[out++] = v;
+            }
+        } else {
+            for (std::size_t i = distinct.size(); i-- > 0;) {
+                const Key k = distinct[i];
+                const T v = RT::decode(k);
+                for (std::size_t c = lookup_count(k); c != 0; --c) p[out++] = v;
+            }
+        }
+        return true;
+    }
+}
+
+template <class T>
+inline bool try_radix_key_sparse_count_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
         (void)p; (void)n; (void)descending;
         return false;
     } else {
@@ -1539,7 +1627,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
     if (radix_order) {
         if (!high_entropy) {
             if (try_integer_range_count_sort(p, n, descending)) { record_dispatch(DispatchDecision::LowCardinality); return; }
-            if (try_integer_sparse_count_sort(p, n, descending)) { record_dispatch(DispatchDecision::LowCardinality); return; }
+            if (try_radix_key_sparse_count_sort(p, n, descending)) { record_dispatch(DispatchDecision::LowCardinality); return; }
             if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         }
         if (partial_pdq) { pdqsort(p, p + n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
@@ -1793,7 +1881,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
             if (!high_entropy) {
                 if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
-                if (detail::try_integer_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
             if (partial_pdq) { detail::pdqsort(p, p + n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
@@ -1842,9 +1930,16 @@ inline void sort_iter_core(It first, It last, Comp comp, const Options& o) {
     (void)o;
     const auto n0 = last - first;
     if (n0 == 0) return;
-    // A raw pointer pair is contiguous: take the radix / network fast path.
+    // Raw pointers and libstdc++/libc++ vector/string normal iterators are
+    // contiguous: route them through the pointer dispatcher so numeric radix,
+    // sparse count and top-level profiling are not lost when callers write
+    // fyx::sort(v.begin(), v.end()) instead of fyx::sort(v).
     if constexpr (std::is_pointer_v<It>) {
         sort_pointer_core(first, static_cast<std::size_t>(n0), comp, o);
+        return;
+    } else if constexpr (detail::has_mutable_base_pointer_v<It>) {
+        sort_pointer_core(detail::iterator_base_pointer<It>::get(first),
+                          static_cast<std::size_t>(n0), comp, o);
         return;
     }
     const std::size_t n = static_cast<std::size_t>(n0);

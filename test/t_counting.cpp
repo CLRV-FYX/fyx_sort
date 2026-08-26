@@ -174,6 +174,33 @@ int main() {
     {
         namespace fd = fyx::detail;
         std::vector<int> v(200000);
+        for (auto& x : v) x = static_cast<int>(rng());
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::Off;
+        fyx::sort(v.begin(), v.end(), o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
+              "vector iterator numeric random uses pointer radix dispatch");
+        CHECK(std::is_sorted(v.begin(), v.end()), "vector iterator numeric random output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<float> keys(16);
+        for (std::size_t i = 0; i < keys.size(); ++i)
+            keys[i] = static_cast<float>(static_cast<int>(i) - 8) * 1.25f;
+        std::vector<float> v(200000);
+        for (auto& x : v) x = keys[rng() % keys.size()];
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::Off;
+        fyx::sort(v.begin(), v.end(), o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::LowCardinality,
+              "vector iterator float low-cardinality uses radix-key sparse count");
+        CHECK(std::is_sorted(v.begin(), v.end()), "vector iterator float low-cardinality output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<int> v(200000);
         std::iota(v.begin(), v.end(), 0);
         for (std::size_t i = 1000; i + 1 < v.size(); i += 4096)
             std::swap(v[i], v[i + 1]);

@@ -22,11 +22,13 @@ Date: 2026-08-26
 - IPS4o regression matrix now includes a high-distinct `struct { int key; int payload; }` custom-comparator case.
 - Counting/string/comparator-key/parallel-merge edge-case tests in `test/t_counting.cpp`.
 - Unified top-level input profiling (`InputProfile` / `profile_input`) with dispatch test hooks for sorted, reverse, all-equal, low-cardinality, partially sorted and high-entropy cases.
+- Contiguous iterator fast-path detection for vector/string-style normal iterators, so `fyx::sort(v.begin(), v.end())` reaches the same pointer dispatcher as `fyx::sort(v)`.
 
 ### Improved
 
 - Monotone distribution detection for sorted/reverse/all-equal inputs is now centralized in the weapon-seven profile layer.  The profile samples 1024 elements, then when worthwhile performs one linear validation scan that combines sorted/reverse/all-equal checks, capped distinct detection and adjacent inversion counting.  Low-cardinality samples are used as a dispatch hint and are still fully validated by the existing counting paths, avoiding an extra profile-only O(n) pass on the low-cardinality hot path.  Default-order floating point uses radix keys to preserve NaN and `-0/+0` semantics.
 - Partially sorted inputs whose adjacent inversion count is at most `n/64` now short-circuit to pdqsort before sample/radix fallback when that is the safer dispatch choice.
+- Radix-key sparse counting now covers all radix-supported scalar keys, not just integral types; this gives default-order low-cardinality `float`/`double` inputs an O(n) count/fill path while preserving radix total-order semantics for `-0/+0` and NaNs.
 - Sample sort now uses a lighter IPS4o-style oversampling policy and temp scatter for non-trivial object types to improve cache locality.
 - Sample-sort permutation was replaced with block-level bucket reorder: per-source-block bucket counts/prefix bases scatter into a temporary buffer, then copy/move back by block.
 - Comparator-key sorting for trivially copyable records now detects integer key fields (`int32/uint32/int64/uint64` prefixes/offsets), validates comparator semantics by sampling, uses low-cardinality count sort when appropriate, and otherwise uses payload-preserving field-key radix sort with a final comparator `is_sorted` guard.

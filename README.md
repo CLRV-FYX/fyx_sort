@@ -41,7 +41,7 @@ Chase-Lev 工作窃取线程池、自适应算法调度、稳定排序接口、�
 std::vector<int> v = {5, 3, 8, 1, 9, 2};
 
 fyx::sort(v);                        // 容器重载
-fyx::sort(v.begin(), v.end());       // 迭代器对
+fyx::sort(v.begin(), v.end());       // 迭代器对；vector/string 等连续迭代器会进入同一指针快路径
 fyx::sort(v.data(), v.size());       // 指针 + 长度
 fyx::sort(v, std::greater<int>());   // 自定义比较器（降序）
 
@@ -81,6 +81,7 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | 逆序（非 stable） | 统一 profile 一次验证后反转 |
 | 部分有序（相邻逆序边 ≤ n/64，且规模合理） | pdqsort |
 | 整数小值域 | 计数排序（O(n + range)） |
+| 数值/浮点默认顺序低基数（≤256 radix keys） | radix-key 稀疏计数排序（O(n)，保留 `-0/+0`/NaN 总序语义） |
 | 任意类型低基数（≤256 等价类） | 压缩计数排序，保留原始对象 payload；`stable_sort` 保持稳定 |
 | 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，单趟融合直方图，非临时散射写） |
 | 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀） |
