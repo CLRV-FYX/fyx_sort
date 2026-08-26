@@ -34,7 +34,7 @@ int main() {
         const unsigned m = 255;
         std::vector<int> s(m);
         for (unsigned i = 0; i < m; ++i) s[i] = static_cast<int>(rng() % 1000000);
-        std::排序(s.begin(), s.end());
+        std::sort(s.begin(), s.end());
         std::vector<int> tree(2 * m + 1);
         build_classifier_tree(tree, s.data(), 1, 0, (int)m - 1, std::less<int>());
         int ok = 1;
@@ -50,7 +50,7 @@ int main() {
         const unsigned m = 255;
         std::vector<std::string> s(m);
         for (unsigned i = 0; i < m; ++i) s[i] = std::to_string(rng() % 100000);
-        std::排序(s.begin(), s.end());
+        std::sort(s.begin(), s.end());
         std::vector<std::string> tree(2 * m + 1);
         build_classifier_tree(tree, s.data(), 1, 0, (int)m - 1, std::less<std::string>());
         int ok = 1;
@@ -65,8 +65,8 @@ int main() {
 
     // ---- 2. fyx::sort on strings: high + low distinct --------------------
     auto check_str = [&](const char* tag, const std::vector<std::string>& in) {
-        std::vector<std::string> ref = in; std::排序(ref.begin(), ref.end());
-        std::vector<std::string> got = in; fyx::排序(got);
+        std::vector<std::string> ref = in; std::sort(ref.begin(), ref.end());
+        std::vector<std::string> got = in; fyx::sort(got);
         CHECK(got == ref, tag);
     };
     printf("string sorting (sample path)\n");
@@ -106,8 +106,8 @@ int main() {
         };
         std::vector<Rec> v(300000);
         for (auto& r : v) { r.k = static_cast<int>(rng() % 1000); r.v = static_cast<int>(rng() % 1000); }
-        std::vector<Rec> ref = v; std::排序(ref.begin(), ref.end(), cmp);
-        fyx::排序(v, cmp);
+        std::vector<Rec> ref = v; std::sort(ref.begin(), ref.end(), cmp);
+        fyx::sort(v, cmp);
         CHECK(v == ref, "struct custom comparator");
         // descending
         auto gcmp = [](const Rec& a, const Rec& b) {
@@ -115,8 +115,8 @@ int main() {
             return a.v > b.v;
         };
         std::vector<Rec> v2 = v; std::vector<Rec> ref2 = v2;
-        std::排序(ref2.begin(), ref2.end(), gcmp);
-        fyx::排序(v2, gcmp);
+        std::sort(ref2.begin(), ref2.end(), gcmp);
+        fyx::sort(v2, gcmp);
         CHECK(v2 == ref2, "struct custom comparator descending");
     }
 
@@ -127,8 +127,8 @@ int main() {
         std::vector<std::string> v(n);
         for (auto& s : v) { s.resize(16); for (char& c : s) c = (char)('a' + (rng() % 26)); }
         std::vector<std::string> a = v, b = v;
-        auto t0 = std::chrono::steady_clock::now(); fyx::排序(a);
-        auto t1 = std::chrono::steady_clock::now(); std::排序(b.begin(), b.end());
+        auto t0 = std::chrono::steady_clock::now(); fyx::sort(a);
+        auto t1 = std::chrono::steady_clock::now(); std::sort(b.begin(), b.end());
         auto t2 = std::chrono::steady_clock::now();
         double tf = std::chrono::duration<double>(t1 - t0).count();
         double ts = std::chrono::duration<double>(t2 - t1).count();

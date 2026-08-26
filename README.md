@@ -16,8 +16,8 @@ Chase-Lev 工作窃取线程池、自适应算法调度、稳定排序接口、�
   `fyx::nth_element`，以及指针+长度、迭代器对、容器、`Options`、`extern "C"` ABI 等全部重载形态。
 - **验证环境**：Intel Xeon Ice Lake-SP，2 vCPU，g++ 12.2.0，
   `-O2 -march=native -pthread -Wall -Wextra -Werror`。
-  既有 6 个测试（t_scalar / t_net / t_radix / t_pdq / t_pool / t_deque_race）全绿，
-  新增 `test/t_api.cpp`（837 项断言）全绿。
+  既有内核测试（t_scalar / t_net / t_radix / t_pdq / t_pool / t_deque_race）全绿，
+  公开 API、sample sort 与 counting/string/IPS4o 对比相关测试全绿。
 - **性能数字只看 `BENCHMARKS.md`**（本机实测）。旧文档里那些「1 亿 int 2.5~4 秒」之类的
   营销数字**没有在本环境实测过**，请当作未经证实的参考，不要照搬到你的机器上。
 - **我们能站得住脚的承诺**：在本机上，对测试过的分布，`fyx::sort` **不会比 `std::sort` 慢**，
@@ -68,21 +68,30 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 
 ## 算法与自适应调度
 
-`fyx::sort` 在编译期/运行期自动选择内核（只走它**能证明等价于请求顺序**的路径，
-不做「已排序就直接返回」之类的猜测，避免误判返回乱序）：
+`fyx::sort` 在编译期/运行期自动选择内核。入口处有统一的输入分布预检测层：
+先采样 1024 个元素判断是否值得全量验证；当样本显示已排序、逆序、全等或部分有序时，
+再用一次线性扫描同时验证 monotonicity、等价性、 distinct≤256 上限 与相邻逆序边计数。低基数样本只作为候选信号，
+真正提交前仍由现有计数排序路径完整验证，避免 profile 本身给低基数场景额外增加一趟 O(n) 税。所有提前退出都必须由线性校验证明，
+不会靠猜测返回；明显随机高基数样本会跳过完整 distinct 预检，直接进入 radix / MSD / sample 路径。
 
 | 条件 | 选择的内核 |
 |---|---|
-| 数值类型 + 默认 `<` + `n ≤ 64` | 分支无关 SIMD 双调网络（AVX-512 / AVX2 / SSE4.2 / NEON） |
-| 数值类型 + 默认 `<` + `n > 64` | LSD 基数排序（8 位桶，单趟融合直方图，非临时散射写，稳定） |
-| 数值类型 + 默认 `>` | 基数排序 + 反转 |
-| 其它（自定义比较器 / 非数值类型） | pdqsort（无分支块分区，堆排序兜底） |
-| `stable_sort` 数值升序 | 基数排序（天然稳定） |
-| `stable_sort` 其它 | 自底向上归并排序（稳定） |
+| 数值类型 + 默认 `<`/`>` + `n ≤ 64` | 分支无关 SIMD 双调网络（AVX-512 / AVX2 / SSE4.2 / NEON） |
+| 已排序 / 全等 | 统一 profile 一次验证后直接返回 |
+| 逆序（非 stable） | 统一 profile 一次验证后反转 |
+| 部分有序（相邻逆序边 ≤ n/64，且规模合理） | pdqsort |
+| 整数小值域 | 计数排序（O(n + range)） |
+| 任意类型低基数（≤256 等价类） | 压缩计数排序，保留原始对象 payload；`stable_sort` 保持稳定 |
+| 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，单趟融合直方图，非临时散射写） |
+| 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀） |
+| trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
+| 结构体 / 自定义比较器大输入 | 256 路 sample sort（ips4o 风格，块级桶重排 + 临时散射） |
+| `stable_sort` 非低基数通用类型 | 自底向上归并排序（稳定） |
 | `partial_sort` / `nth_element` | 堆 + 内省选择（quickselect） |
 
 并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，
-在 Chase-Lev 工作窃取池上做任务并行分治，合并两路已排序区间。默认 `Auto`。
+通用大输入走并行 sample sort（并行分类、散射和桶递归）；其它中等输入保留任务并行分治，
+归并阶段优先使用 scratch-buffered 并行分块归并，分配失败或不适用时回退到 `std::inplace_merge`。默认 `Auto`。
 
 ---
 
@@ -113,7 +122,7 @@ fyx::sort(v, o);              // 或 fyx::sort(v.begin(), v.end(), o)
 
 ```bash
 ./build.sh
-for t in t_scalar t_net t_radix t_pdq t_pool t_deque_race t_api; do
+for t in t_scalar t_net t_radix t_pdq t_pool t_deque_race t_api t_sample t_counting; do
   g++ -std=c++17 -O2 -march=native -pthread -Wall -Wextra -Werror test/$t.cpp -o /tmp/$t && /tmp/$t
 done
 ```
@@ -121,12 +130,25 @@ done
 `test/t_api.cpp` 覆盖：所有重载形态、`std::sort` / `std::stable_sort` 逐元素比对、
 稳定排序的 (key,idx) 稳定性验证、`partial_sort` / `nth_element` 契约验证、
 `-0`/`+0`/NaN 的浮点全序、以及 `extern "C"` ABI。
+`test/t_counting.cpp` 覆盖低基数整数/字符串/结构体、稀疏 256 distinct、MSD 字符串边界、并行 sample sort 显式路径，以及武器七 profile 调度（已排序、逆序、全等、低基数、部分有序、高熵 comparator-key）。
 
 ---
 
 ## 性能
 
-见 [`BENCHMARKS.md`](./BENCHMARKS.md) —— 本机实测，不写没跑过的数。
+基础数值 benchmark 见 [`BENCHMARKS.md`](./BENCHMARKS.md)。IPS4o 对比 harness 与完整表格见 [`bench/README_ips4o_compare.md`](./bench/README_ips4o_compare.md)。
+
+在本沙箱（2 vCPU Intel Xeon，GCC 12.2，`-O3 -march=native`）的 IPS4o sequential 与真实 oneTBB parallel 矩阵中，FYX 当前在已跟踪的 7 个分布上全部领先：
+
+| case | FYX seq | IPS4o seq | FYX par | IPS4o par |
+|---|---:|---:|---:|---:|
+| i32 random, 5M | 0.0688s | 0.1299s | 0.0585s | 0.0687s |
+| i32 low distinct 16, 5M | 0.0072s | 0.0184s | 0.0073s | 0.0108s |
+| i64 sparse distinct 256, 3M | 0.0160s | 0.0197s | 0.0103s | 0.0114s |
+| string random len16, 1M | 0.1540s | 0.1970s | 0.0941s | 0.1115s |
+| string low distinct 64, 1M | 0.0212s | 0.0652s | 0.0209s | 0.0378s |
+| struct key distinct 64, 1M | 0.0048s | 0.0052s | 0.0040s | 0.0050s |
+| struct key random, 1M | 0.0138s | 0.0278s | 0.0127s | 0.0142s |
 
 ---
 

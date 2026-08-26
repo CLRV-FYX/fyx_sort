@@ -129,6 +129,10 @@
 // GCC-or-Clang: the two share the GNU attribute / builtin vocabulary.
 #define FYX_GNUC_LIKE (FYX_COMPILER_GCC || FYX_COMPILER_CLANG)
 
+#ifndef FYX_ENABLE_TEST_HOOKS
+#  define FYX_ENABLE_TEST_HOOKS 0
+#endif
+
 // ---------------------------------------------------------------------------
 // Operating system
 // ---------------------------------------------------------------------------
@@ -197,8 +201,10 @@
 #include <iterator>
 #include <functional>
 #include <algorithm>
+#include <string>
 #include <vector>
 #include <array>
+#include <unordered_map>
 #include <new>
 
 // ---------------------------------------------------------------------------
