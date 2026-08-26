@@ -200,6 +200,18 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        std::vector<std::uint64_t> v((std::size_t(1) << 20) + 17);
+        for (auto& x : v) x = rng();
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::On;
+        fyx::sort(v.begin(), v.end(), o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
+              "parallel uint64 high-entropy uses chunked radix dispatch");
+        CHECK(std::is_sorted(v.begin(), v.end()), "parallel uint64 high-entropy output");
+    }
+    {
+        namespace fd = fyx::detail;
         std::vector<int> v(200000);
         std::iota(v.begin(), v.end(), 0);
         for (std::size_t i = 1000; i + 1 < v.size(); i += 4096)

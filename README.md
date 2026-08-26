@@ -83,7 +83,7 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | 整数小值域 | 计数排序（O(n + range)） |
 | 数值/浮点默认顺序低基数（≤256 radix keys） | radix-key 稀疏计数排序（O(n)，保留 `-0/+0`/NaN 总序语义） |
 | 任意类型低基数（≤256 等价类） | 压缩计数排序，保留原始对象 payload；`stable_sort` 保持稳定 |
-| 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，单趟融合直方图，非临时散射写） |
+| 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，单趟融合直方图，非临时散射写；大 64-bit 随机键可走 chunked parallel radix） |
 | 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀） |
 | trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
 | 结构体 / 自定义比较器大输入 | 256 路 sample sort（ips4o 风格，块级桶重排 + 临时散射） |

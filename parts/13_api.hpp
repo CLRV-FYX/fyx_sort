@@ -1216,6 +1216,135 @@ inline std::size_t adaptive_parallel_chunks(std::size_t n) {
 }
 
 template <class T>
+inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T>) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        constexpr unsigned Passes = RT::passes;
+        // The chunked parallel radix path is intended for the remaining large
+        // 64-bit high-entropy cases.  32-bit keys are already faster through the
+        // existing split/merge path on the tested 2-4 core machines, while this
+        // path removes compare-merge overhead from 64-bit random data.
+        if constexpr (sizeof(Key) < 8) {
+            (void)p; (void)n; (void)descending;
+            return false;
+        } else {
+            if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+
+            ScratchLease<Key> lease(n * 2);
+            if (!lease.valid()) return false;
+            Key* a = lease.get();
+            Key* b = a + n;
+
+            const std::size_t chunks = adaptive_parallel_chunks(n);
+            std::vector<RadixHistogram<Passes>> local(chunks);
+            for (std::size_t c = 0; c < chunks; ++c) local[c].clear();
+
+            auto hist_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                for (std::size_t c = c_lo; c < c_hi; ++c) {
+                    const std::size_t lo = (c * n) / chunks;
+                    const std::size_t hi = ((c + 1) * n) / chunks;
+                    auto& h = local[c];
+                    for (std::size_t i = lo; i < hi; ++i) {
+                        const Key k = RT::encode(p[i]);
+                        for (unsigned pass = 0; pass < Passes; ++pass)
+                            ++h.count[pass][radix_digit(k, pass)];
+                    }
+                }
+            };
+            parallel_for_index(std::size_t(0), chunks, std::size_t(1), hist_job);
+
+            RadixHistogram<Passes> hist;
+            hist.clear();
+            for (std::size_t c = 0; c < chunks; ++c) {
+                for (unsigned pass = 0; pass < Passes; ++pass)
+                    for (unsigned d = 0; d < kRadixBuckets; ++d)
+                        hist.count[pass][d] += local[c].count[pass][d];
+            }
+
+            const RadixPlan<Passes> plan = plan_radix<Passes>(hist, n);
+            if (plan.count == 0) return true;
+
+            auto encode_job = [&](std::size_t lo, std::size_t hi) {
+                for (std::size_t i = lo; i < hi; ++i) a[i] = RT::encode(p[i]);
+            };
+            parallel_for_index(std::size_t(0), n, kParallelThreshold, encode_job);
+
+            Key* src = a;
+            Key* dst = b;
+            std::vector<std::array<std::size_t, kRadixBuckets>> base(chunks);
+            std::vector<std::array<std::size_t, kRadixBuckets>> pass_local(chunks);
+            const bool can_stream = have_nt_stores();
+
+            for (unsigned pi = 0; pi < plan.count; ++pi) {
+                const unsigned pass = plan.active[pi];
+                const unsigned shift = pass * kRadixBits;
+
+                auto pass_count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                    for (std::size_t c = c_lo; c < c_hi; ++c) {
+                        auto& pc = pass_local[c];
+                        pc.fill(0);
+                        const std::size_t lo = (c * n) / chunks;
+                        const std::size_t hi = ((c + 1) * n) / chunks;
+                        for (std::size_t i = lo; i < hi; ++i)
+                            ++pc[static_cast<unsigned>((src[i] >> shift) & Key(kRadixMask))];
+                    }
+                };
+                parallel_for_index(std::size_t(0), chunks, std::size_t(1), pass_count_job);
+
+                std::size_t run = 0;
+                for (unsigned d = 0; d < kRadixBuckets; ++d) {
+                    for (std::size_t c = 0; c < chunks; ++c) {
+                        base[c][d] = run;
+                        run += pass_local[c][d];
+                    }
+                }
+
+                auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                    constexpr std::size_t kPerLine = WcbTraits<Key>::kPerLine;
+                    ScratchLease<Key> wcb_lease(2 * kRadixBuckets * kPerLine + kPerLine);
+                    RadixScatterScratch<Key> sc;
+                    bool local_stream = false;
+                    if (wcb_lease.valid()) {
+                        const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(wcb_lease.get());
+                        const std::uintptr_t mis = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+                        sc.line = reinterpret_cast<Key*>(addr + mis);
+                        sc.head = sc.line + kRadixBuckets * kPerLine;
+                        local_stream = can_stream;
+                    }
+                    for (std::size_t c = c_lo; c < c_hi; ++c) {
+                        const std::size_t lo = (c * n) / chunks;
+                        const std::size_t hi = ((c + 1) * n) / chunks;
+                        auto pos = base[c];
+                        if (wcb_lease.valid()) {
+                            radix_scatter_pass<Key>(src + lo, hi - lo, dst, shift, pos.data(), sc, local_stream);
+                        } else {
+                            for (std::size_t i = lo; i < hi; ++i) {
+                                const Key k = src[i];
+                                const unsigned d = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+                                dst[pos[d]++] = k;
+                            }
+                        }
+                    }
+                };
+                parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
+                Key* t = src; src = dst; dst = t;
+            }
+
+            auto decode_job = [&](std::size_t lo, std::size_t hi) {
+                for (std::size_t i = lo; i < hi; ++i) p[i] = RT::decode(src[i]);
+            };
+            parallel_for_index(std::size_t(0), n, kParallelThreshold, decode_job);
+            if (descending) std::reverse(p, p + n);
+            return true;
+        }
+    }
+}
+
+template <class T>
 inline bool integer_sparse_probe_ok(T* p, std::size_t n) {
     if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
         (void)p; (void)n;
@@ -1885,6 +2014,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
             if (partial_pdq) { detail::pdqsort(p, p + n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (detail::try_parallel_radix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
         } else {
             if (!high_entropy) {
                 if (detail::try_string_value_count_sort(p, n, comp, false)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
@@ -1903,6 +2033,10 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
     if (radix_ok) {
 #if FYX_ENABLE_PARALLEL
         if (want_parallel) {
+            if (detail::try_parallel_radix_sort(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
             detail::parallel_sort_ptr(p, n, comp, descending, o);
             return;
         }
