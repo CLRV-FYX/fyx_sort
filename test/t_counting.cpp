@@ -214,6 +214,21 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        std::vector<float> keys(256);
+        for (std::size_t i = 0; i < keys.size(); ++i)
+            keys[i] = static_cast<float>(static_cast<int>(i) - 128) * 0.5f;
+        std::vector<float> v((std::size_t(1) << 20) + 17);
+        for (auto& x : v) x = keys[rng() % keys.size()];
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::On;
+        fyx::sort(v.begin(), v.end(), o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::LowCardinality,
+              "parallel float low-cardinality uses dense-prefix count");
+        CHECK(std::is_sorted(v.begin(), v.end()), "parallel float low-cardinality output");
+    }
+    {
+        namespace fd = fyx::detail;
         std::vector<std::int32_t> keys = {
             std::numeric_limits<std::int32_t>::min(), -1234567890, -77777777, -1024,
             -7, 0, 3, 19, 1024, 65537, 77777777, 123456789, 987654321,

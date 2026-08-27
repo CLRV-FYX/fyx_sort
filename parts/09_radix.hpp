@@ -296,6 +296,7 @@ inline void radix_scatter_pass(const Key* FYX_RESTRICT src, std::size_t n,
 
     // Work out, per bucket, how many leading elements must be diverted so the
     // streaming cursor starts on a cache-line boundary.
+    std::size_t remaining_heads = 0;
     for (unsigned b = 0; b < kRadixBuckets; ++b) {
         sc.fill[b] = 0;
         sc.hn[b]   = 0;
@@ -309,21 +310,10 @@ inline void radix_scatter_pass(const Key* FYX_RESTRICT src, std::size_t n,
         } else {
             sc.need[b] = 0;
         }
+        remaining_heads += sc.need[b];
     }
 
-    for (std::size_t i = 0; i < n; ++i) {
-        prefetch_stream(src, i, n);
-
-        const Key      k = src[i];
-        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
-
-        // Alignment prologue for this bucket.
-        if (FYX_UNLIKELY(sc.hn[b] < sc.need[b])) {
-            head[static_cast<std::size_t>(b) * kPerLine + sc.hn[b]] = k;
-            ++sc.hn[b];
-            continue;
-        }
-
+    auto push_line = [&](Key k, unsigned b) {
         Key* L = line + static_cast<std::size_t>(b) * kPerLine;
         const std::uint32_t f = sc.fill[b];
         L[f] = k;
@@ -341,6 +331,33 @@ inline void radix_scatter_pass(const Key* FYX_RESTRICT src, std::size_t n,
         } else {
             sc.fill[b] = f + 1;
         }
+    };
+
+    std::size_t i = 0;
+    for (; i < n && remaining_heads != 0; ++i) {
+        prefetch_stream(src, i, n);
+
+        const Key      k = src[i];
+        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+
+        // Alignment prologue for this bucket.  Once every bucket has consumed
+        // its tiny prologue (at most one cache line total per bucket), the main
+        // loop below no longer pays this branch on every element.
+        if (FYX_UNLIKELY(sc.hn[b] < sc.need[b])) {
+            head[static_cast<std::size_t>(b) * kPerLine + sc.hn[b]] = k;
+            ++sc.hn[b];
+            --remaining_heads;
+            continue;
+        }
+
+        push_line(k, b);
+    }
+
+    for (; i < n; ++i) {
+        prefetch_stream(src, i, n);
+        const Key      k = src[i];
+        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+        push_line(k, b);
     }
 
     // Write back the alignment prologues and the partial trailing lines.

@@ -5,6 +5,7 @@
 #include <random>
 #include <cmath>
 #include <cstring>
+#include <functional>
 using namespace fyx::detail;
 
 static int failures = 0;
@@ -64,6 +65,58 @@ int main(){
     suite<uint64_t>("uint64", rng);
     suite<float>("float", rng);
     suite<double>("double", rng);
+
+#if FYX_ENABLE_PARALLEL
+    // High-entropy 64-bit default-order inputs use the high-prefix radix path
+    // before the ordinary 8-pass radix fallback.  Exercise both ascending and
+    // descending top-level dispatch on ranges large enough to trigger it.
+    if (parallel_available()) {
+        printf("parallel high-prefix 64-bit random\n");
+        const size_t n = (size_t(1) << 20) + 123;
+        {
+            std::vector<uint64_t> v(n);
+            for (auto& x : v) x = rng();
+            fyx::sort(v.data(), v.size());
+            bool ok = std::is_sorted(v.begin(), v.end());
+            printf("  uint64 ascending: %s\n", ok ? "OK" : "FAIL");
+            if (!ok) failures++;
+        }
+        {
+            std::vector<int64_t> v(n);
+            for (auto& x : v) x = static_cast<int64_t>(rng());
+            fyx::sort(v.data(), v.size(), std::greater<int64_t>{});
+            bool ok = std::is_sorted(v.begin(), v.end(), std::greater<int64_t>{});
+            printf("  int64 descending: %s\n", ok ? "OK" : "FAIL");
+            if (!ok) failures++;
+        }
+        {
+            std::vector<double> v(n);
+            for (auto& x : v) x = std::generate_canonical<double, 53>(rng);
+            for (size_t i = 0; i < 256 && i * 1024 + 2 < v.size(); ++i) {
+                v[i * 1024 + 0] = std::numeric_limits<double>::quiet_NaN();
+                v[i * 1024 + 1] = -0.0;
+                v[i * 1024 + 2] = +0.0;
+            }
+            fyx::sort(v.data(), v.size());
+            bool ok = true;
+            size_t nan0 = 0;
+            while (nan0 < v.size() && v[nan0] == v[nan0]) ++nan0;
+            for (size_t i = 1; i < nan0; ++i) if (v[i] < v[i - 1]) ok = false;
+            for (size_t i = nan0; i < v.size(); ++i) if (v[i] == v[i]) ok = false;
+            auto zr = std::equal_range(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(nan0), 0.0);
+            bool seen_pos_zero = false;
+            for (auto it = zr.first; it != zr.second; ++it) {
+                if (std::signbit(*it)) {
+                    if (seen_pos_zero) ok = false;
+                } else {
+                    seen_pos_zero = true;
+                }
+            }
+            printf("  double ascending: %s\n", ok ? "OK" : "FAIL");
+            if (!ok) failures++;
+        }
+    }
+#endif
 
     // float special values including NaN, +-0, +-inf
     printf("float specials\n");

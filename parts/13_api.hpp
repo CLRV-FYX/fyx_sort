@@ -621,19 +621,21 @@ inline bool try_radix_key_sparse_count_sort(T* p, std::size_t n, bool descending
         using Key = typename RT::Key;
         constexpr std::size_t Cap  = 1024;
         constexpr std::size_t Mask = Cap - 1;
+        constexpr std::size_t Limit =
+            (std::is_floating_point<T>::value && sizeof(T) == 4) ? 64 : kCountingClassLimit;
 
         std::array<Key, Cap> keys{};
         std::array<std::size_t, Cap> counts{};
         std::array<unsigned char, Cap> used{};
         std::vector<Key> distinct;
-        distinct.reserve(kCountingClassLimit);
+        distinct.reserve(Limit);
 
         for (std::size_t i = 0; i < n; ++i) {
             const Key k = RT::encode(p[i]);
             std::size_t h = low_card_hash_key(k) & Mask;
             for (;;) {
                 if (!used[h]) {
-                    if (distinct.size() >= kCountingClassLimit) return false;
+                    if (distinct.size() >= Limit) return false;
                     used[h] = 1;
                     keys[h] = k;
                     counts[h] = 1;
@@ -1265,6 +1267,7 @@ inline void radix_scatter_value_pass(const T* FYX_RESTRICT src, std::size_t n,
     T* FYX_RESTRICT line = sc.line;
     T* FYX_RESTRICT head = sc.head;
 
+    std::size_t remaining_heads = 0;
     for (unsigned b = 0; b < kRadixBuckets; ++b) {
         sc.fill[b] = 0;
         sc.hn[b]   = 0;
@@ -1276,20 +1279,10 @@ inline void radix_scatter_value_pass(const T* FYX_RESTRICT src, std::size_t n,
         } else {
             sc.need[b] = 0;
         }
+        remaining_heads += sc.need[b];
     }
 
-    for (std::size_t i = 0; i < n; ++i) {
-        prefetch_stream(src, i, n);
-        const T v = src[i];
-        const Key k = RT::encode(v);
-        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
-
-        if (FYX_UNLIKELY(sc.hn[b] < sc.need[b])) {
-            head[static_cast<std::size_t>(b) * kPerLine + sc.hn[b]] = v;
-            ++sc.hn[b];
-            continue;
-        }
-
+    auto push_line = [&](T v, unsigned b) {
         T* L = line + static_cast<std::size_t>(b) * kPerLine;
         const std::uint32_t f = sc.fill[b];
         L[f] = v;
@@ -1303,6 +1296,31 @@ inline void radix_scatter_value_pass(const T* FYX_RESTRICT src, std::size_t n,
         } else {
             sc.fill[b] = f + 1;
         }
+    };
+
+    std::size_t i = 0;
+    for (; i < n && remaining_heads != 0; ++i) {
+        prefetch_stream(src, i, n);
+        const T v = src[i];
+        const Key k = RT::encode(v);
+        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+
+        if (FYX_UNLIKELY(sc.hn[b] < sc.need[b])) {
+            head[static_cast<std::size_t>(b) * kPerLine + sc.hn[b]] = v;
+            ++sc.hn[b];
+            --remaining_heads;
+            continue;
+        }
+
+        push_line(v, b);
+    }
+
+    for (; i < n; ++i) {
+        prefetch_stream(src, i, n);
+        const T v = src[i];
+        const Key k = RT::encode(v);
+        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+        push_line(v, b);
     }
 
     for (unsigned b = 0; b < kRadixBuckets; ++b) {
@@ -1332,6 +1350,7 @@ inline void radix_scatter_decode_pass(const typename RadixTraits<T>::Key* FYX_RE
     T* FYX_RESTRICT line = sc.line;
     T* FYX_RESTRICT head = sc.head;
 
+    std::size_t remaining_heads = 0;
     for (unsigned b = 0; b < kRadixBuckets; ++b) {
         sc.fill[b] = 0;
         sc.hn[b]   = 0;
@@ -1343,20 +1362,10 @@ inline void radix_scatter_decode_pass(const typename RadixTraits<T>::Key* FYX_RE
         } else {
             sc.need[b] = 0;
         }
+        remaining_heads += sc.need[b];
     }
 
-    for (std::size_t i = 0; i < n; ++i) {
-        prefetch_stream(src, i, n);
-        const Key k = src[i];
-        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
-        const T v = RT::decode(k);
-
-        if (FYX_UNLIKELY(sc.hn[b] < sc.need[b])) {
-            head[static_cast<std::size_t>(b) * kPerLine + sc.hn[b]] = v;
-            ++sc.hn[b];
-            continue;
-        }
-
+    auto push_line = [&](T v, unsigned b) {
         T* L = line + static_cast<std::size_t>(b) * kPerLine;
         const std::uint32_t f = sc.fill[b];
         L[f] = v;
@@ -1370,6 +1379,31 @@ inline void radix_scatter_decode_pass(const typename RadixTraits<T>::Key* FYX_RE
         } else {
             sc.fill[b] = f + 1;
         }
+    };
+
+    std::size_t i = 0;
+    for (; i < n && remaining_heads != 0; ++i) {
+        prefetch_stream(src, i, n);
+        const Key k = src[i];
+        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+        const T v = RT::decode(k);
+
+        if (FYX_UNLIKELY(sc.hn[b] < sc.need[b])) {
+            head[static_cast<std::size_t>(b) * kPerLine + sc.hn[b]] = v;
+            ++sc.hn[b];
+            --remaining_heads;
+            continue;
+        }
+
+        push_line(v, b);
+    }
+
+    for (; i < n; ++i) {
+        prefetch_stream(src, i, n);
+        const Key k = src[i];
+        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+        const T v = RT::decode(k);
+        push_line(v, b);
     }
 
     for (unsigned b = 0; b < kRadixBuckets; ++b) {
@@ -1431,6 +1465,651 @@ inline void radix_count_value_pass_banked(const T* FYX_RESTRICT src,
     }
     for (unsigned d = 0; d < kRadixBuckets; ++d)
         out[d] = bank[0][d] + bank[1][d] + bank[2][d] + bank[3][d];
+}
+
+
+template <class T, unsigned PrefixBits>
+inline bool radix_high_prefix_probe(const T* p, std::size_t n) noexcept {
+    if constexpr (!radix_supported_v<T> || PrefixBits == 0 || PrefixBits > 64) {
+        (void)p; (void)n;
+        return false;
+    } else {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        if constexpr (sizeof(Key) != 8) {
+            (void)p; (void)n;
+            return false;
+        } else {
+            constexpr unsigned Shift = 64u - PrefixBits;
+            constexpr std::size_t Cap = 2048;
+            constexpr std::size_t Mask = Cap - 1;
+            std::array<Key, Cap> keys{};
+            std::array<unsigned char, Cap> used{};
+            std::size_t distinct = 0;
+            const std::size_t sample_n = std::min<std::size_t>(n, kProfileSampleLimit);
+            if (sample_n < 64) return false;
+            for (std::size_t j = 0; j < sample_n; ++j) {
+                const std::size_t idx = (j * (n - 1)) / (sample_n - 1);
+                const Key prefix = RT::encode(p[idx]) >> Shift;
+                std::size_t h = low_card_hash_key(prefix) & Mask;
+                for (;;) {
+                    if (!used[h]) {
+                        used[h] = 1;
+                        keys[h] = prefix;
+                        ++distinct;
+                        break;
+                    }
+                    if (keys[h] == prefix) break;
+                    h = (h + 1) & Mask;
+                }
+            }
+            return distinct * 16 >= sample_n * 15;
+        }
+    }
+}
+
+template <class T, unsigned PrefixBits>
+inline void radix_sort_high_prefix_value_ties(T* p, std::size_t n) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr unsigned Shift = 64u - PrefixBits;
+    std::size_t i = 0;
+    while (i < n) {
+        const Key prefix = RT::encode(p[i]) >> Shift;
+        std::size_t j = i + 1;
+        while (j < n && (RT::encode(p[j]) >> Shift) == prefix) ++j;
+        const std::size_t sz = j - i;
+        if (sz > 1) {
+            if (sz <= kNetworkMax) {
+                small_sort_numeric(p + i, sz);
+            } else {
+                std::sort(p + i, p + j, [](const T& a, const T& b) {
+                    return RT::encode(a) < RT::encode(b);
+                });
+            }
+        }
+        i = j;
+    }
+}
+
+template <class Key, unsigned PrefixBits>
+inline void radix_sort_high_prefix_key_ties(Key* p, std::size_t n) {
+    constexpr unsigned Shift = 64u - PrefixBits;
+    std::size_t i = 0;
+    while (i < n) {
+        const Key prefix = p[i] >> Shift;
+        std::size_t j = i + 1;
+        while (j < n && (p[j] >> Shift) == prefix) ++j;
+        const std::size_t sz = j - i;
+        if (sz > 1) {
+            if (sz <= kNetworkMax) small_sort_numeric(p + i, sz);
+            else std::sort(p + i, p + j);
+        }
+        i = j;
+    }
+}
+
+template <class T, unsigned PrefixBits>
+inline bool try_parallel_radix_high_prefix_value_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || PrefixBits == 0 || PrefixBits > 64 || (PrefixBits % 8) != 0) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        if constexpr (sizeof(Key) != 8) {
+            (void)p; (void)n; (void)descending;
+            return false;
+        } else {
+            constexpr unsigned PrefixBytes = PrefixBits / 8;
+            constexpr unsigned FirstShift = 64u - PrefixBits;
+            if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+            if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
+
+            ScratchLease<T> tmp_lease(n);
+            if (!tmp_lease.valid()) return false;
+            T* tmp = tmp_lease.get();
+
+            const std::size_t chunks = adaptive_parallel_radix_chunks<T>(n);
+            if ((n + chunks - 1) / chunks > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
+            std::vector<std::array<std::uint32_t, kRadixBuckets>> local(chunks);
+            std::vector<std::array<std::size_t, kRadixBuckets>> base(chunks);
+            T* src = p;
+            T* dst = tmp;
+            const bool can_stream = have_nt_stores();
+
+            for (unsigned pi = 0; pi < PrefixBytes; ++pi) {
+                const unsigned shift = FirstShift + pi * kRadixBits;
+                auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                    for (std::size_t c = c_lo; c < c_hi; ++c) {
+                        const std::size_t lo = (c * n) / chunks;
+                        const std::size_t hi = ((c + 1) * n) / chunks;
+                        radix_count_value_pass_banked<T>(src + lo, hi - lo, shift, local[c].data());
+                    }
+                };
+                parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+
+                std::size_t run = 0;
+                for (unsigned d = 0; d < kRadixBuckets; ++d) {
+                    for (std::size_t c = 0; c < chunks; ++c) {
+                        base[c][d] = run;
+                        run += local[c][d];
+                    }
+                }
+
+                auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                    constexpr std::size_t kPerLine = WcbTraits<T>::kPerLine;
+                    ScratchLease<T> wcb_lease(2 * kRadixBuckets * kPerLine + kPerLine);
+                    RadixScatterScratch<T> sc;
+                    bool local_stream = false;
+                    if (wcb_lease.valid()) {
+                        const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(wcb_lease.get());
+                        const std::uintptr_t mis = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+                        sc.line = reinterpret_cast<T*>(addr + mis);
+                        sc.head = sc.line + kRadixBuckets * kPerLine;
+                        local_stream = can_stream;
+                    }
+                    for (std::size_t c = c_lo; c < c_hi; ++c) {
+                        const std::size_t lo = (c * n) / chunks;
+                        const std::size_t hi = ((c + 1) * n) / chunks;
+                        auto pos = base[c];
+                        if (wcb_lease.valid()) {
+                            radix_scatter_value_pass<T>(src + lo, hi - lo, dst, shift, pos.data(), sc, local_stream);
+                        } else {
+                            for (std::size_t i = lo; i < hi; ++i) {
+                                const T v = src[i];
+                                const Key k = RT::encode(v);
+                                const unsigned d = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+                                dst[pos[d]++] = v;
+                            }
+                        }
+                    }
+                };
+                parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
+                T* t = src; src = dst; dst = t;
+            }
+
+            if (src != p) {
+                auto copy_job = [&](std::size_t lo, std::size_t hi) {
+                    for (std::size_t i = lo; i < hi; ++i) p[i] = src[i];
+                };
+                parallel_for_index(std::size_t(0), n, kParallelThreshold, copy_job);
+            }
+            radix_sort_high_prefix_value_ties<T, PrefixBits>(p, n);
+            if (descending) std::reverse(p, p + n);
+            return true;
+        }
+    }
+}
+
+template <class Key, unsigned Bits>
+inline void radix_count_key_pass_banked_wide(const Key* FYX_RESTRICT src,
+                                             std::size_t n, unsigned shift,
+                                             std::uint32_t* FYX_RESTRICT out) noexcept {
+    static_assert(Bits > 8 && Bits <= 13, "wide radix count is tuned for 9..13 bits");
+    constexpr std::size_t Buckets = std::size_t(1) << Bits;
+    constexpr Key Mask = Key(Buckets - 1);
+    std::array<std::uint32_t, 4 * Buckets> bank{};
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        prefetch_stream(src, i, n);
+        const Key k0 = src[i + 0];
+        const Key k1 = src[i + 1];
+        const Key k2 = src[i + 2];
+        const Key k3 = src[i + 3];
+        ++bank[0 * Buckets + static_cast<std::size_t>((k0 >> shift) & Mask)];
+        ++bank[1 * Buckets + static_cast<std::size_t>((k1 >> shift) & Mask)];
+        ++bank[2 * Buckets + static_cast<std::size_t>((k2 >> shift) & Mask)];
+        ++bank[3 * Buckets + static_cast<std::size_t>((k3 >> shift) & Mask)];
+    }
+    for (; i < n; ++i)
+        ++bank[static_cast<std::size_t>((src[i] >> shift) & Mask)];
+    for (std::size_t d = 0; d < Buckets; ++d)
+        out[d] = bank[d] + bank[Buckets + d] + bank[2 * Buckets + d] + bank[3 * Buckets + d];
+}
+
+template <class T, unsigned Bits>
+inline void radix_count_value_pass_banked_wide(const T* FYX_RESTRICT src,
+                                               std::size_t n, unsigned shift,
+                                               std::uint32_t* FYX_RESTRICT out) noexcept {
+    static_assert(Bits > 8 && Bits <= 13, "wide radix count is tuned for 9..13 bits");
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr std::size_t Buckets = std::size_t(1) << Bits;
+    constexpr Key Mask = Key(Buckets - 1);
+    std::array<std::uint32_t, 4 * Buckets> bank{};
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        prefetch_stream(src, i, n);
+        const Key k0 = RT::encode(src[i + 0]);
+        const Key k1 = RT::encode(src[i + 1]);
+        const Key k2 = RT::encode(src[i + 2]);
+        const Key k3 = RT::encode(src[i + 3]);
+        ++bank[0 * Buckets + static_cast<std::size_t>((k0 >> shift) & Mask)];
+        ++bank[1 * Buckets + static_cast<std::size_t>((k1 >> shift) & Mask)];
+        ++bank[2 * Buckets + static_cast<std::size_t>((k2 >> shift) & Mask)];
+        ++bank[3 * Buckets + static_cast<std::size_t>((k3 >> shift) & Mask)];
+    }
+    for (; i < n; ++i) {
+        const Key k = RT::encode(src[i]);
+        ++bank[static_cast<std::size_t>((k >> shift) & Mask)];
+    }
+    for (std::size_t d = 0; d < Buckets; ++d)
+        out[d] = bank[d] + bank[Buckets + d] + bank[2 * Buckets + d] + bank[3 * Buckets + d];
+}
+
+template <class Key, unsigned Bits>
+inline void radix_scatter_key_pass_wide(const Key* FYX_RESTRICT src, std::size_t n,
+                                        Key* FYX_RESTRICT dst, unsigned shift,
+                                        std::size_t* FYX_RESTRICT offset,
+                                        bool can_stream) {
+    static_assert(Bits > 8 && Bits <= 13, "wide radix scatter is tuned for 9..13 bits");
+    constexpr std::size_t Buckets = std::size_t(1) << Bits;
+    constexpr std::size_t kPerLine = WcbTraits<Key>::kPerLine;
+    constexpr Key Mask = Key(Buckets - 1);
+
+    ScratchLease<Key> wcb_lease(2 * Buckets * kPerLine + kPerLine);
+    if (!wcb_lease.valid()) {
+        for (std::size_t i = 0; i < n; ++i) {
+            const Key k = src[i];
+            const std::size_t b = static_cast<std::size_t>((k >> shift) & Mask);
+            dst[offset[b]++] = k;
+        }
+        return;
+    }
+
+    const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(wcb_lease.get());
+    const std::uintptr_t mis = (kCacheLine - (raw & (kCacheLine - 1))) & (kCacheLine - 1);
+    Key* FYX_RESTRICT line = reinterpret_cast<Key*>(raw + mis);
+    Key* FYX_RESTRICT head = line + Buckets * kPerLine;
+
+    std::array<std::uint32_t, Buckets> fill{};
+    std::array<std::uint32_t, Buckets> hn{};
+    std::array<std::uint32_t, Buckets> need{};
+    std::array<std::size_t, Buckets> base{};
+    std::size_t remaining_heads = 0;
+    for (std::size_t b = 0; b < Buckets; ++b) {
+        base[b] = offset[b];
+        if (can_stream) {
+            const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(dst + offset[b]);
+            const std::size_t align = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+            need[b] = static_cast<std::uint32_t>(align / sizeof(Key));
+            remaining_heads += need[b];
+        }
+    }
+
+    auto push_line = [&](Key k, std::size_t b) {
+        Key* L = line + b * kPerLine;
+        const std::uint32_t f = fill[b];
+        L[f] = k;
+        if (FYX_UNLIKELY(f + 1 == kPerLine)) {
+            Key* out = dst + offset[b] + need[b];
+            if (can_stream) stream_cache_line(out, L);
+            else std::memcpy(out, L, kCacheLine);
+            offset[b] += kPerLine;
+            fill[b] = 0;
+        } else {
+            fill[b] = f + 1;
+        }
+    };
+
+    std::size_t i = 0;
+    for (; i < n && remaining_heads != 0; ++i) {
+        prefetch_stream(src, i, n);
+        const Key k = src[i];
+        const std::size_t b = static_cast<std::size_t>((k >> shift) & Mask);
+        if (FYX_UNLIKELY(hn[b] < need[b])) {
+            head[b * kPerLine + hn[b]] = k;
+            ++hn[b];
+            --remaining_heads;
+            continue;
+        }
+        push_line(k, b);
+    }
+    for (; i < n; ++i) {
+        prefetch_stream(src, i, n);
+        const Key k = src[i];
+        const std::size_t b = static_cast<std::size_t>((k >> shift) & Mask);
+        push_line(k, b);
+    }
+
+    for (std::size_t b = 0; b < Buckets; ++b) {
+        if (hn[b])
+            std::memcpy(dst + base[b], head + b * kPerLine,
+                        static_cast<std::size_t>(hn[b]) * sizeof(Key));
+        if (fill[b])
+            std::memcpy(dst + offset[b] + need[b], line + b * kPerLine,
+                        static_cast<std::size_t>(fill[b]) * sizeof(Key));
+        offset[b] += fill[b] + hn[b];
+    }
+    if (can_stream) store_fence();
+}
+
+template <class T, class Key, unsigned Bits>
+inline void radix_scatter_encode_pass_wide(const T* FYX_RESTRICT src, std::size_t n,
+                                           Key* FYX_RESTRICT dst, unsigned shift,
+                                           std::size_t* FYX_RESTRICT offset,
+                                           bool can_stream) {
+    static_assert(Bits > 8 && Bits <= 13, "wide radix scatter is tuned for 9..13 bits");
+    using RT = RadixTraits<T>;
+    constexpr std::size_t Buckets = std::size_t(1) << Bits;
+    constexpr std::size_t kPerLine = WcbTraits<Key>::kPerLine;
+    constexpr Key Mask = Key(Buckets - 1);
+
+    ScratchLease<Key> wcb_lease(2 * Buckets * kPerLine + kPerLine);
+    if (!wcb_lease.valid()) {
+        for (std::size_t i = 0; i < n; ++i) {
+            const Key k = RT::encode(src[i]);
+            const std::size_t b = static_cast<std::size_t>((k >> shift) & Mask);
+            dst[offset[b]++] = k;
+        }
+        return;
+    }
+
+    const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(wcb_lease.get());
+    const std::uintptr_t mis = (kCacheLine - (raw & (kCacheLine - 1))) & (kCacheLine - 1);
+    Key* FYX_RESTRICT line = reinterpret_cast<Key*>(raw + mis);
+    Key* FYX_RESTRICT head = line + Buckets * kPerLine;
+
+    std::array<std::uint32_t, Buckets> fill{};
+    std::array<std::uint32_t, Buckets> hn{};
+    std::array<std::uint32_t, Buckets> need{};
+    std::array<std::size_t, Buckets> base{};
+    std::size_t remaining_heads = 0;
+    for (std::size_t b = 0; b < Buckets; ++b) {
+        base[b] = offset[b];
+        if (can_stream) {
+            const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(dst + offset[b]);
+            const std::size_t align = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+            need[b] = static_cast<std::uint32_t>(align / sizeof(Key));
+            remaining_heads += need[b];
+        }
+    }
+
+    auto push_line = [&](Key k, std::size_t b) {
+        Key* L = line + b * kPerLine;
+        const std::uint32_t f = fill[b];
+        L[f] = k;
+        if (FYX_UNLIKELY(f + 1 == kPerLine)) {
+            Key* out = dst + offset[b] + need[b];
+            if (can_stream) stream_cache_line(out, L);
+            else std::memcpy(out, L, kCacheLine);
+            offset[b] += kPerLine;
+            fill[b] = 0;
+        } else {
+            fill[b] = f + 1;
+        }
+    };
+
+    std::size_t i = 0;
+    for (; i < n && remaining_heads != 0; ++i) {
+        prefetch_stream(src, i, n);
+        const Key k = RT::encode(src[i]);
+        const std::size_t b = static_cast<std::size_t>((k >> shift) & Mask);
+        if (FYX_UNLIKELY(hn[b] < need[b])) {
+            head[b * kPerLine + hn[b]] = k;
+            ++hn[b];
+            --remaining_heads;
+            continue;
+        }
+        push_line(k, b);
+    }
+    for (; i < n; ++i) {
+        prefetch_stream(src, i, n);
+        const Key k = RT::encode(src[i]);
+        const std::size_t b = static_cast<std::size_t>((k >> shift) & Mask);
+        push_line(k, b);
+    }
+
+    for (std::size_t b = 0; b < Buckets; ++b) {
+        if (hn[b])
+            std::memcpy(dst + base[b], head + b * kPerLine,
+                        static_cast<std::size_t>(hn[b]) * sizeof(Key));
+        if (fill[b])
+            std::memcpy(dst + offset[b] + need[b], line + b * kPerLine,
+                        static_cast<std::size_t>(fill[b]) * sizeof(Key));
+        offset[b] += fill[b] + hn[b];
+    }
+    if (can_stream) store_fence();
+}
+
+template <class T, class Key, unsigned Bits>
+inline void radix_scatter_key_decode_pass_wide(const Key* FYX_RESTRICT src, std::size_t n,
+                                               T* FYX_RESTRICT dst, unsigned shift,
+                                               std::size_t* FYX_RESTRICT offset,
+                                               bool can_stream) {
+    static_assert(Bits > 8 && Bits <= 13, "wide radix scatter is tuned for 9..13 bits");
+    static_assert(sizeof(T) == sizeof(Key), "decoded scatter expects word-sized values");
+    using RT = RadixTraits<T>;
+    constexpr std::size_t Buckets = std::size_t(1) << Bits;
+    constexpr std::size_t kPerLine = WcbTraits<T>::kPerLine;
+    constexpr Key Mask = Key(Buckets - 1);
+
+    ScratchLease<T> wcb_lease(2 * Buckets * kPerLine + kPerLine);
+    if (!wcb_lease.valid()) {
+        for (std::size_t i = 0; i < n; ++i) {
+            const Key k = src[i];
+            const std::size_t b = static_cast<std::size_t>((k >> shift) & Mask);
+            dst[offset[b]++] = RT::decode(k);
+        }
+        return;
+    }
+
+    const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(wcb_lease.get());
+    const std::uintptr_t mis = (kCacheLine - (raw & (kCacheLine - 1))) & (kCacheLine - 1);
+    T* FYX_RESTRICT line = reinterpret_cast<T*>(raw + mis);
+    T* FYX_RESTRICT head = line + Buckets * kPerLine;
+
+    std::array<std::uint32_t, Buckets> fill{};
+    std::array<std::uint32_t, Buckets> hn{};
+    std::array<std::uint32_t, Buckets> need{};
+    std::array<std::size_t, Buckets> base{};
+    std::size_t remaining_heads = 0;
+    for (std::size_t b = 0; b < Buckets; ++b) {
+        base[b] = offset[b];
+        if (can_stream) {
+            const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(dst + offset[b]);
+            const std::size_t align = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+            need[b] = static_cast<std::uint32_t>(align / sizeof(T));
+            remaining_heads += need[b];
+        }
+    }
+
+    auto push_line = [&](T v, std::size_t b) {
+        T* L = line + b * kPerLine;
+        const std::uint32_t f = fill[b];
+        L[f] = v;
+        if (FYX_UNLIKELY(f + 1 == kPerLine)) {
+            T* out = dst + offset[b] + need[b];
+            if (can_stream) stream_cache_line(out, L);
+            else std::memcpy(out, L, kCacheLine);
+            offset[b] += kPerLine;
+            fill[b] = 0;
+        } else {
+            fill[b] = f + 1;
+        }
+    };
+
+    std::size_t i = 0;
+    for (; i < n && remaining_heads != 0; ++i) {
+        prefetch_stream(src, i, n);
+        const Key k = src[i];
+        const std::size_t b = static_cast<std::size_t>((k >> shift) & Mask);
+        const T v = RT::decode(k);
+        if (FYX_UNLIKELY(hn[b] < need[b])) {
+            head[b * kPerLine + hn[b]] = v;
+            ++hn[b];
+            --remaining_heads;
+            continue;
+        }
+        push_line(v, b);
+    }
+    for (; i < n; ++i) {
+        prefetch_stream(src, i, n);
+        const Key k = src[i];
+        const std::size_t b = static_cast<std::size_t>((k >> shift) & Mask);
+        push_line(RT::decode(k), b);
+    }
+
+    for (std::size_t b = 0; b < Buckets; ++b) {
+        if (hn[b])
+            std::memcpy(dst + base[b], head + b * kPerLine,
+                        static_cast<std::size_t>(hn[b]) * sizeof(T));
+        if (fill[b])
+            std::memcpy(dst + offset[b] + need[b], line + b * kPerLine,
+                        static_cast<std::size_t>(fill[b]) * sizeof(T));
+        offset[b] += fill[b] + hn[b];
+    }
+    if (can_stream) store_fence();
+}
+
+template <class T, unsigned PrefixBits>
+inline void radix_sort_high_prefix_decoded_ties(T* p, std::size_t n) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr unsigned Shift = 64u - PrefixBits;
+    std::size_t i = 0;
+    while (i < n) {
+        const Key prefix = RT::encode(p[i]) >> Shift;
+        std::size_t j = i + 1;
+        while (j < n && (RT::encode(p[j]) >> Shift) == prefix) ++j;
+        for (std::size_t a = i + 1; a < j; ++a) {
+            T v = p[a];
+            const Key kv = RT::encode(v);
+            std::size_t b = a;
+            while (b > i && RT::encode(p[b - 1]) > kv) {
+                p[b] = p[b - 1];
+                --b;
+            }
+            p[b] = v;
+        }
+        i = j;
+    }
+}
+
+template <class T, unsigned PrefixBits, unsigned Bits>
+inline bool try_parallel_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || PrefixBits == 0 || PrefixBits > 64 ||
+                  Bits <= 8 || Bits > 13 || (PrefixBits % Bits) != 0) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        if constexpr (sizeof(Key) != 8) {
+            (void)p; (void)n; (void)descending;
+            return false;
+        } else {
+            constexpr unsigned Passes = PrefixBits / Bits;
+            constexpr unsigned FirstShift = 64u - PrefixBits;
+            constexpr std::size_t Buckets = std::size_t(1) << Bits;
+            if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+            if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
+
+            ScratchLease<Key> lease(n * 2);
+            if (!lease.valid()) return false;
+            Key* a = lease.get();
+            Key* b = a + n;
+
+            const std::size_t chunks = std::min<std::size_t>(
+                adaptive_parallel_radix_chunks<T>(n),
+                std::max<std::size_t>(2, global_pool().nworkers()));
+            if ((n + chunks - 1) / chunks > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
+            std::vector<std::array<std::uint32_t, Buckets>> local(chunks);
+            std::vector<std::array<std::size_t, Buckets>> base(chunks);
+            Key* src = a;
+            Key* dst = b;
+            const bool can_stream = have_nt_stores();
+
+            for (unsigned pi = 0; pi < Passes; ++pi) {
+                const unsigned shift = FirstShift + pi * Bits;
+                auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                    for (std::size_t c = c_lo; c < c_hi; ++c) {
+                        const std::size_t lo = (c * n) / chunks;
+                        const std::size_t hi = ((c + 1) * n) / chunks;
+                        if (pi == 0)
+                            radix_count_value_pass_banked_wide<T, Bits>(p + lo, hi - lo, shift, local[c].data());
+                        else
+                            radix_count_key_pass_banked_wide<Key, Bits>(src + lo, hi - lo, shift, local[c].data());
+                    }
+                };
+                parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+
+                std::size_t run = 0;
+                for (std::size_t d = 0; d < Buckets; ++d) {
+                    for (std::size_t c = 0; c < chunks; ++c) {
+                        base[c][d] = run;
+                        run += local[c][d];
+                    }
+                }
+
+                if (pi == 0) {
+                    auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        for (std::size_t c = c_lo; c < c_hi; ++c) {
+                            const std::size_t lo = (c * n) / chunks;
+                            const std::size_t hi = ((c + 1) * n) / chunks;
+                            auto pos = base[c];
+                            radix_scatter_encode_pass_wide<T, Key, Bits>(p + lo, hi - lo, src, shift, pos.data(), can_stream);
+                        }
+                    };
+                    parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
+                } else if (pi + 1 == Passes) {
+                    auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        for (std::size_t c = c_lo; c < c_hi; ++c) {
+                            const std::size_t lo = (c * n) / chunks;
+                            const std::size_t hi = ((c + 1) * n) / chunks;
+                            auto pos = base[c];
+                            radix_scatter_key_decode_pass_wide<T, Key, Bits>(src + lo, hi - lo, p, shift, pos.data(), can_stream);
+                        }
+                    };
+                    parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
+                } else {
+                    auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        for (std::size_t c = c_lo; c < c_hi; ++c) {
+                            const std::size_t lo = (c * n) / chunks;
+                            const std::size_t hi = ((c + 1) * n) / chunks;
+                            auto pos = base[c];
+                            radix_scatter_key_pass_wide<Key, Bits>(src + lo, hi - lo, dst, shift, pos.data(), can_stream);
+                        }
+                    };
+                    parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
+                    Key* t = src; src = dst; dst = t;
+                }
+            }
+
+            radix_sort_high_prefix_decoded_ties<T, PrefixBits>(p, n);
+            if (descending) std::reverse(p, p + n);
+            return true;
+        }
+    }
+}
+
+template <class T>
+inline bool try_parallel_radix_high_prefix_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using Key = typename RadixTraits<T>::Key;
+        if constexpr (sizeof(Key) != 8) {
+            (void)p; (void)n; (void)descending;
+            return false;
+        } else if constexpr (std::is_same<T, double>::value) {
+            // IEEE doubles generated by benchmark/random workloads share many
+            // exponent bits.  Sorting the top 39 encoded bits with three 13-bit
+            // digits removes most tie buckets while cutting the full 8-pass radix
+            // to two key-buffer passes plus a final decode scatter.
+            return try_parallel_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
+        } else if constexpr (std::is_integral<T>::value && sizeof(T) == 8) {
+            // 64-bit integer random data has very few collisions in the top
+            // encoded bits at 10M scale.  Three 11-bit prefix passes avoid the
+            // fourth byte pass and repair only the remaining tiny tie groups.
+            return try_parallel_radix_high_prefix_key_sort_wide<T, 33, 11>(p, n, descending);
+        } else {
+            (void)p; (void)n; (void)descending;
+            return false;
+        }
+    }
 }
 
 template <class T>
@@ -1767,6 +2446,125 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
 }
 
 template <class T>
+inline bool try_radix_key_dense_prefix_count_sort_parallel(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || !std::is_floating_point<T>::value || std::is_same<T, bool>::value) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        if (n < kParallelThreshold || !parallel_available()) return false;
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        constexpr std::size_t Limit = kCountingClassLimit;
+        constexpr std::size_t HashCap = 1024;
+        constexpr std::size_t HashMask = HashCap - 1;
+        constexpr unsigned short Sentinel = std::numeric_limits<unsigned short>::max();
+        constexpr std::size_t MaxRange = std::size_t(1) << 20;
+
+        std::array<Key, HashCap> sample_keys{};
+        std::array<unsigned char, HashCap> sample_used{};
+        std::vector<Key> distinct;
+        distinct.reserve(Limit);
+        const std::size_t s = std::min<std::size_t>(n, kCountingProbeLimit);
+        for (std::size_t j = 0; j < s; ++j) {
+            const std::size_t idx = (j * n) / s;
+            const Key k = RT::encode(p[idx]);
+            std::size_t h = low_card_hash_key(k) & HashMask;
+            for (;;) {
+                if (!sample_used[h]) {
+                    if (distinct.size() >= Limit) return false;
+                    sample_used[h] = 1;
+                    sample_keys[h] = k;
+                    distinct.push_back(k);
+                    break;
+                }
+                if (sample_keys[h] == k) break;
+                h = (h + 1) & HashMask;
+            }
+        }
+        if (distinct.empty()) return false;
+        std::sort(distinct.begin(), distinct.end());
+
+        unsigned chosen_shift = 0;
+        Key prefix_base = 0;
+        std::size_t prefix_range = 0;
+        auto try_shift = [&](unsigned sh) -> bool {
+            Key mn = distinct.front() >> sh;
+            Key mx = mn;
+            Key prev = mn;
+            for (std::size_t i = 1; i < distinct.size(); ++i) {
+                const Key q = distinct[i] >> sh;
+                if (q == prev) return false;
+                prev = q;
+                mx = q;
+            }
+            const unsigned long long range64 = static_cast<unsigned long long>(mx - mn) + 1ull;
+            if (range64 == 0 || range64 > static_cast<unsigned long long>(MaxRange)) return false;
+            chosen_shift = sh;
+            prefix_base = mn;
+            prefix_range = static_cast<std::size_t>(range64);
+            return true;
+        };
+
+        bool mapped = false;
+        if constexpr (sizeof(Key) == 4) {
+            mapped = try_shift(16) || try_shift(12) || try_shift(8) || try_shift(20) || try_shift(0);
+        } else {
+            mapped = try_shift(48) || try_shift(44) || try_shift(40) || try_shift(52) || try_shift(36) || try_shift(32);
+        }
+        if (!mapped) return false;
+
+        const std::size_t d = distinct.size();
+        std::vector<unsigned short> rank_of(prefix_range, Sentinel);
+        for (std::size_t r = 0; r < d; ++r) {
+            const std::size_t idx = static_cast<std::size_t>((distinct[r] >> chosen_shift) - prefix_base);
+            rank_of[idx] = static_cast<unsigned short>(r);
+        }
+
+        const std::size_t chunks = adaptive_parallel_chunks(n);
+        std::vector<std::size_t> local(chunks * d, 0);
+        std::vector<unsigned char> miss(chunks, 0);
+        auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+            for (std::size_t c = c_lo; c < c_hi; ++c) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                std::size_t* lc = local.data() + c * d;
+                for (std::size_t i = lo; i < hi; ++i) {
+                    const Key k = RT::encode(p[i]);
+                    const Key q = k >> chosen_shift;
+                    if (q < prefix_base) { miss[c] = 1; break; }
+                    const std::size_t map_idx = static_cast<std::size_t>(q - prefix_base);
+                    if (map_idx >= prefix_range) { miss[c] = 1; break; }
+                    const unsigned short r = rank_of[map_idx];
+                    if (r == Sentinel || distinct[r] != k) { miss[c] = 1; break; }
+                    ++lc[r];
+                }
+            }
+        };
+        parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+        for (unsigned char v : miss) if (v) return false;
+
+        std::vector<std::size_t> offset(d + 1, 0);
+        for (std::size_t out_rank = 0; out_rank < d; ++out_rank) {
+            const std::size_t src_rank = descending ? (d - 1 - out_rank) : out_rank;
+            std::size_t total = 0;
+            for (std::size_t c = 0; c < chunks; ++c)
+                total += local[c * d + src_rank];
+            offset[out_rank + 1] = offset[out_rank] + total;
+        }
+
+        auto fill_job = [&](std::size_t lo, std::size_t hi) {
+            for (std::size_t out_rank = lo; out_rank < hi; ++out_rank) {
+                const std::size_t src_rank = descending ? (d - 1 - out_rank) : out_rank;
+                const T v = RT::decode(distinct[src_rank]);
+                std::fill(p + offset[out_rank], p + offset[out_rank + 1], v);
+            }
+        };
+        parallel_for_index(std::size_t(0), d, std::size_t(8), fill_job);
+        return true;
+    }
+}
+
+template <class T>
 inline bool radix_key_sparse_probe_ok(T* p, std::size_t n) {
     if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
         (void)p; (void)n;
@@ -1776,6 +2574,8 @@ inline bool radix_key_sparse_probe_ok(T* p, std::size_t n) {
         using Key = typename RT::Key;
         constexpr std::size_t Cap = 512;
         constexpr std::size_t Mask = Cap - 1;
+        constexpr std::size_t Limit =
+            (std::is_floating_point<T>::value && sizeof(T) == 4) ? 64 : kCountingClassLimit;
         std::array<Key, Cap> keys{};
         std::array<unsigned char, Cap> used{};
         std::size_t distinct = 0;
@@ -1786,7 +2586,7 @@ inline bool radix_key_sparse_probe_ok(T* p, std::size_t n) {
             std::size_t h = low_card_hash_key(k) & Mask;
             for (;;) {
                 if (!used[h]) {
-                    if (distinct++ >= kCountingClassLimit) return false;
+                    if (distinct++ >= Limit) return false;
                     used[h] = 1;
                     keys[h] = k;
                     break;
@@ -1812,6 +2612,8 @@ inline bool try_radix_key_sparse_count_sort_parallel(T* p, std::size_t n, bool d
         using Key = typename RT::Key;
         constexpr std::size_t Cap = 1024;
         constexpr std::size_t Mask = Cap - 1;
+        constexpr std::size_t Limit =
+            (std::is_floating_point<T>::value && sizeof(T) == 4) ? 64 : kCountingClassLimit;
 
         const std::size_t chunks = adaptive_parallel_chunks(n);
         std::vector<std::array<Key, Cap>> local_keys(chunks);
@@ -1822,7 +2624,7 @@ inline bool try_radix_key_sparse_count_sort_parallel(T* p, std::size_t n, bool d
         for (std::size_t c = 0; c < chunks; ++c) {
             local_used[c].fill(0);
             local_counts[c].fill(0);
-            local_distinct[c].reserve(kCountingClassLimit);
+            local_distinct[c].reserve(Limit);
         }
 
         auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
@@ -1838,7 +2640,7 @@ inline bool try_radix_key_sparse_count_sort_parallel(T* p, std::size_t n, bool d
                     std::size_t h = low_card_hash_key(k) & Mask;
                     for (;;) {
                         if (!used[h]) {
-                            if (distinct.size() >= kCountingClassLimit) { overflow[c] = 1; goto done_chunk; }
+                            if (distinct.size() >= Limit) { overflow[c] = 1; goto done_chunk; }
                             used[h] = 1;
                             keys[h] = k;
                             counts[h] = 1;
@@ -1859,12 +2661,12 @@ inline bool try_radix_key_sparse_count_sort_parallel(T* p, std::size_t n, bool d
         std::array<std::size_t, Cap> counts{};
         std::array<unsigned char, Cap> used{};
         std::vector<Key> distinct;
-        distinct.reserve(kCountingClassLimit);
+        distinct.reserve(Limit);
         auto global_add = [&](Key k, std::size_t add) -> bool {
             std::size_t h = low_card_hash_key(k) & Mask;
             for (;;) {
                 if (!used[h]) {
-                    if (distinct.size() >= kCountingClassLimit) return false;
+                    if (distinct.size() >= Limit) return false;
                     used[h] = 1; keys[h] = k; counts[h] = add; distinct.push_back(k); return true;
                 }
                 if (keys[h] == k) { counts[h] += add; return true; }
@@ -2371,6 +3173,7 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
 #if FYX_ENABLE_PARALLEL
             if (prefer_parallel) {
                 done = try_integer_sparse_count_sort_parallel(p, n, descending) ||
+                       try_radix_key_dense_prefix_count_sort_parallel(p, n, descending) ||
                        try_radix_key_sparse_count_sort_parallel(p, n, descending);
             }
 #endif
@@ -2900,21 +3703,25 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                     // Sparse random low-cardinality data often has a huge min/max
                     // span; trying dense range counting first costs a full extra
                     // scan before the sparse path wins.  The profile hint is only
-                    // a hint: the sparse implementations still validate <=256
-                    // distinct keys before committing.
+                    // a hint: the sparse implementations still validate <=256 distinct keys before committing;
+                    // float32 sparse counting is capped lower because 256-way
+                    // low-cardinality floats are faster through parallel radix.
                     if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_radix_key_dense_prefix_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 } else {
                     if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_radix_key_dense_prefix_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
             if (partial_pdq) { detail::pdqsort(p, p + n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_parallel_radix_sort(p, n, descending, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
         } else {
@@ -2938,6 +3745,10 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
 #if FYX_ENABLE_PARALLEL
         if (want_parallel) {
             const bool high_entropy = prof && prof->is_high_entropy;
+            if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;

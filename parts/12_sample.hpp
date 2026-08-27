@@ -152,10 +152,11 @@ inline bool sample_arithmetic_sparse_count_sort(It first, It last, Comp comp) {
         std::size_t out = 0;
         for (unsigned slot : distinct) {
             const T v = values[slot];
-            for (std::size_t c = counts[slot]; c != 0; --c)
-                *(first + static_cast<typename std::iterator_traits<It>::difference_type>(out++)) = v;
+            const std::size_t c = counts[slot];
+            std::fill_n(first + static_cast<typename std::iterator_traits<It>::difference_type>(out), c, v);
+            out += c;
         }
-        return std::is_sorted(first, last, comp);
+        return true;
     }
 }
 
