@@ -64,6 +64,102 @@ FYX_FORCE_INLINE unsigned classify_bucket_256(const T& x, const T* tree, Comp co
     return b - kSampleBuckets;
 }
 
+
+template <class T>
+inline constexpr std::size_t sample_sort_threshold_for() noexcept {
+    // The lower threshold helps cheap numeric/custom-comparator leaves by
+    // avoiding large pdqsort tails.  Strings are comparison-expensive and the
+    // 32K recursion threshold regressed the 4H2G random-string matrix, so keep
+    // the previous 128K handoff for string sample-sort fallback paths.
+    if constexpr (std::is_same<T, std::string>::value) return std::size_t(1) << 17;
+    else return kSampleThreshold;
+}
+
+template <class T, class Comp>
+FYX_FORCE_INLINE unsigned classify_bucket_sample(const T& x, const T* tree,
+                                                 unsigned m, Comp comp) {
+    // Unrolling the fixed-depth classifier is a win for cheap/trivial payloads.
+    // For std::string and other non-trivial comparators, preserve the compact
+    // looped classifier to avoid code-size/I-cache regressions and keep the
+    // old random-string behaviour.
+    if constexpr (std::is_arithmetic<T>::value || std::is_trivially_copyable<T>::value) {
+        (void)m;
+        return classify_bucket_256(x, tree, comp);
+    } else {
+        return classify_bucket(x, tree, m, comp);
+    }
+}
+
+
+template <class T>
+FYX_FORCE_INLINE std::uint64_t sample_value_bits(const T& v) noexcept {
+    std::uint64_t u = 0;
+    std::memcpy(&u, &v, sizeof(T));
+    return u;
+}
+
+FYX_FORCE_INLINE std::size_t sample_hash_bits(std::uint64_t x) noexcept {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return static_cast<std::size_t>(x);
+}
+
+template <class It, class Comp>
+inline bool sample_arithmetic_sparse_count_sort(It first, It last, Comp comp) {
+    using T = typename std::iterator_traits<It>::value_type;
+    if constexpr (!std::is_arithmetic<T>::value || std::is_same<T, bool>::value ||
+                  !std::is_trivially_copyable<T>::value || sizeof(T) > sizeof(std::uint64_t)) {
+        (void)first; (void)last; (void)comp;
+        return false;
+    } else {
+        constexpr std::size_t Cap = 512;
+        constexpr std::size_t Mask = Cap - 1;
+        const std::size_t n = static_cast<std::size_t>(last - first);
+        if (n < 2) return true;
+
+        std::array<std::uint64_t, Cap> keys{};
+        std::array<T, Cap> values{};
+        std::array<std::size_t, Cap> counts{};
+        std::array<unsigned char, Cap> used{};
+        std::vector<unsigned> distinct;
+        distinct.reserve(256);
+
+        for (std::size_t i = 0; i < n; ++i) {
+            const T v = *(first + static_cast<typename std::iterator_traits<It>::difference_type>(i));
+            const std::uint64_t key = sample_value_bits(v);
+            std::size_t h = sample_hash_bits(key) & Mask;
+            for (;;) {
+                if (!used[h]) {
+                    if (distinct.size() >= 256) return false;
+                    used[h] = 1;
+                    keys[h] = key;
+                    values[h] = v;
+                    counts[h] = 1;
+                    distinct.push_back(static_cast<unsigned>(h));
+                    break;
+                }
+                if (keys[h] == key) { ++counts[h]; break; }
+                h = (h + 1) & Mask;
+            }
+        }
+        if (distinct.size() <= 1) return true;
+
+        std::sort(distinct.begin(), distinct.end(), [&](unsigned a, unsigned b) {
+            return comp(values[a], values[b]);
+        });
+
+        std::size_t out = 0;
+        for (unsigned slot : distinct) {
+            const T v = values[slot];
+            for (std::size_t c = counts[slot]; c != 0; --c)
+                *(first + static_cast<typename std::iterator_traits<It>::difference_type>(out++)) = v;
+        }
+        return std::is_sorted(first, last, comp);
+    }
+}
+
+
 // Sample sort over a random-access range.  Falls back to pdqsort when the
 // low-cardinality guard fires (cheap for caller -- this is hit before the
 // O(n) permutation work).
@@ -72,8 +168,9 @@ inline void sample_sort(It first, It last, Comp comp) {
     using T = typename std::iterator_traits<It>::value_type;
     const std::size_t n = static_cast<std::size_t>(last - first);
 
+    const std::size_t sample_threshold = sample_sort_threshold_for<T>();
     if (n <= kInsertionThreshold) { insertion_sort(first, last, comp); return; }
-    if (n <  kSampleThreshold)    { pdqsort(first, last, comp);      return; }
+    if (n < sample_threshold)     { pdqsort(first, last, comp);      return; }
 
     const unsigned k = static_cast<unsigned>(kSampleBuckets);   // 256
     const unsigned m = k - 1u;                                  // 255 splitters
@@ -98,8 +195,16 @@ inline void sample_sort(It first, It last, Comp comp) {
         if (comp(sample[i - 1], sample[i])) ++distinct;
     const double distinct_ratio = static_cast<double>(distinct) / static_cast<double>(S);
     if (distinct_ratio == 0) { pdqsort(first, last, comp); return; }
-    if ((std::is_arithmetic<T>::value && distinct_ratio < 0.10) ||
-        (!std::is_arithmetic<T>::value && distinct_ratio < 0.05)) {
+    if constexpr (std::is_arithmetic<T>::value) {
+        if (distinct_ratio < (std::is_integral<T>::value ? 0.25 : 0.10)) {
+            if (sample_arithmetic_sparse_count_sort(first, last, comp)) return;
+            if (distinct_ratio < 0.10) { pdqsort(first, last, comp); return; }
+        }
+        if (std::is_floating_point<T>::value && distinct_ratio < 0.25) {
+            pdqsort(first, last, comp);
+            return;
+        }
+    } else if (distinct_ratio < 0.05) {
         pdqsort(first, last, comp);
         return;
     }
@@ -113,13 +218,13 @@ inline void sample_sort(It first, It last, Comp comp) {
 
     // ---- 4. count bucket sizes (and remember each element's bucket) ------
     std::vector<unsigned char> bid(n);
-    std::vector<std::size_t> count(k, 0);
+    std::array<std::size_t, kSampleBuckets> count{};
     for (std::size_t i = 0; i < n; ++i) {
-        const unsigned b = classify_bucket_256(*(first + i), tree.data(), comp);
+        const unsigned b = classify_bucket_sample(*(first + i), tree.data(), m, comp);
         bid[i] = static_cast<unsigned char>(b);
         ++count[b];
     }
-    std::vector<std::size_t> offset(k + 1);
+    std::array<std::size_t, kSampleBuckets + 1> offset{};
     std::size_t max_bucket = 0;
     for (unsigned b = 0; b < k; ++b) {
         offset[b + 1] = offset[b] + count[b];
@@ -131,17 +236,47 @@ inline void sample_sort(It first, It last, Comp comp) {
     if (max_bucket == n) { pdqsort(first, last, comp); return; }
 
     // ---- 5. bucket reorder -----------------------------------------------
-    // Serial sample sort does not need per-block reservation: one thread owns
-    // every bucket cursor.  A single prefix-position scatter removes an extra
-    // full scan over bid[] and two large block-prefix tables from the previous
-    // block plan, while the parallel path below keeps per-chunk bases for
-    // thread safety.
+    // Non-string payloads use one prefix-position scatter: a single thread owns
+    // every bucket cursor and avoids the old block-prefix tables.  String
+    // fallback paths keep the pre-unroll block reservations, which give
+    // comparison-expensive objects more localized per-bucket writes and avoid
+    // the 4H2G random-string regression seen with the numeric-tuned fast path.
     {
         std::vector<T> tmp(n);
-        std::vector<std::size_t> pos(offset.begin(), offset.begin() + k);
-        for (std::size_t i = 0; i < n; ++i) {
-            const unsigned b = bid[i];
-            tmp[pos[b]++] = std::move(*(first + i));
+        if constexpr (!std::is_same<T, std::string>::value) {
+            std::array<std::size_t, kSampleBuckets> pos{};
+            for (unsigned b = 0; b < k; ++b) pos[b] = offset[b];
+            for (std::size_t i = 0; i < n; ++i) {
+                const unsigned b = bid[i];
+                tmp[pos[b]++] = std::move(*(first + i));
+            }
+        } else {
+            const std::size_t block_elems = std::max<std::size_t>(kSampleBlock, 1024);
+            const std::size_t blocks = (n + block_elems - 1) / block_elems;
+            std::vector<std::array<std::size_t, kSampleBuckets>> local(blocks);
+            for (auto& a : local) a.fill(0);
+            for (std::size_t i = 0; i < n; ++i)
+                ++local[i / block_elems][bid[i]];
+
+            std::vector<std::array<std::size_t, kSampleBuckets>> base(blocks);
+            for (auto& a : base) a.fill(0);
+            for (unsigned b = 0; b < k; ++b) {
+                std::size_t run = offset[b];
+                for (std::size_t blk = 0; blk < blocks; ++blk) {
+                    base[blk][b] = run;
+                    run += local[blk][b];
+                }
+            }
+
+            for (std::size_t blk = 0; blk < blocks; ++blk) {
+                const std::size_t lo = blk * block_elems;
+                const std::size_t hi = std::min(n, lo + block_elems);
+                auto pos = base[blk];
+                for (std::size_t i = lo; i < hi; ++i) {
+                    const unsigned b = bid[i];
+                    tmp[pos[b]++] = std::move(*(first + i));
+                }
+            }
         }
         for (std::size_t i = 0; i < n; ++i) *(first + i) = std::move(tmp[i]);
     }
@@ -151,7 +286,7 @@ inline void sample_sort(It first, It last, Comp comp) {
         const std::size_t lo = offset[b], hi = offset[b + 1];
         const std::size_t sz = hi - lo;
         if (sz == 0) continue;
-        if (sz >= kSampleThreshold) sample_sort(first + lo, first + hi, comp);
+        if (sz >= sample_threshold) sample_sort(first + lo, first + hi, comp);
         else if (sz > kInsertionThreshold) pdqsort(first + lo, first + hi, comp);
         else insertion_sort(first + lo, first + hi, comp);
     }
@@ -182,7 +317,8 @@ inline void parallel_sample_sort_one_bucket(It first, std::size_t lo, std::size_
     if (sz == 0) return;
     It b = first + static_cast<typename std::iterator_traits<It>::difference_type>(lo);
     It e = first + static_cast<typename std::iterator_traits<It>::difference_type>(hi);
-    if (sz >= kSampleThreshold && depth != 0)
+    using T = typename std::iterator_traits<It>::value_type;
+    if (sz >= sample_sort_threshold_for<T>() && depth != 0)
         parallel_sample_sort_impl(b, e, comp, depth - 1);
     else if (sz > kInsertionThreshold)
         pdqsort(b, e, comp);
@@ -215,8 +351,9 @@ inline void parallel_sample_sort_impl(It first, It last, Comp comp, unsigned dep
     using T = typename std::iterator_traits<It>::value_type;
     const std::size_t n = static_cast<std::size_t>(last - first);
 
+    const std::size_t sample_threshold = sample_sort_threshold_for<T>();
     if (n <= kInsertionThreshold) { insertion_sort(first, last, comp); return; }
-    if (n < kSampleThreshold || depth == 0 || !parallel_available()) {
+    if (n < sample_threshold || depth == 0 || !parallel_available()) {
         sample_sort(first, last, comp);
         return;
     }
@@ -235,8 +372,16 @@ inline void parallel_sample_sort_impl(It first, It last, Comp comp, unsigned dep
     for (std::size_t i = 1; i < S; ++i)
         if (comp(sample[i - 1], sample[i])) ++distinct;
     const double distinct_ratio = static_cast<double>(distinct) / static_cast<double>(S);
-    if ((std::is_arithmetic<T>::value && distinct_ratio < 0.10) ||
-        (!std::is_arithmetic<T>::value && distinct_ratio < 0.05)) {
+    if constexpr (std::is_arithmetic<T>::value) {
+        if (distinct_ratio < (std::is_integral<T>::value ? 0.25 : 0.10)) {
+            if (sample_arithmetic_sparse_count_sort(first, last, comp)) return;
+            if (distinct_ratio < 0.10) { pdqsort(first, last, comp); return; }
+        }
+        if (std::is_floating_point<T>::value && distinct_ratio < 0.25) {
+            pdqsort(first, last, comp);
+            return;
+        }
+    } else if (distinct_ratio < 0.05) {
         pdqsort(first, last, comp);
         return;
     }
@@ -263,7 +408,7 @@ inline void parallel_sample_sort_impl(It first, It last, Comp comp, unsigned dep
             const std::size_t hi = ((c + 1) * n) / chunks;
             auto& lc = local[c];
             for (std::size_t i = lo; i < hi; ++i) {
-                const unsigned b = classify_bucket_256(*(first + i), tree.data(), comp);
+                const unsigned b = classify_bucket_sample(*(first + i), tree.data(), m, comp);
                 bid[i] = static_cast<unsigned char>(b);
                 ++lc[b];
             }

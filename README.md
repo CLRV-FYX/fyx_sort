@@ -87,7 +87,7 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀） |
 | 自定义比较器但采样等价于自然升/降序的数值或 `std::string` | guarded radix/count/MSD recovery（采样确认 + 最终 `is_sorted(comp)` 校验；失败则继续比较排序） |
 | trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
-| 结构体 / 自定义比较器大输入 | 256 路 sample sort（unrolled Eytzinger 分类；串行路径单趟 prefix scatter，并行路径分 chunk 计数/散射；低 distinct 算术样本回退 pdqsort） |
+| 结构体 / 自定义比较器大输入 | 256 路 sample sort（cheap/trivial payload 使用 unrolled Eytzinger 分类；`std::string` fallback 保持 looped classifier + 128K handoff + block scatter；非字符串串行路径单趟 prefix scatter，并行路径分 chunk 计数/散射；低 distinct 算术样本先走 sparse value counting） |
 | `stable_sort` 非低基数通用类型 | 自底向上归并排序（稳定） |
 | `partial_sort` / `nth_element` | 堆 + 内省选择（quickselect） |
 

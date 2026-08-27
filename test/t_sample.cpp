@@ -1,7 +1,7 @@
 // Sample-sort (Module C) conformance + sanity test.
 // Validates the Eytzinger classifier against brute force, and checks that
-// fyx::sort on strings/structs (which now route through sample_sort) matches
-// std::sort for both high- and low-distinct data (guard on/off paths).
+// explicit sample_sort on strings/structs matches std::sort for both high-
+// and low-distinct data (guard on/off paths).
 #include "../fyx_sort.hpp"
 #include <cstdio>
 #include <vector>
@@ -122,7 +122,29 @@ int main() {
         CHECK(v2 == ref2, "struct custom comparator descending");
     }
 
-    // ---- 4. performance sketch: sample sort vs pdqsort on strings --------
+    // ---- 4. arithmetic low-cardinality sample fallback -------------------
+    printf("arithmetic low-cardinality sample fallback\n");
+    {
+        auto cmp_i = [](int a, int b) { return a < b; };
+        std::vector<int> v(200000);
+        for (auto& x : v) x = static_cast<int>(rng() % 16) - 8;
+        std::vector<int> ref = v;
+        std::sort(ref.begin(), ref.end(), cmp_i);
+        sample_sort(v.data(), v.data() + v.size(), cmp_i);
+        CHECK(v == ref, "int low-card sample fallback");
+    }
+    {
+        auto cmp_f = [](float a, float b) { return a < b; };
+        std::vector<float> vals(16);
+        for (std::size_t i = 0; i < vals.size(); ++i)
+            vals[i] = static_cast<float>(static_cast<int>(i) - 8) * 0.25f;
+        std::vector<float> v(200000);
+        for (auto& x : v) x = vals[rng() % vals.size()];
+        sample_sort(v.data(), v.data() + v.size(), cmp_f);
+        CHECK(std::is_sorted(v.begin(), v.end(), cmp_f), "float low-card sample fallback");
+    }
+
+    // ---- 5. performance sketch: sample sort vs pdqsort on strings --------
     printf("perf: fyx::sort vs std::sort on strings\n");
     {
         const std::size_t n = 2'000'000;
