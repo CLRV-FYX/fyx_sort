@@ -6020,9 +6020,35 @@ inline void radix_scatter_value_pass(const T* FYX_RESTRICT src, std::size_t n,
 }
 
 template <class T>
-inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending) {
+inline bool radix_sample_all_passes_vary(const T* p, std::size_t n) noexcept {
     if constexpr (!radix_supported_v<T>) {
-        (void)p; (void)n; (void)descending;
+        (void)p; (void)n;
+        return false;
+    } else {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        constexpr unsigned Passes = RT::passes;
+        if (n < 2) return false;
+        const Key first = RT::encode(p[0]);
+        unsigned varied = 0;
+        const std::size_t s = std::min<std::size_t>(n, kProfileSampleLimit);
+        for (std::size_t j = 1; j < s; ++j) {
+            const std::size_t idx = (j * (n - 1)) / (s - 1);
+            const Key k = RT::encode(p[idx]);
+            for (unsigned pass = 0; pass < Passes; ++pass) {
+                if (radix_digit(k, pass) != radix_digit(first, pass))
+                    varied |= (1u << pass);
+            }
+            if (varied == ((1u << Passes) - 1u)) return true;
+        }
+        return false;
+    }
+}
+
+template <class T>
+inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool assume_all_passes = false) {
+    if constexpr (!radix_supported_v<T>) {
+        (void)p; (void)n; (void)descending; (void)assume_all_passes;
         return false;
     } else {
         using RT  = RadixTraits<T>;
@@ -6032,6 +6058,7 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending) {
         // fallback for large high-entropy numeric inputs.
         {
             if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+            assume_all_passes = assume_all_passes && radix_sample_all_passes_vary<T>(p, n);
 
             if constexpr ((std::is_integral<T>::value && !std::is_same<T, bool>::value) ||
                           std::is_same<T, float>::value) {
@@ -6041,30 +6068,53 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending) {
 
                 const std::size_t chunks = adaptive_parallel_chunks(n);
                 std::vector<RadixHistogram<Passes>> local(chunks);
-                for (std::size_t c = 0; c < chunks; ++c) local[c].clear();
-                auto hist_job = [&](std::size_t c_lo, std::size_t c_hi) {
-                    for (std::size_t c = c_lo; c < c_hi; ++c) {
-                        const std::size_t lo = (c * n) / chunks;
-                        const std::size_t hi = ((c + 1) * n) / chunks;
-                        auto& h = local[c];
-                        for (std::size_t i = lo; i < hi; ++i) {
-                            const Key k = RT::encode(p[i]);
-                            for (unsigned pass = 0; pass < Passes; ++pass)
-                                ++h.count[pass][radix_digit(k, pass)];
-                        }
-                    }
-                };
-                parallel_for_index(std::size_t(0), chunks, std::size_t(1), hist_job);
-
-                RadixHistogram<Passes> hist;
-                hist.clear();
                 for (std::size_t c = 0; c < chunks; ++c) {
-                    for (unsigned pass = 0; pass < Passes; ++pass)
-                        for (unsigned d = 0; d < kRadixBuckets; ++d)
-                            hist.count[pass][d] += local[c].count[pass][d];
+                    if (assume_all_passes) std::memset(local[c].count[0], 0, sizeof(local[c].count[0]));
+                    else local[c].clear();
                 }
-                const RadixPlan<Passes> plan = plan_radix<Passes>(hist, n);
-                if (plan.count == 0) { if (descending) std::reverse(p, p + n); return true; }
+                if (assume_all_passes) {
+                    auto hist_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        for (std::size_t c = c_lo; c < c_hi; ++c) {
+                            const std::size_t lo = (c * n) / chunks;
+                            const std::size_t hi = ((c + 1) * n) / chunks;
+                            auto& h = local[c];
+                            for (std::size_t i = lo; i < hi; ++i) {
+                                const Key k = RT::encode(p[i]);
+                                ++h.count[0][radix_digit(k, 0)];
+                            }
+                        }
+                    };
+                    parallel_for_index(std::size_t(0), chunks, std::size_t(1), hist_job);
+                } else {
+                    auto hist_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        for (std::size_t c = c_lo; c < c_hi; ++c) {
+                            const std::size_t lo = (c * n) / chunks;
+                            const std::size_t hi = ((c + 1) * n) / chunks;
+                            auto& h = local[c];
+                            for (std::size_t i = lo; i < hi; ++i) {
+                                const Key k = RT::encode(p[i]);
+                                for (unsigned pass = 0; pass < Passes; ++pass)
+                                    ++h.count[pass][radix_digit(k, pass)];
+                            }
+                        }
+                    };
+                    parallel_for_index(std::size_t(0), chunks, std::size_t(1), hist_job);
+                }
+
+                RadixPlan<Passes> plan;
+                if (assume_all_passes) {
+                    for (unsigned pass = 0; pass < Passes; ++pass) plan.active[plan.count++] = pass;
+                } else {
+                    RadixHistogram<Passes> hist;
+                    hist.clear();
+                    for (std::size_t c = 0; c < chunks; ++c) {
+                        for (unsigned pass = 0; pass < Passes; ++pass)
+                            for (unsigned d = 0; d < kRadixBuckets; ++d)
+                                hist.count[pass][d] += local[c].count[pass][d];
+                    }
+                    plan = plan_radix<Passes>(hist, n);
+                    if (plan.count == 0) { if (descending) std::reverse(p, p + n); return true; }
+                }
 
                 T* src = p;
                 T* dst = tmp;
@@ -6146,37 +6196,57 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending) {
 
             const std::size_t chunks = adaptive_parallel_chunks(n);
             std::vector<RadixHistogram<Passes>> local(chunks);
-            for (std::size_t c = 0; c < chunks; ++c) local[c].clear();
-
-            auto hist_job = [&](std::size_t c_lo, std::size_t c_hi) {
-                for (std::size_t c = c_lo; c < c_hi; ++c) {
-                    const std::size_t lo = (c * n) / chunks;
-                    const std::size_t hi = ((c + 1) * n) / chunks;
-                    auto& h = local[c];
-                    for (std::size_t i = lo; i < hi; ++i) {
-                        const Key k = RT::encode(p[i]);
-                        for (unsigned pass = 0; pass < Passes; ++pass)
-                            ++h.count[pass][radix_digit(k, pass)];
-                    }
-                }
-            };
-            parallel_for_index(std::size_t(0), chunks, std::size_t(1), hist_job);
-
-            RadixHistogram<Passes> hist;
-            hist.clear();
             for (std::size_t c = 0; c < chunks; ++c) {
-                for (unsigned pass = 0; pass < Passes; ++pass)
-                    for (unsigned d = 0; d < kRadixBuckets; ++d)
-                        hist.count[pass][d] += local[c].count[pass][d];
+                if (assume_all_passes) std::memset(local[c].count[0], 0, sizeof(local[c].count[0]));
+                else local[c].clear();
             }
 
-            const RadixPlan<Passes> plan = plan_radix<Passes>(hist, n);
-            if (plan.count == 0) return true;
+            if (assume_all_passes) {
+                auto hist_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                    for (std::size_t c = c_lo; c < c_hi; ++c) {
+                        const std::size_t lo = (c * n) / chunks;
+                        const std::size_t hi = ((c + 1) * n) / chunks;
+                        auto& h = local[c];
+                        for (std::size_t i = lo; i < hi; ++i) {
+                            const Key k = RT::encode(p[i]);
+                            a[i] = k;
+                            ++h.count[0][radix_digit(k, 0)];
+                        }
+                    }
+                };
+                parallel_for_index(std::size_t(0), chunks, std::size_t(1), hist_job);
+            } else {
+                auto hist_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                    for (std::size_t c = c_lo; c < c_hi; ++c) {
+                        const std::size_t lo = (c * n) / chunks;
+                        const std::size_t hi = ((c + 1) * n) / chunks;
+                        auto& h = local[c];
+                        for (std::size_t i = lo; i < hi; ++i) {
+                            const Key k = RT::encode(p[i]);
+                            a[i] = k;
+                            for (unsigned pass = 0; pass < Passes; ++pass)
+                                ++h.count[pass][radix_digit(k, pass)];
+                        }
+                    }
+                };
+                parallel_for_index(std::size_t(0), chunks, std::size_t(1), hist_job);
+            }
 
-            auto encode_job = [&](std::size_t lo, std::size_t hi) {
-                for (std::size_t i = lo; i < hi; ++i) a[i] = RT::encode(p[i]);
-            };
-            parallel_for_index(std::size_t(0), n, kParallelThreshold, encode_job);
+            RadixPlan<Passes> plan;
+            if (assume_all_passes) {
+                for (unsigned pass = 0; pass < Passes; ++pass) plan.active[plan.count++] = pass;
+            } else {
+                RadixHistogram<Passes> hist;
+                hist.clear();
+                for (std::size_t c = 0; c < chunks; ++c) {
+                    for (unsigned pass = 0; pass < Passes; ++pass)
+                        for (unsigned d = 0; d < kRadixBuckets; ++d)
+                            hist.count[pass][d] += local[c].count[pass][d];
+                }
+
+                plan = plan_radix<Passes>(hist, n);
+                if (plan.count == 0) return true;
+            }
 
             Key* src = a;
             Key* dst = b;
@@ -7064,14 +7134,28 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
         }
         if (radix_ok) {
             if (!high_entropy) {
-                if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
-                if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
-                if (detail::try_radix_key_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
-                if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                const bool low_card_hint = prof &&
+                    (prof->is_low_cardinality_candidate || prof->is_low_cardinality);
+                if (low_card_hint) {
+                    // Sparse random low-cardinality data often has a huge min/max
+                    // span; trying dense range counting first costs a full extra
+                    // scan before the sparse path wins.  The profile hint is only
+                    // a hint: the sparse implementations still validate <=256
+                    // distinct keys before committing.
+                    if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_radix_key_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                } else {
+                    if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_radix_key_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
             if (partial_pdq) { detail::pdqsort(p, p + n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
-            if (detail::try_parallel_radix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
+            if (detail::try_parallel_radix_sort(p, n, descending, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
         } else {
             if (!high_entropy) {
                 if (detail::try_string_value_count_sort(p, n, comp, false)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
@@ -7090,7 +7174,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
     if (radix_ok) {
 #if FYX_ENABLE_PARALLEL
         if (want_parallel) {
-            if (detail::try_parallel_radix_sort(p, n, descending)) {
+            if (detail::try_parallel_radix_sort(p, n, descending, prof && prof->is_high_entropy)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
             }

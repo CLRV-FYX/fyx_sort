@@ -35,6 +35,8 @@ Date: 2026-08-27
 - High-distinct comparator-key probes now skip expensive low-cardinality counting attempts before entering field-key radix sort.
 - Parallel divide-and-conquer merge now prefers buffered recursive block merge and falls back to `std::inplace_merge` on allocation failure or unsupported shapes.
 - High-entropy numeric default-order inputs now enter chunked parallel radix beyond the 64-bit-only case; 32-bit integers and `float` can use the same multi-chunk count/scatter schedule, the first radix pass reuses the initial local histograms, integer/`float` value-buffer radix avoids the extra encode/decode arrays when profitable, and the chunk scheduler uses more fine-grained chunks for better 4-core/VM load balance.
+- High-entropy radix now has a safe all-pass fast plan: if an evenly-spaced sample proves every radix byte varies, the parallel path counts only byte 0 for the first scatter instead of building a full all-pass planning histogram.  If any byte looks degenerate in the sample, FYX falls back to the full histogram/skip-pass planner.
+- Profile-hinted sparse low-cardinality numeric inputs now try sparse/radix-key counting before dense min/max range counting, avoiding a wasted full range scan on random lowcard16/lowcard256 data with large value spans.
 - Degenerate sample-sort splitter cases now fall back to pdqsort instead of recursing without progress.
 
 ### Benchmark snapshot

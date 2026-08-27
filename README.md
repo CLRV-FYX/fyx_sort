@@ -91,7 +91,7 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | `partial_sort` / `nth_element` | 堆 + 内省选择（quickselect） |
 
 并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，
-高熵数值默认顺序走 chunked parallel radix（32/64-bit 整数与 `float`/`double` 都覆盖，首趟复用 profile/local hist；整数和 `float` 优先用 value-buffer radix，减少 encode/decode 和 scratch 流量）；
+高熵数值默认顺序走 chunked parallel radix（32/64-bit 整数与 `float`/`double` 都覆盖；当样本证明每个 radix byte 都非退化时，首趟只建第 0 byte local hist，跳过全 pass 规划；整数和 `float` 优先用 value-buffer radix，减少 encode/decode 和 scratch 流量）；
 低基数 radix-key 场景走并行 sparse counting；通用大输入走并行 sample sort（并行分类、散射和桶递归）；其它中等输入保留任务并行分治，
 归并阶段优先使用 scratch-buffered 并行分块归并，分配失败或不适用时回退到 `std::inplace_merge`。默认 `Auto`。
 

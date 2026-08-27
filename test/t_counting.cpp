@@ -200,6 +200,23 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        std::vector<std::int32_t> keys = {
+            std::numeric_limits<std::int32_t>::min(), -1234567890, -77777777, -1024,
+            -7, 0, 3, 19, 1024, 65537, 77777777, 123456789, 987654321,
+            1357913579, 1900000000, std::numeric_limits<std::int32_t>::max()
+        };
+        std::vector<std::int32_t> v((std::size_t(1) << 20) + 17);
+        for (auto& x : v) x = keys[rng() % keys.size()];
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::On;
+        fyx::sort(v.begin(), v.end(), o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::LowCardinality,
+              "parallel int32 sparse low-cardinality uses sparse count");
+        CHECK(std::is_sorted(v.begin(), v.end()), "parallel int32 sparse low-cardinality output");
+    }
+    {
+        namespace fd = fyx::detail;
         std::vector<std::int32_t> v((std::size_t(1) << 20) + 17);
         for (auto& x : v) x = static_cast<std::int32_t>(rng());
         fd::test_reset_dispatch();
