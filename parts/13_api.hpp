@@ -1224,6 +1224,28 @@ inline std::size_t adaptive_parallel_chunks(std::size_t n) {
 }
 
 template <class T>
+inline std::size_t adaptive_parallel_radix_chunks(std::size_t n) {
+    ThreadPool& pool = global_pool();
+    constexpr bool wide_key = radix_supported_v<T> && (sizeof(typename RadixTraits<T>::Key) >= 8);
+    constexpr bool heavier_digit = wide_key || std::is_floating_point<T>::value;
+    const std::size_t per_worker = heavier_digit ? std::size_t(4) : std::size_t(8);
+    std::size_t chunks = (n + kParallelThreshold - 1) / kParallelThreshold;
+    const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * per_worker);
+    if (chunks < 2) chunks = 2;
+    if (chunks > max_chunks) chunks = max_chunks;
+    return chunks;
+}
+
+template <unsigned Passes>
+struct RadixLocalHistogram {
+    // Parallel radix chunks are kept far below 4G elements; 32-bit local
+    // counters halve the per-chunk hot histogram/recount footprint, while the
+    // global folded histogram remains 64-bit for correctness on huge arrays.
+    std::uint32_t count[Passes][kRadixBuckets];
+    void clear() noexcept { std::memset(count, 0, sizeof(count)); }
+};
+
+template <class T>
 inline void radix_scatter_value_pass(const T* FYX_RESTRICT src, std::size_t n,
                                      T* FYX_RESTRICT dst, unsigned shift,
                                      std::size_t* FYX_RESTRICT offset,
@@ -1289,6 +1311,54 @@ inline void radix_scatter_value_pass(const T* FYX_RESTRICT src, std::size_t n,
     }
 }
 
+template <class Key>
+inline void radix_count_key_pass_banked(const Key* FYX_RESTRICT src,
+                                        std::size_t n, unsigned shift,
+                                        std::uint32_t* FYX_RESTRICT out) noexcept {
+    std::uint32_t bank[4][kRadixBuckets];
+    std::memset(bank, 0, sizeof(bank));
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        prefetch_stream(src, i, n);
+        ++bank[0][static_cast<unsigned>((src[i + 0] >> shift) & Key(kRadixMask))];
+        ++bank[1][static_cast<unsigned>((src[i + 1] >> shift) & Key(kRadixMask))];
+        ++bank[2][static_cast<unsigned>((src[i + 2] >> shift) & Key(kRadixMask))];
+        ++bank[3][static_cast<unsigned>((src[i + 3] >> shift) & Key(kRadixMask))];
+    }
+    for (; i < n; ++i)
+        ++bank[0][static_cast<unsigned>((src[i] >> shift) & Key(kRadixMask))];
+    for (unsigned d = 0; d < kRadixBuckets; ++d)
+        out[d] = bank[0][d] + bank[1][d] + bank[2][d] + bank[3][d];
+}
+
+template <class T>
+inline void radix_count_value_pass_banked(const T* FYX_RESTRICT src,
+                                          std::size_t n, unsigned shift,
+                                          std::uint32_t* FYX_RESTRICT out) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    std::uint32_t bank[4][kRadixBuckets];
+    std::memset(bank, 0, sizeof(bank));
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        prefetch_stream(src, i, n);
+        const Key k0 = RT::encode(src[i + 0]);
+        const Key k1 = RT::encode(src[i + 1]);
+        const Key k2 = RT::encode(src[i + 2]);
+        const Key k3 = RT::encode(src[i + 3]);
+        ++bank[0][static_cast<unsigned>((k0 >> shift) & Key(kRadixMask))];
+        ++bank[1][static_cast<unsigned>((k1 >> shift) & Key(kRadixMask))];
+        ++bank[2][static_cast<unsigned>((k2 >> shift) & Key(kRadixMask))];
+        ++bank[3][static_cast<unsigned>((k3 >> shift) & Key(kRadixMask))];
+    }
+    for (; i < n; ++i) {
+        const Key k = RT::encode(src[i]);
+        ++bank[0][static_cast<unsigned>((k >> shift) & Key(kRadixMask))];
+    }
+    for (unsigned d = 0; d < kRadixBuckets; ++d)
+        out[d] = bank[0][d] + bank[1][d] + bank[2][d] + bank[3][d];
+}
+
 template <class T>
 inline bool radix_sample_all_passes_vary(const T* p, std::size_t n) noexcept {
     if constexpr (!radix_supported_v<T>) {
@@ -1336,8 +1406,10 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
                 if (!tmp_lease.valid()) return false;
                 T* tmp = tmp_lease.get();
 
-                const std::size_t chunks = adaptive_parallel_chunks(n);
-                std::vector<RadixHistogram<Passes>> local(chunks);
+                const std::size_t chunks = adaptive_parallel_radix_chunks<T>(n);
+                if ((n + chunks - 1) / chunks >
+                    static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
+                std::vector<RadixLocalHistogram<Passes>> local(chunks);
                 for (std::size_t c = 0; c < chunks; ++c) {
                     if (assume_all_passes) std::memset(local[c].count[0], 0, sizeof(local[c].count[0]));
                     else local[c].clear();
@@ -1348,10 +1420,7 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
                             const std::size_t lo = (c * n) / chunks;
                             const std::size_t hi = ((c + 1) * n) / chunks;
                             auto& h = local[c];
-                            for (std::size_t i = lo; i < hi; ++i) {
-                                const Key k = RT::encode(p[i]);
-                                ++h.count[0][radix_digit(k, 0)];
-                            }
+                            radix_count_value_pass_banked<T>(p + lo, hi - lo, 0, h.count[0]);
                         }
                     };
                     parallel_for_index(std::size_t(0), chunks, std::size_t(1), hist_job);
@@ -1389,7 +1458,7 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
                 T* src = p;
                 T* dst = tmp;
                 std::vector<std::array<std::size_t, kRadixBuckets>> base(chunks);
-                std::vector<std::array<std::size_t, kRadixBuckets>> pass_local(chunks);
+                std::vector<std::array<std::uint32_t, kRadixBuckets>> pass_local(chunks);
                 const bool can_stream = have_nt_stores();
 
                 for (unsigned pi = 0; pi < plan.count; ++pi) {
@@ -1399,13 +1468,9 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
                         auto pass_count_job = [&](std::size_t c_lo, std::size_t c_hi) {
                             for (std::size_t c = c_lo; c < c_hi; ++c) {
                                 auto& pc = pass_local[c];
-                                pc.fill(0);
                                 const std::size_t lo = (c * n) / chunks;
                                 const std::size_t hi = ((c + 1) * n) / chunks;
-                                for (std::size_t i = lo; i < hi; ++i) {
-                                    const Key k = RT::encode(src[i]);
-                                    ++pc[static_cast<unsigned>((k >> shift) & Key(kRadixMask))];
-                                }
+                                radix_count_value_pass_banked<T>(src + lo, hi - lo, shift, pc.data());
                             }
                         };
                         parallel_for_index(std::size_t(0), chunks, std::size_t(1), pass_count_job);
@@ -1464,8 +1529,10 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
             Key* a = lease.get();
             Key* b = a + n;
 
-            const std::size_t chunks = adaptive_parallel_chunks(n);
-            std::vector<RadixHistogram<Passes>> local(chunks);
+            const std::size_t chunks = adaptive_parallel_radix_chunks<T>(n);
+            if ((n + chunks - 1) / chunks >
+                static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
+            std::vector<RadixLocalHistogram<Passes>> local(chunks);
             for (std::size_t c = 0; c < chunks; ++c) {
                 if (assume_all_passes) std::memset(local[c].count[0], 0, sizeof(local[c].count[0]));
                 else local[c].clear();
@@ -1521,7 +1588,7 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
             Key* src = a;
             Key* dst = b;
             std::vector<std::array<std::size_t, kRadixBuckets>> base(chunks);
-            std::vector<std::array<std::size_t, kRadixBuckets>> pass_local(chunks);
+            std::vector<std::array<std::uint32_t, kRadixBuckets>> pass_local(chunks);
             const bool can_stream = have_nt_stores();
 
             for (unsigned pi = 0; pi < plan.count; ++pi) {
@@ -1532,11 +1599,9 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
                     auto pass_count_job = [&](std::size_t c_lo, std::size_t c_hi) {
                         for (std::size_t c = c_lo; c < c_hi; ++c) {
                             auto& pc = pass_local[c];
-                            pc.fill(0);
                             const std::size_t lo = (c * n) / chunks;
                             const std::size_t hi = ((c + 1) * n) / chunks;
-                            for (std::size_t i = lo; i < hi; ++i)
-                                ++pc[static_cast<unsigned>((src[i] >> shift) & Key(kRadixMask))];
+                            radix_count_key_pass_banked<Key>(src + lo, hi - lo, shift, pc.data());
                         }
                     };
                     parallel_for_index(std::size_t(0), chunks, std::size_t(1), pass_count_job);
