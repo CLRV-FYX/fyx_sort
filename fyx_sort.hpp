@@ -5926,6 +5926,14 @@ inline void string_msd_sort_rec(std::string* p, std::string* tmp,
     }
 }
 
+inline bool string_msd_sort_default(std::string* p, std::size_t n, bool descending) {
+    if (n < 4096) return false;
+    std::vector<std::string> tmp(n);
+    string_msd_sort_rec(p, tmp.data(), n, 0);
+    if (descending) std::reverse(p, p + n);
+    return true;
+}
+
 template <class T, class Comp>
 inline bool try_string_msd_sort(T* p, std::size_t n, Comp comp, bool descending) {
     if constexpr (!std::is_same<T, std::string>::value) {
@@ -5933,11 +5941,7 @@ inline bool try_string_msd_sort(T* p, std::size_t n, Comp comp, bool descending)
         return false;
     } else {
         if (!(is_ascending_v<Comp, T> || is_descending_v<Comp, T>)) return false;
-        if (n < 4096) return false;
-        std::vector<std::string> tmp(n);
-        string_msd_sort_rec(p, tmp.data(), n, 0);
-        if (descending) std::reverse(p, p + n);
-        return true;
+        return string_msd_sort_default(p, n, descending);
     }
 }
 
@@ -5960,7 +5964,7 @@ inline std::size_t adaptive_parallel_radix_chunks(std::size_t n) {
     constexpr bool int64_value_key = wide_key && std::is_integral<T>::value && !std::is_same<T, bool>::value;
     constexpr bool heavier_digit = wide_key || std::is_floating_point<T>::value;
     const std::size_t per_worker = (int64_value_key && pool.nworkers() >= 3)
-        ? std::size_t(3)
+        ? std::size_t(2)
         : (heavier_digit ? std::size_t(4) : std::size_t(8));
     std::size_t chunks = (n + kParallelThreshold - 1) / kParallelThreshold;
     const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * per_worker);
@@ -6927,13 +6931,7 @@ inline void string_msd_sort_bucket_range_parallel(std::string* data, std::string
               [&] { string_msd_sort_bucket_range_parallel(data, aux, off, mid, hi_b, depth); });
 }
 
-template <class T, class Comp>
-inline bool try_string_msd_sort_parallel(T* p, std::size_t n, Comp comp, bool descending) {
-    if constexpr (!std::is_same<T, std::string>::value) {
-        (void)p; (void)n; (void)comp; (void)descending;
-        return false;
-    } else {
-        if (!(is_ascending_v<Comp, T> || is_descending_v<Comp, T>)) return false;
+inline bool string_msd_sort_parallel_default(std::string* p, std::size_t n, bool descending) {
         if (n < kParallelThreshold || !parallel_available()) return false;
         const std::size_t chunks = adaptive_parallel_chunks(n);
         std::vector<std::array<std::size_t, 257>> local(chunks);
@@ -6992,10 +6990,141 @@ inline bool try_string_msd_sort_parallel(T* p, std::size_t n, Comp comp, bool de
         parallel_for_index(std::size_t(0), n, kParallelThreshold, copy_job);
         if (descending) std::reverse(p, p + n);
         return true;
+}
+
+template <class T, class Comp>
+inline bool try_string_msd_sort_parallel(T* p, std::size_t n, Comp comp, bool descending) {
+    if constexpr (!std::is_same<T, std::string>::value) {
+        (void)p; (void)n; (void)comp; (void)descending;
+        return false;
+    } else {
+        if (!(is_ascending_v<Comp, T> || is_descending_v<Comp, T>)) return false;
+        return string_msd_sort_parallel_default(p, n, descending);
     }
 }
 
 #endif // FYX_ENABLE_PARALLEL
+
+// ---------------------------------------------------------------------------
+// Guarded recovery of default-order fast paths for custom comparators.
+// A caller may spell the natural order as a lambda (`[](auto a, auto b){return
+// a < b;}`), which intentionally does not match the compile-time std::less /
+// fyx::less traits above.  We only use radix/count/MSD after a cheap sample
+// proves the comparator is compatible with natural ascending/descending order,
+// and we always finish with std::is_sorted(comp).  If the sample was fooled the
+// array is still a permutation, so the caller can safely continue into the
+// comparison sorter.
+// ---------------------------------------------------------------------------
+template <class T, class Comp, class Less>
+inline int probe_guarded_default_order(T* p, std::size_t n, Comp comp, Less less) {
+    if (n < 2) return 0;
+    const std::size_t s = std::min<std::size_t>(n, kProfileSampleLimit);
+    bool asc_ok = true, desc_ok = true, saw_order = false;
+
+    auto check_pair = [&](const T& a, const T& b) {
+        const bool ab = comp(a, b);
+        const bool ba = comp(b, a);
+        if (ab || ba) saw_order = true;
+        const bool alb = less(a, b);
+        const bool bla = less(b, a);
+        if ((ab && !alb) || (ba && !bla)) asc_ok = false;
+        if ((ab && !bla) || (ba && !alb)) desc_ok = false;
+    };
+
+    std::size_t prev = 0;
+    for (std::size_t j = 1; j < s && (asc_ok || desc_ok); ++j) {
+        const std::size_t idx = (j * (n - 1)) / (s - 1);
+        check_pair(p[prev], p[idx]);
+        check_pair(p[0], p[idx]);
+        prev = idx;
+    }
+
+    if (!saw_order) return 0;
+    if (asc_ok) return 1;
+    if (desc_ok) return -1;
+    return 0;
+}
+
+template <class T, class Comp>
+inline int probe_guarded_radix_order(T* p, std::size_t n, Comp comp) {
+    if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value ||
+                  is_ascending_v<Comp, T> || is_descending_v<Comp, T>) {
+        (void)p; (void)n; (void)comp;
+        return 0;
+    } else {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        return probe_guarded_default_order(p, n, comp, [](const T& a, const T& b) {
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            return ka < kb;
+        });
+    }
+}
+
+template <class T, class Comp>
+inline bool try_guarded_string_order_sort(T* p, std::size_t n, Comp comp,
+                                          bool prefer_parallel) {
+    if constexpr (!std::is_same<T, std::string>::value ||
+                  is_ascending_v<Comp, T> || is_descending_v<Comp, T>) {
+        (void)p; (void)n; (void)comp; (void)prefer_parallel;
+        return false;
+    } else {
+        const int dir = probe_guarded_default_order(p, n, comp, std::less<std::string>{});
+        if (dir == 0) return false;
+        const bool descending = dir < 0;
+        bool done = false;
+#if FYX_ENABLE_PARALLEL
+        if (prefer_parallel) done = string_msd_sort_parallel_default(p, n, descending);
+#else
+        (void)prefer_parallel;
+#endif
+        if (!done) done = string_msd_sort_default(p, n, descending);
+        return done && std::is_sorted(p, p + n, comp);
+    }
+}
+
+template <class T, class Comp>
+inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
+                                         bool prefer_parallel, bool high_entropy) {
+    if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value ||
+                  is_ascending_v<Comp, T> || is_descending_v<Comp, T>) {
+        (void)p; (void)n; (void)comp; (void)prefer_parallel; (void)high_entropy;
+        return false;
+    } else {
+        const int dir = probe_guarded_radix_order(p, n, comp);
+        if (dir == 0) return false;
+        const bool descending = dir < 0;
+
+        bool done = false;
+        if (!high_entropy) {
+#if FYX_ENABLE_PARALLEL
+            if (prefer_parallel) {
+                done = try_integer_sparse_count_sort_parallel(p, n, descending) ||
+                       try_radix_key_sparse_count_sort_parallel(p, n, descending);
+            }
+#endif
+            if (!done) {
+                done = try_radix_key_sparse_count_sort(p, n, descending) ||
+                       try_integer_sparse_count_sort(p, n, descending) ||
+                       try_integer_range_count_sort(p, n, descending);
+            }
+        }
+
+#if FYX_ENABLE_PARALLEL
+        if (!done && prefer_parallel)
+            done = try_parallel_radix_sort(p, n, descending, high_entropy);
+#else
+        (void)prefer_parallel;
+#endif
+
+        if (!done) {
+            done = radix_sort(p, n);
+            if (done && descending) std::reverse(p, p + n);
+        }
+        return done && std::is_sorted(p, p + n, comp);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Single-threaded best-kernel selection for a contiguous pointer range.
@@ -7067,6 +7196,8 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
             }
         }
     } else {
+        if (try_guarded_radix_order_sort(p, n, comp, false, high_entropy)) { record_dispatch(DispatchDecision::Radix); return; }
+        if (try_guarded_string_order_sort(p, n, comp, false)) { record_dispatch(DispatchDecision::Radix); return; }
         if (!high_entropy) {
             if (try_string_value_count_sort(p, n, comp, false)) { record_dispatch(DispatchDecision::LowCardinality); return; }
             if (try_trivial_prefix_key_count_sort(p, n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
@@ -7517,6 +7648,8 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_parallel_radix_sort(p, n, descending, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
         } else {
+            if (detail::try_guarded_radix_order_sort(p, n, comp, want_parallel, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
+            if (detail::try_guarded_string_order_sort(p, n, comp, want_parallel)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (!high_entropy) {
                 if (detail::try_string_value_count_sort(p, n, comp, false)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_trivial_prefix_key_count_sort_parallel(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
@@ -7553,6 +7686,15 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
 
 #if FYX_ENABLE_PARALLEL
     if (want_parallel) {
+        const bool high_entropy = prof && prof->is_high_entropy;
+        if (detail::try_guarded_radix_order_sort(p, n, comp, true, high_entropy)) {
+            detail::record_dispatch(detail::DispatchDecision::Radix);
+            return;
+        }
+        if (detail::try_guarded_string_order_sort(p, n, comp, true)) {
+            detail::record_dispatch(detail::DispatchDecision::Radix);
+            return;
+        }
         if (n >= detail::kSampleThreshold) {
             detail::parallel_sample_sort(p, p + n, comp);
             detail::record_dispatch(detail::DispatchDecision::ParallelSample);

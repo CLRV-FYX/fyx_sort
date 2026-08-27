@@ -185,6 +185,20 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        std::vector<int> v(200000);
+        for (auto& x : v) x = static_cast<int>(rng());
+        auto less_lambda = [](int a, int b) { return a < b; };
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::Off;
+        fyx::sort(v.begin(), v.end(), less_lambda, o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
+              "custom numeric less lambda recovers guarded radix path");
+        CHECK(std::is_sorted(v.begin(), v.end(), less_lambda),
+              "custom numeric less lambda guarded radix output");
+    }
+    {
+        namespace fd = fyx::detail;
         std::vector<float> keys(16);
         for (std::size_t i = 0; i < keys.size(); ++i)
             keys[i] = static_cast<float>(static_cast<int>(i) - 8) * 1.25f;
@@ -305,6 +319,7 @@ int main() {
 
     std::printf("string MSD lexicographic edge cases\n");
     {
+        namespace fd = fyx::detail;
         std::vector<std::string> v(30000);
         for (auto& s : v) {
             const std::size_t len = static_cast<std::size_t>(rng() % 9);
@@ -313,6 +328,16 @@ int main() {
         }
         check_against_std("string MSD random bytes", v, std::less<std::string>{});
         check_against_std("string MSD random bytes descending", v, std::greater<std::string>{});
+
+        auto less_lambda = [](const std::string& a, const std::string& b) { return a < b; };
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::Off;
+        fyx::sort(v.begin(), v.end(), less_lambda, o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
+              "custom string less lambda recovers guarded MSD path");
+        CHECK(std::is_sorted(v.begin(), v.end(), less_lambda),
+              "custom string less lambda guarded MSD output");
     }
 
     std::printf("radix monotone detector with NaN\n");
