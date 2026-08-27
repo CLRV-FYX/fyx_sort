@@ -6989,6 +6989,11 @@ inline bool try_msd_radix_bucket_sort_impl(T* p, std::size_t n, bool descending)
     constexpr unsigned Shift = KeyBits - TopBits;
 
     if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+    // This MSD-bucket hybrid is a bandwidth-constrained 2-worker win in the
+    // sandbox, but the user's 4H8G vqsort matrix shows it loses to the normal
+    // chunked radix path once four hardware threads are available.  Keep it as
+    // the 2-core specialization and let 3+ cores fall through to radix.
+    if (global_pool().nworkers() != 2) return false;
     const std::size_t chunks = adaptive_parallel_chunks(n);
     if ((n + chunks - 1) / chunks > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
         return false;
