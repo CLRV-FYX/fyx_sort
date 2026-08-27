@@ -1227,8 +1227,11 @@ template <class T>
 inline std::size_t adaptive_parallel_radix_chunks(std::size_t n) {
     ThreadPool& pool = global_pool();
     constexpr bool wide_key = radix_supported_v<T> && (sizeof(typename RadixTraits<T>::Key) >= 8);
+    constexpr bool int64_value_key = wide_key && std::is_integral<T>::value && !std::is_same<T, bool>::value;
     constexpr bool heavier_digit = wide_key || std::is_floating_point<T>::value;
-    const std::size_t per_worker = heavier_digit ? std::size_t(4) : std::size_t(8);
+    const std::size_t per_worker = (int64_value_key && pool.nworkers() >= 3)
+        ? std::size_t(3)
+        : (heavier_digit ? std::size_t(4) : std::size_t(8));
     std::size_t chunks = (n + kParallelThreshold - 1) / kParallelThreshold;
     const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * per_worker);
     if (chunks < 2) chunks = 2;
@@ -1683,6 +1686,7 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
                     }
                 }
 
+                if constexpr (std::is_same<T, double>::value) {
                 if (pi + 1 == plan.count) {
                     auto scatter_decode_job = [&](std::size_t c_lo, std::size_t c_hi) {
                         constexpr std::size_t kPerLine = WcbTraits<T>::kPerLine;
@@ -1714,6 +1718,7 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
                     parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_decode_job);
                     if (descending) std::reverse(p, p + n);
                     return true;
+                }
                 }
 
                 auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
