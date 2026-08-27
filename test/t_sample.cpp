@@ -41,8 +41,9 @@ int main() {
         for (int t = 0; t < 20000; ++t) {
             int x = static_cast<int>(rng() % 2000000) - 1000000;
             unsigned a = classify_bucket(x, tree.data(), m, std::less<int>());
+            unsigned au = classify_bucket_256(x, tree.data(), std::less<int>());
             unsigned b = brute_bucket(x, s, std::less<int>());
-            if (a != b) { ok = 0; break; }
+            if (a != b || au != b) { ok = 0; break; }
         }
         CHECK(ok, "classify matches brute force (int)");
     }
@@ -57,8 +58,9 @@ int main() {
         for (int t = 0; t < 20000; ++t) {
             std::string x = std::to_string(rng() % 200000);
             unsigned a = classify_bucket(x, tree.data(), m, std::less<std::string>());
+            unsigned au = classify_bucket_256(x, tree.data(), std::less<std::string>());
             unsigned b = brute_bucket(x, s, std::less<std::string>());
-            if (a != b) { ok = 0; break; }
+            if (a != b || au != b) { ok = 0; break; }
         }
         CHECK(ok, "classify matches brute force (string)");
     }

@@ -1234,7 +1234,7 @@ inline std::size_t adaptive_parallel_radix_chunks(std::size_t n) {
     constexpr bool int64_value_key = wide_key && std::is_integral<T>::value && !std::is_same<T, bool>::value;
     constexpr bool heavier_digit = wide_key || std::is_floating_point<T>::value;
     const std::size_t per_worker = (int64_value_key && pool.nworkers() >= 3)
-        ? std::size_t(2)
+        ? std::size_t(3)
         : (heavier_digit ? std::size_t(4) : std::size_t(8));
     std::size_t chunks = (n + kParallelThreshold - 1) / kParallelThreshold;
     const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * per_worker);

@@ -87,12 +87,12 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀） |
 | 自定义比较器但采样等价于自然升/降序的数值或 `std::string` | guarded radix/count/MSD recovery（采样确认 + 最终 `is_sorted(comp)` 校验；失败则继续比较排序） |
 | trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
-| 结构体 / 自定义比较器大输入 | 256 路 sample sort（ips4o 风格，块级桶重排 + 临时散射） |
+| 结构体 / 自定义比较器大输入 | 256 路 sample sort（unrolled Eytzinger 分类；串行路径单趟 prefix scatter，并行路径分 chunk 计数/散射；低 distinct 算术样本回退 pdqsort） |
 | `stable_sort` 非低基数通用类型 | 自底向上归并排序（稳定） |
 | `partial_sort` / `nth_element` | 堆 + 内省选择（quickselect） |
 
 并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，
-高熵数值默认顺序在 3+ worker 上回到 chunked parallel radix（保留全 pass 快速规划、32-bit/value-buffer 优化，并用 32-bit local hist / 按 key 宽度自适应 chunk 数降低 64-bit recount/cache 压力；3+ worker 的 64-bit 整数 value-buffer radix 收粗到 2 chunks/worker 来降低 scatter task/WCB 开销；`double` key-buffer 路径最后一趟直接 scatter+decode 回用户数组，少一次额外输出拷贝且不进入整数实例化），避免 4H8G 上 MSD 分桶开销反噬；只有 2-worker/bandwidth-constrained 环境才启用 `float` top-byte / 64-bit top16 MSD-bucket hybrid；
+高熵数值默认顺序在 3+ worker 上回到 chunked parallel radix（保留全 pass 快速规划、32-bit/value-buffer 优化，并用 32-bit local hist / 按 key 宽度自适应 chunk 数降低 64-bit recount/cache 压力；64-bit 整数 value-buffer radix 回退到 4H2G 实测更稳的 3 chunks/worker；`double` key-buffer 路径最后一趟直接 scatter+decode 回用户数组，少一次额外输出拷贝且不进入整数实例化），避免 4H8G 上 MSD 分桶开销反噬；只有 2-worker/bandwidth-constrained 环境才启用 `float` top-byte / 64-bit top16 MSD-bucket hybrid；
 低基数 radix-key 场景走并行 sparse counting；通用大输入走并行 sample sort（并行分类、散射和桶递归）；其它中等输入保留任务并行分治，
 归并阶段优先使用 scratch-buffered 并行分块归并，分配失败或不适用时回退到 `std::inplace_merge`。默认 `Auto`。
 

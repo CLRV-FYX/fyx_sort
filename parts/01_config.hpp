@@ -402,10 +402,11 @@ inline constexpr std::size_t kNetworkMax = 64;
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;
 
-/// Sample-sort bucket count and block size (ips4o terminology).
+/// Sample-sort bucket count.  The serial path uses a single prefix scatter;
+/// the parallel path derives chunk blocks from kParallelThreshold.
 inline constexpr std::size_t kSampleBuckets   = 256;
 inline constexpr std::size_t kSampleBlock     = 1024;
-inline constexpr std::size_t kSampleThreshold = 1u << 17;     // 131072
+inline constexpr std::size_t kSampleThreshold = 1u << 15;     // 32768
 
 /// Hard ceiling on pool size.  Guards against absurd hardware_concurrency
 /// values and bounds the per-thread scratch the pool can pin.

@@ -402,10 +402,11 @@ inline constexpr std::size_t kNetworkMax = 64;
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;
 
-/// Sample-sort bucket count and block size (ips4o terminology).
+/// Sample-sort bucket count.  The serial path uses a single prefix scatter;
+/// the parallel path derives chunk blocks from kParallelThreshold.
 inline constexpr std::size_t kSampleBuckets   = 256;
 inline constexpr std::size_t kSampleBlock     = 1024;
-inline constexpr std::size_t kSampleThreshold = 1u << 17;     // 131072
+inline constexpr std::size_t kSampleThreshold = 1u << 15;     // 32768
 
 /// Hard ceiling on pool size.  Guards against absurd hardware_concurrency
 /// values and bounds the per-thread scratch the pool can pin.
@@ -4444,6 +4445,26 @@ inline unsigned classify_bucket(const T& x, const T* tree, unsigned m, Comp comp
     return b - m - 1u;
 }
 
+
+// Specialized unrolled classifier for the fixed 256-way top-level used by FYX.
+// It removes the loop/termination branch from the Eytzinger descent while
+// preserving the exact same splitter semantics (bucket = upper_bound in the
+// sorted splitter set represented by the tree).
+template <class T, class Comp>
+FYX_FORCE_INLINE unsigned classify_bucket_256(const T& x, const T* tree, Comp comp) {
+    static_assert(kSampleBuckets == 256, "unrolled classifier assumes 256 buckets");
+    unsigned b = 1;
+    b = 2 * b + (comp(x, tree[b]) ? 0u : 1u);
+    b = 2 * b + (comp(x, tree[b]) ? 0u : 1u);
+    b = 2 * b + (comp(x, tree[b]) ? 0u : 1u);
+    b = 2 * b + (comp(x, tree[b]) ? 0u : 1u);
+    b = 2 * b + (comp(x, tree[b]) ? 0u : 1u);
+    b = 2 * b + (comp(x, tree[b]) ? 0u : 1u);
+    b = 2 * b + (comp(x, tree[b]) ? 0u : 1u);
+    b = 2 * b + (comp(x, tree[b]) ? 0u : 1u);
+    return b - kSampleBuckets;
+}
+
 // Sample sort over a random-access range.  Falls back to pdqsort when the
 // low-cardinality guard fires (cheap for caller -- this is hit before the
 // O(n) permutation work).
@@ -4478,7 +4499,8 @@ inline void sample_sort(It first, It last, Comp comp) {
         if (comp(sample[i - 1], sample[i])) ++distinct;
     const double distinct_ratio = static_cast<double>(distinct) / static_cast<double>(S);
     if (distinct_ratio == 0) { pdqsort(first, last, comp); return; }
-    if (!std::is_arithmetic<T>::value && distinct_ratio < 0.05) {
+    if ((std::is_arithmetic<T>::value && distinct_ratio < 0.10) ||
+        (!std::is_arithmetic<T>::value && distinct_ratio < 0.05)) {
         pdqsort(first, last, comp);
         return;
     }
@@ -4494,9 +4516,9 @@ inline void sample_sort(It first, It last, Comp comp) {
     std::vector<unsigned char> bid(n);
     std::vector<std::size_t> count(k, 0);
     for (std::size_t i = 0; i < n; ++i) {
-        const unsigned b = classify_bucket(*(first + i), tree.data(), m, comp);
+        const unsigned b = classify_bucket_256(*(first + i), tree.data(), comp);
         bid[i] = static_cast<unsigned char>(b);
-        count[b]++;
+        ++count[b];
     }
     std::vector<std::size_t> offset(k + 1);
     std::size_t max_bucket = 0;
@@ -4509,42 +4531,18 @@ inline void sample_sort(It first, It last, Comp comp) {
     // three-way partition / heapsort fallback.
     if (max_bucket == n) { pdqsort(first, last, comp); return; }
 
-    // ---- 5. block-level bucket reorder (武器四) -------------------------
-    // The previous in-place cycle follower minimized auxiliary memory for
-    // trivially-copyable records, but it touched the input/output in long
-    // pseudo-random cycles.  Here we use an IPS4o-style block plan: count each
-    // source block's contribution to every bucket, prefix those block counts
-    // inside each bucket, then scatter block by block into a temporary array.
-    // Writes are confined to the block's reserved slice of each bucket, and the
-    // final copy-back is a streaming pass.  Non-trivial objects already used a
-    // temp buffer; this gives trivial payload records the same cache locality.
+    // ---- 5. bucket reorder -----------------------------------------------
+    // Serial sample sort does not need per-block reservation: one thread owns
+    // every bucket cursor.  A single prefix-position scatter removes an extra
+    // full scan over bid[] and two large block-prefix tables from the previous
+    // block plan, while the parallel path below keeps per-chunk bases for
+    // thread safety.
     {
-        const std::size_t block_elems = std::max<std::size_t>(kSampleBlock, 1024);
-        const std::size_t blocks = (n + block_elems - 1) / block_elems;
-        std::vector<std::array<std::size_t, kSampleBuckets>> local(blocks);
-        for (auto& a : local) a.fill(0);
-        for (std::size_t i = 0; i < n; ++i)
-            ++local[i / block_elems][bid[i]];
-
-        std::vector<std::array<std::size_t, kSampleBuckets>> base(blocks);
-        for (auto& a : base) a.fill(0);
-        for (unsigned b = 0; b < k; ++b) {
-            std::size_t run = offset[b];
-            for (std::size_t blk = 0; blk < blocks; ++blk) {
-                base[blk][b] = run;
-                run += local[blk][b];
-            }
-        }
-
         std::vector<T> tmp(n);
-        for (std::size_t blk = 0; blk < blocks; ++blk) {
-            const std::size_t lo = blk * block_elems;
-            const std::size_t hi = std::min(n, lo + block_elems);
-            auto pos = base[blk];
-            for (std::size_t i = lo; i < hi; ++i) {
-                const unsigned b = bid[i];
-                tmp[pos[b]++] = std::move(*(first + i));
-            }
+        std::vector<std::size_t> pos(offset.begin(), offset.begin() + k);
+        for (std::size_t i = 0; i < n; ++i) {
+            const unsigned b = bid[i];
+            tmp[pos[b]++] = std::move(*(first + i));
         }
         for (std::size_t i = 0; i < n; ++i) *(first + i) = std::move(tmp[i]);
     }
@@ -4638,7 +4636,8 @@ inline void parallel_sample_sort_impl(It first, It last, Comp comp, unsigned dep
     for (std::size_t i = 1; i < S; ++i)
         if (comp(sample[i - 1], sample[i])) ++distinct;
     const double distinct_ratio = static_cast<double>(distinct) / static_cast<double>(S);
-    if (!std::is_arithmetic<T>::value && distinct_ratio < 0.05) {
+    if ((std::is_arithmetic<T>::value && distinct_ratio < 0.10) ||
+        (!std::is_arithmetic<T>::value && distinct_ratio < 0.05)) {
         pdqsort(first, last, comp);
         return;
     }
@@ -4665,7 +4664,7 @@ inline void parallel_sample_sort_impl(It first, It last, Comp comp, unsigned dep
             const std::size_t hi = ((c + 1) * n) / chunks;
             auto& lc = local[c];
             for (std::size_t i = lo; i < hi; ++i) {
-                const unsigned b = classify_bucket(*(first + i), tree.data(), m, comp);
+                const unsigned b = classify_bucket_256(*(first + i), tree.data(), comp);
                 bid[i] = static_cast<unsigned char>(b);
                 ++lc[b];
             }
@@ -5964,7 +5963,7 @@ inline std::size_t adaptive_parallel_radix_chunks(std::size_t n) {
     constexpr bool int64_value_key = wide_key && std::is_integral<T>::value && !std::is_same<T, bool>::value;
     constexpr bool heavier_digit = wide_key || std::is_floating_point<T>::value;
     const std::size_t per_worker = (int64_value_key && pool.nworkers() >= 3)
-        ? std::size_t(2)
+        ? std::size_t(3)
         : (heavier_digit ? std::size_t(4) : std::size_t(8));
     std::size_t chunks = (n + kParallelThreshold - 1) / kParallelThreshold;
     const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * per_worker);
