@@ -241,6 +241,21 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        std::vector<double> v((std::size_t(1) << 20) + 17);
+        for (auto& x : v) {
+            const std::int64_t raw = static_cast<std::int64_t>(rng());
+            x = static_cast<double>(raw) * 0.25;
+        }
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::On;
+        fyx::sort(v.begin(), v.end(), o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
+              "parallel double high-entropy uses radix bucket dispatch");
+        CHECK(std::is_sorted(v.begin(), v.end()), "parallel double high-entropy output");
+    }
+    {
+        namespace fd = fyx::detail;
         std::vector<float> keys(16);
         for (std::size_t i = 0; i < keys.size(); ++i)
             keys[i] = static_cast<float>(static_cast<int>(i) - 8) * 0.5f;

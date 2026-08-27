@@ -83,7 +83,7 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | 整数小值域 | 计数排序（O(n + range)） |
 | 数值/浮点默认顺序低基数（≤256 radix keys） | radix-key 稀疏计数排序；大输入可并行计数/填充（O(n)，保留 `-0/+0`/NaN 总序语义） |
 | 任意类型低基数（≤256 等价类） | 压缩计数排序，保留原始对象 payload；`stable_sort` 保持稳定 |
-| 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，SIMD/scalar 直方图，非临时散射写；大规模高熵 numeric 可走 chunked parallel radix） |
+| 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，SIMD/scalar 直方图，非临时散射写；大规模高熵 numeric 可走 chunked parallel radix，64-bit/`float` random 可先 MSD 分桶再桶内 radix/PDQ） |
 | 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀） |
 | trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
 | 结构体 / 自定义比较器大输入 | 256 路 sample sort（ips4o 风格，块级桶重排 + 临时散射） |
@@ -91,7 +91,7 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | `partial_sort` / `nth_element` | 堆 + 内省选择（quickselect） |
 
 并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，
-高熵数值默认顺序走 chunked parallel radix（32/64-bit 整数与 `float`/`double` 都覆盖；当样本证明每个 radix byte 都非退化时，首趟只建第 0 byte local hist，跳过全 pass 规划；整数和 `float` 优先用 value-buffer radix，减少 encode/decode 和 scratch 流量）；
+高熵数值默认顺序先按类型选择更省内存流量的 parallel radix 形态：32-bit 整数保留 chunked value-buffer radix；`float` 使用 8-bit MSD 顶层分桶后桶内 3-pass lower radix；64-bit 整数/`double` 使用 16-bit MSD 顶层分桶，桶内用小桶 PDQ 或 lower radix，从而避开纯 8-pass 全局随机 scatter 的最坏内存流量；
 低基数 radix-key 场景走并行 sparse counting；通用大输入走并行 sample sort（并行分类、散射和桶递归）；其它中等输入保留任务并行分治，
 归并阶段优先使用 scratch-buffered 并行分块归并，分配失败或不适用时回退到 `std::inplace_merge`。默认 `Auto`。
 

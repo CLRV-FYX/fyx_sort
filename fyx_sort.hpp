@@ -6922,6 +6922,190 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
 
 #if FYX_ENABLE_PARALLEL
 
+template <class T, unsigned ActivePasses>
+inline bool radix_sort_lower_passes(T* data, std::size_t n) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    static_assert(ActivePasses <= RT::passes, "too many lower radix passes");
+    if (n < 2) return true;
+    if (n <= kNetworkMax) {
+        small_sort_numeric(data, n);
+        return true;
+    }
+
+    ScratchLease<Key> lease(n * 2);
+    if (!lease.valid()) return false;
+    Key* a = lease.get();
+    Key* b = a + n;
+
+    RadixHistogram<ActivePasses> hist;
+    hist.clear();
+    for (std::size_t i = 0; i < n; ++i) {
+        const Key k = RT::encode(data[i]);
+        a[i] = k;
+        for (unsigned pass = 0; pass < ActivePasses; ++pass)
+            ++hist.count[pass][radix_digit(k, pass)];
+    }
+
+    const RadixPlan<ActivePasses> plan = plan_radix<ActivePasses>(hist, n);
+    if (plan.count == 0) return true;
+
+    Key* src = a;
+    Key* dst = b;
+    constexpr std::size_t kPerLine = WcbTraits<Key>::kPerLine;
+    ScratchLease<Key> wcb_lease(2 * kRadixBuckets * kPerLine + kPerLine);
+    if (!wcb_lease.valid()) return false;
+
+    RadixScatterScratch<Key> sc;
+    const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(wcb_lease.get());
+    const std::uintptr_t mis = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+    sc.line = reinterpret_cast<Key*>(addr + mis);
+    sc.head = sc.line + kRadixBuckets * kPerLine;
+    const bool can_stream = have_nt_stores();
+
+    std::size_t offset[kRadixBuckets];
+    for (unsigned pi = 0; pi < plan.count; ++pi) {
+        const unsigned pass = plan.active[pi];
+        std::size_t sum = 0;
+        for (unsigned d = 0; d < kRadixBuckets; ++d) {
+            offset[d] = sum;
+            sum += static_cast<std::size_t>(hist.count[pass][d]);
+        }
+        radix_scatter_pass<Key>(src, n, dst, pass * kRadixBits, offset, sc, can_stream);
+        Key* t = src; src = dst; dst = t;
+    }
+
+    for (std::size_t i = 0; i < n; ++i) data[i] = RT::decode(src[i]);
+    return true;
+}
+
+template <unsigned TopBits, class T>
+inline bool try_msd_radix_bucket_sort_impl(T* p, std::size_t n, bool descending) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr unsigned KeyBits = sizeof(Key) * CHAR_BIT;
+    static_assert(TopBits > 0 && TopBits <= KeyBits, "invalid MSD radix width");
+    constexpr std::size_t Buckets = std::size_t(1) << TopBits;
+    constexpr unsigned Shift = KeyBits - TopBits;
+
+    if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+    const std::size_t chunks = adaptive_parallel_chunks(n);
+    if ((n + chunks - 1) / chunks > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
+        return false;
+
+    ScratchLease<T> tmp_lease(n);
+    if (!tmp_lease.valid()) return false;
+    T* tmp = tmp_lease.get();
+
+    std::vector<std::uint32_t> local(chunks * Buckets, 0);
+    auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+        for (std::size_t c = c_lo; c < c_hi; ++c) {
+            const std::size_t lo = (c * n) / chunks;
+            const std::size_t hi = ((c + 1) * n) / chunks;
+            std::uint32_t* lc = local.data() + c * Buckets;
+            for (std::size_t i = lo; i < hi; ++i) {
+                const Key k = RT::encode(p[i]);
+                ++lc[static_cast<std::size_t>(k >> Shift)];
+            }
+        }
+    };
+    parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+
+    std::vector<std::size_t> off(Buckets + 1, 0);
+    std::size_t nonzero = 0;
+    for (std::size_t d = 0; d < Buckets; ++d) {
+        std::size_t s = 0;
+        for (std::size_t c = 0; c < chunks; ++c)
+            s += local[c * Buckets + d];
+        if (s != 0) ++nonzero;
+        off[d + 1] = off[d] + s;
+    }
+    if (nonzero <= 1) return false;
+
+    std::vector<std::size_t> base(chunks * Buckets);
+    std::size_t run = 0;
+    for (std::size_t d = 0; d < Buckets; ++d) {
+        for (std::size_t c = 0; c < chunks; ++c) {
+            const std::size_t idx = c * Buckets + d;
+            base[idx] = run;
+            run += local[idx];
+        }
+    }
+
+    auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+        ScratchLease<std::size_t> pos_lease(Buckets);
+        std::vector<std::size_t> pos_fallback;
+        std::size_t* pos = pos_lease.valid() ? pos_lease.get() : nullptr;
+        if (!pos) {
+            pos_fallback.resize(Buckets);
+            pos = pos_fallback.data();
+        }
+        for (std::size_t c = c_lo; c < c_hi; ++c) {
+            std::memcpy(pos, base.data() + c * Buckets, Buckets * sizeof(std::size_t));
+            const std::size_t lo = (c * n) / chunks;
+            const std::size_t hi = ((c + 1) * n) / chunks;
+            for (std::size_t i = lo; i < hi; ++i) {
+                const T v = p[i];
+                const Key k = RT::encode(v);
+                tmp[pos[static_cast<std::size_t>(k >> Shift)]++] = v;
+            }
+        }
+    };
+    parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
+
+    auto bucket_job = [&](std::size_t d_lo, std::size_t d_hi) {
+        for (std::size_t d = d_lo; d < d_hi; ++d) {
+            const std::size_t lo = off[d];
+            const std::size_t hi = off[d + 1];
+            const std::size_t sz = hi - lo;
+            if (sz <= 1) continue;
+            if constexpr (TopBits == 16 && sizeof(Key) == 8) {
+                if constexpr (std::is_floating_point<T>::value) {
+                    if (!radix_sort_lower_passes<T, 6>(tmp + lo, sz))
+                        sort_st(tmp + lo, sz, fyx::less{}, false);
+                } else {
+                    if (sz <= kNetworkMax) small_sort_numeric(tmp + lo, sz);
+                    else if (sz < (std::size_t(1) << 16)) pdqsort(tmp + lo, tmp + hi, fyx::less{});
+                    else if (!radix_sort_lower_passes<T, 6>(tmp + lo, sz))
+                        pdqsort(tmp + lo, tmp + hi, fyx::less{});
+                }
+            } else if constexpr (TopBits == 8 && sizeof(Key) == 4 && std::is_floating_point<T>::value) {
+                if (!radix_sort_lower_passes<T, 3>(tmp + lo, sz))
+                    sort_st(tmp + lo, sz, fyx::less{}, false);
+            } else {
+                sort_st(tmp + lo, sz, fyx::less{}, false);
+            }
+        }
+    };
+    const std::size_t bucket_grain = TopBits >= 16 ? std::size_t(256) : std::size_t(1);
+    parallel_for_index(std::size_t(0), Buckets, bucket_grain, bucket_job);
+
+    auto copy_job = [&](std::size_t lo, std::size_t hi) {
+        for (std::size_t i = lo; i < hi; ++i) p[i] = tmp[i];
+    };
+    parallel_for_index(std::size_t(0), n, kParallelThreshold, copy_job);
+    if (descending) std::reverse(p, p + n);
+    return true;
+}
+
+template <class T>
+inline bool try_msd_radix_bucket_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using Key = typename RadixTraits<T>::Key;
+        if constexpr (sizeof(Key) == 8) {
+            return try_msd_radix_bucket_sort_impl<16>(p, n, descending);
+        } else if constexpr (std::is_same<T, float>::value) {
+            return try_msd_radix_bucket_sort_impl<8>(p, n, descending);
+        } else {
+            (void)p; (void)n; (void)descending;
+            return false;
+        }
+    }
+}
+
 template <class T, class Comp>
 inline void parallel_merge_to_buffer_rec(T* src,
                                          std::size_t a0, std::size_t a1,
@@ -7155,6 +7339,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
             if (partial_pdq) { detail::pdqsort(p, p + n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_parallel_radix_sort(p, n, descending, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
         } else {
             if (!high_entropy) {
@@ -7174,7 +7359,12 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
     if (radix_ok) {
 #if FYX_ENABLE_PARALLEL
         if (want_parallel) {
-            if (detail::try_parallel_radix_sort(p, n, descending, prof && prof->is_high_entropy)) {
+            const bool high_entropy = prof && prof->is_high_entropy;
+            if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
+            if (detail::try_parallel_radix_sort(p, n, descending, high_entropy)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
             }
