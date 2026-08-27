@@ -80,11 +80,11 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | 已排序 / 全等 | 统一 profile 一次验证后直接返回 |
 | 逆序（非 stable） | 统一 profile 一次验证后反转 |
 | 部分有序（相邻逆序边 ≤ n/64，且规模合理） | pdqsort |
-| 整数小值域 | 计数排序（O(n + range)） |
+| 整数小值域 | 计数排序（O(n + range)）；大输入先用 sample-gated 并行 dense-range count/fill 加速 256-way lowcard |
 | 数值/浮点默认顺序低基数（≤256 radix keys） | radix-key 稀疏计数排序；大输入可并行计数/填充，浮点小值域先用 compact prefix direct-map 计数（O(n)，保留 `-0/+0`/NaN 总序语义） |
 | 任意类型低基数（≤256 等价类） | 压缩计数排序，保留原始对象 payload；`stable_sort` 保持稳定 |
 | 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，SIMD/scalar 直方图，非临时散射写；大规模高熵 64-bit random 先走 high-prefix radix：整数排序 encoded top33 key 后只修复极少 tie，`double` 排序 encoded top39 key 并在最后一趟解码；其它 numeric 回退 chunked parallel radix；2-worker/bandwidth-constrained 环境仍保留 MSD-bucket hybrid fallback） |
-| 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀） |
+| 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀）；自然顺序 comparator 下的低基数字符串可恢复 unordered value-count/fill |
 | 自定义比较器但采样等价于自然升/降序的数值或 `std::string` | guarded radix/count/MSD recovery（采样确认 + 最终 `is_sorted(comp)` 校验；失败则继续比较排序） |
 | trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
 | 结构体 / 自定义比较器大输入 | 256 路 sample sort（cheap/trivial payload 使用 unrolled Eytzinger 分类；`std::string` fallback 保持 looped classifier + 128K handoff + block scatter；非字符串串行路径单趟 prefix scatter，并行路径分 chunk 计数/散射；低 distinct 算术样本先走 sparse value counting） |
@@ -93,7 +93,7 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 
 并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，
 高熵数值默认顺序会先尝试 64-bit high-prefix radix（sample 确认高 prefix 近似唯一后，`int64/uint64` 只排 encoded top33 key，`double` 只排 encoded top39 key，最后一趟 scatter 时直接解码回用户数组，再对相同 prefix 的小桶补排），用更少全数组 pass 攻击 64-bit random 短板；不适用时回到 chunked parallel radix（保留全 pass 快速规划、32-bit/value-buffer 优化，并用 32-bit local hist / 按 key 宽度自适应 chunk 数降低 64-bit recount/cache 压力；64-bit 整数 value-buffer radix 保持 4H2G 实测更稳的 3 chunks/worker；`double` key-buffer 路径最后一趟直接 scatter+decode 回用户数组），2-worker/bandwidth-constrained 环境仍保留 `float` top-byte / 64-bit top16 MSD-bucket hybrid fallback；
-低基数 radix-key 场景走并行 sparse counting，浮点低基数会先尝试 compact prefix direct-map 以避免逐元素 hash probe；通用大输入走并行 sample sort（并行分类、散射和桶递归）；其它中等输入保留任务并行分治，
+低基数 radix-key 场景走并行 sparse counting；整数 64..65536 小值域会优先走 sample-gated 并行 dense-range count/fill，浮点低基数会先尝试 compact prefix direct-map 以避免逐元素 hash probe；通用大输入走并行 sample sort（并行分类、散射和桶递归）；其它中等输入保留任务并行分治，
 归并阶段优先使用 scratch-buffered 并行分块归并，分配失败或不适用时回退到 `std::inplace_merge`。默认 `Auto`。
 
 ---

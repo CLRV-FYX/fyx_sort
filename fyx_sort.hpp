@@ -5598,7 +5598,8 @@ inline bool try_string_value_count_sort(T* p, std::size_t n, Comp comp, bool des
         std::size_t out = 0;
         for (const std::string& s : distinct) {
             const std::size_t c = counts.find(s)->second;
-            for (std::size_t j = 0; j < c; ++j) p[out++] = s;
+            std::fill_n(p + out, c, s);
+            out += c;
         }
         (void)descending;
         return true;
@@ -7756,6 +7757,109 @@ inline bool try_integer_sparse_count_sort_parallel(T* p, std::size_t n, bool des
     }
 }
 
+template <class T>
+inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool descending) {
+    if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        if (n < kParallelThreshold || !parallel_available()) return false;
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        constexpr std::size_t MaxParallelRange = 65536;
+
+        const std::size_t sample_n = std::min<std::size_t>(n, kProfileSampleLimit);
+        Key smn = RT::encode(p[0]);
+        Key smx = smn;
+        for (std::size_t j = 1; j < sample_n; ++j) {
+            const std::size_t idx = (j * n) / sample_n;
+            const Key k = RT::encode(p[idx]);
+            if (k < smn) smn = k;
+            if (smx < k) smx = k;
+        }
+        const Key sample_span = static_cast<Key>(smx - smn);
+        if (sample_span == std::numeric_limits<Key>::max()) return false;
+        const unsigned long long sample_range64 = static_cast<unsigned long long>(sample_span) + 1ull;
+        if (sample_range64 < 64ull ||
+            sample_range64 > static_cast<unsigned long long>(MaxParallelRange)) return false;
+
+        const std::size_t chunks = adaptive_parallel_chunks(n);
+        if ((n + chunks - 1) / chunks >
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
+
+        std::vector<Key> local_min(chunks), local_max(chunks);
+        auto minmax_job = [&](std::size_t c_lo, std::size_t c_hi) {
+            for (std::size_t c = c_lo; c < c_hi; ++c) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                Key mn = RT::encode(p[lo]);
+                Key mx = mn;
+                for (std::size_t i = lo + 1; i < hi; ++i) {
+                    const Key k = RT::encode(p[i]);
+                    if (k < mn) mn = k;
+                    if (mx < k) mx = k;
+                }
+                local_min[c] = mn;
+                local_max[c] = mx;
+            }
+        };
+        parallel_for_index(std::size_t(0), chunks, std::size_t(1), minmax_job);
+
+        Key mn = local_min[0];
+        Key mx = local_max[0];
+        for (std::size_t c = 1; c < chunks; ++c) {
+            if (local_min[c] < mn) mn = local_min[c];
+            if (mx < local_max[c]) mx = local_max[c];
+        }
+        const Key span = static_cast<Key>(mx - mn);
+        if (span == std::numeric_limits<Key>::max()) return false;
+        const unsigned long long range64 = static_cast<unsigned long long>(span) + 1ull;
+        if (range64 == 0 || range64 > static_cast<unsigned long long>(MaxParallelRange)) return false;
+        const std::size_t range = static_cast<std::size_t>(range64);
+
+        std::vector<std::uint32_t> local(chunks * range, 0);
+        auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+            for (std::size_t c = c_lo; c < c_hi; ++c) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                std::uint32_t* lc = local.data() + c * range;
+                for (std::size_t i = lo; i < hi; ++i)
+                    ++lc[static_cast<std::size_t>(RT::encode(p[i]) - mn)];
+            }
+        };
+        parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+
+        std::vector<std::size_t> offset(range + 1, 0);
+        if (!descending) {
+            for (std::size_t r = 0; r < range; ++r) {
+                std::size_t total = 0;
+                for (std::size_t c = 0; c < chunks; ++c)
+                    total += local[c * range + r];
+                offset[r + 1] = offset[r] + total;
+            }
+        } else {
+            std::size_t sum = 0;
+            for (std::size_t rr = range; rr-- > 0;) {
+                std::size_t total = 0;
+                for (std::size_t c = 0; c < chunks; ++c)
+                    total += local[c * range + rr];
+                offset[range - rr] = sum + total;
+                sum += total;
+            }
+        }
+
+        auto fill_job = [&](std::size_t lo, std::size_t hi) {
+            for (std::size_t out_rank = lo; out_rank < hi; ++out_rank) {
+                const std::size_t src_rank = descending ? (range - 1 - out_rank) : out_rank;
+                const T v = RT::decode(static_cast<Key>(mn + static_cast<Key>(src_rank)));
+                std::fill(p + offset[out_rank], p + offset[out_rank + 1], v);
+            }
+        };
+        parallel_for_index(std::size_t(0), range, std::size_t(64), fill_job);
+        return true;
+    }
+}
+
 template <class Field, class T, class Comp>
 inline bool try_trivial_field_count_sort_parallel(T* p, std::size_t n, Comp comp,
                                                   std::size_t offset_bytes) {
@@ -8027,6 +8131,43 @@ inline int probe_guarded_radix_order(T* p, std::size_t n, Comp comp) {
 }
 
 template <class T, class Comp>
+inline bool try_guarded_string_value_count_sort(T* p, std::size_t n, Comp comp) {
+    if constexpr (!std::is_same<T, std::string>::value ||
+                  is_ascending_v<Comp, T> || is_descending_v<Comp, T>) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        if (n < kCountingMinN) return false;
+        const int dir = probe_guarded_default_order(p, n, comp, std::less<std::string>{});
+        if (dir == 0) return false;
+
+        std::unordered_map<std::string, std::size_t> counts;
+        counts.reserve(kCountingClassLimit * 2);
+        std::vector<std::string> distinct;
+        distinct.reserve(kCountingClassLimit);
+        for (std::size_t i = 0; i < n; ++i) {
+            auto it = counts.find(p[i]);
+            if (it == counts.end()) {
+                if (distinct.size() >= kCountingClassLimit) return false;
+                distinct.push_back(p[i]);
+                counts.emplace(distinct.back(), std::size_t(1));
+            } else {
+                ++it->second;
+            }
+        }
+        if (distinct.size() <= 1) return true;
+        std::sort(distinct.begin(), distinct.end(), comp);
+        std::size_t out = 0;
+        for (const std::string& s : distinct) {
+            const std::size_t c = counts.find(s)->second;
+            std::fill_n(p + out, c, s);
+            out += c;
+        }
+        return std::is_sorted(p, p + n, comp);
+    }
+}
+
+template <class T, class Comp>
 inline bool try_guarded_string_order_sort(T* p, std::size_t n, Comp comp,
                                           bool prefer_parallel) {
     if constexpr (!std::is_same<T, std::string>::value ||
@@ -8064,7 +8205,8 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
         if (!high_entropy) {
 #if FYX_ENABLE_PARALLEL
             if (prefer_parallel) {
-                done = try_integer_sparse_count_sort_parallel(p, n, descending) ||
+                done = try_integer_range_count_sort_parallel(p, n, descending) ||
+                       try_integer_sparse_count_sort_parallel(p, n, descending) ||
                        try_radix_key_dense_prefix_count_sort_parallel(p, n, descending) ||
                        try_radix_key_sparse_count_sort_parallel(p, n, descending);
             }
@@ -8077,6 +8219,8 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
         }
 
 #if FYX_ENABLE_PARALLEL
+        if (!done && prefer_parallel && high_entropy)
+            done = try_parallel_radix_high_prefix_sort(p, n, descending);
         if (!done && prefer_parallel)
             done = try_parallel_radix_sort(p, n, descending, high_entropy);
 #else
@@ -8164,6 +8308,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
         if (try_guarded_radix_order_sort(p, n, comp, false, high_entropy)) { record_dispatch(DispatchDecision::Radix); return; }
         if (!high_entropy) {
             if (try_string_value_count_sort(p, n, comp, false)) { record_dispatch(DispatchDecision::LowCardinality); return; }
+            if (try_guarded_string_value_count_sort(p, n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
             if (try_trivial_prefix_key_count_sort(p, n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
             if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         }
@@ -8592,18 +8737,18 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 const bool low_card_hint = prof &&
                     (prof->is_low_cardinality_candidate || prof->is_low_cardinality);
                 if (low_card_hint) {
-                    // Sparse random low-cardinality data often has a huge min/max
-                    // span; trying dense range counting first costs a full extra
-                    // scan before the sparse path wins.  The profile hint is only
-                    // a hint: the sparse implementations still validate <=256 distinct keys before committing;
-                    // float32 sparse counting is capped lower because 256-way
-                    // low-cardinality floats are faster through parallel radix.
+                    // The profile hint is only a hint: each counting path still
+                    // validates the full range before committing.  Dense integer
+                    // range counting is sample-gated so sparse huge-span data can
+                    // decline before paying a full min/max scan.
+                    if (detail::try_integer_range_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_dense_prefix_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 } else {
+                    if (detail::try_integer_range_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_dense_prefix_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
@@ -8620,6 +8765,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
             if (detail::try_guarded_radix_order_sort(p, n, comp, want_parallel, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (!high_entropy) {
                 if (detail::try_string_value_count_sort(p, n, comp, false)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                if (detail::try_guarded_string_value_count_sort(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_trivial_prefix_key_count_sort_parallel(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_trivial_prefix_key_count_sort(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }

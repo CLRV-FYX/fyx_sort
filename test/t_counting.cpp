@@ -227,6 +227,15 @@ int main() {
               "parallel float low-cardinality uses dense-prefix count");
         CHECK(std::is_sorted(v.begin(), v.end()), "parallel float low-cardinality output");
     }
+#if FYX_ENABLE_PARALLEL
+    {
+        std::vector<std::int32_t> v((std::size_t(1) << 20) + 17);
+        for (auto& x : v) x = static_cast<std::int32_t>(rng() % 256) - 128;
+        const bool ok_path = fyx::detail::try_integer_range_count_sort_parallel(v.data(), v.size(), false);
+        CHECK(ok_path, "parallel int32 dense-range count path accepted 256-way lowcard");
+        CHECK(std::is_sorted(v.begin(), v.end()), "parallel int32 dense-range count output");
+    }
+#endif
     {
         namespace fd = fyx::detail;
         std::vector<std::int32_t> keys = {
