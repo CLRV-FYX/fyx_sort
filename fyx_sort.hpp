@@ -6041,6 +6041,73 @@ inline void radix_scatter_value_pass(const T* FYX_RESTRICT src, std::size_t n,
     }
 }
 
+template <class T>
+inline void radix_scatter_decode_pass(const typename RadixTraits<T>::Key* FYX_RESTRICT src,
+                                      std::size_t n,
+                                      T* FYX_RESTRICT dst, unsigned shift,
+                                      std::size_t* FYX_RESTRICT offset,
+                                      RadixScatterScratch<T>& sc,
+                                      bool can_stream) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr std::size_t kPerLine = WcbTraits<T>::kPerLine;
+
+    T* FYX_RESTRICT line = sc.line;
+    T* FYX_RESTRICT head = sc.head;
+
+    for (unsigned b = 0; b < kRadixBuckets; ++b) {
+        sc.fill[b] = 0;
+        sc.hn[b]   = 0;
+        sc.base[b] = offset[b];
+        if (can_stream) {
+            const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(dst + offset[b]);
+            const std::size_t misalign = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+            sc.need[b] = static_cast<std::uint32_t>(misalign / sizeof(T));
+        } else {
+            sc.need[b] = 0;
+        }
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        prefetch_stream(src, i, n);
+        const Key k = src[i];
+        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+        const T v = RT::decode(k);
+
+        if (FYX_UNLIKELY(sc.hn[b] < sc.need[b])) {
+            head[static_cast<std::size_t>(b) * kPerLine + sc.hn[b]] = v;
+            ++sc.hn[b];
+            continue;
+        }
+
+        T* L = line + static_cast<std::size_t>(b) * kPerLine;
+        const std::uint32_t f = sc.fill[b];
+        L[f] = v;
+
+        if (FYX_UNLIKELY(f + 1 == kPerLine)) {
+            T* out = dst + offset[b] + sc.need[b];
+            if (can_stream) stream_cache_line(out, L);
+            else std::memcpy(out, L, kCacheLine);
+            offset[b] += kPerLine;
+            sc.fill[b] = 0;
+        } else {
+            sc.fill[b] = f + 1;
+        }
+    }
+
+    for (unsigned b = 0; b < kRadixBuckets; ++b) {
+        if (sc.hn[b])
+            std::memcpy(dst + sc.base[b],
+                        head + static_cast<std::size_t>(b) * kPerLine,
+                        static_cast<std::size_t>(sc.hn[b]) * sizeof(T));
+        if (sc.fill[b])
+            std::memcpy(dst + offset[b] + sc.need[b],
+                        line + static_cast<std::size_t>(b) * kPerLine,
+                        static_cast<std::size_t>(sc.fill[b]) * sizeof(T));
+        offset[b] += sc.fill[b] + sc.hn[b];
+    }
+}
+
 template <class Key>
 inline void radix_count_key_pass_banked(const Key* FYX_RESTRICT src,
                                         std::size_t n, unsigned shift,
@@ -6344,6 +6411,39 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
                         run += (pi == 0) ? static_cast<std::size_t>(local[c].count[pass][d])
                                          : pass_local[c][d];
                     }
+                }
+
+                if (pi + 1 == plan.count) {
+                    auto scatter_decode_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        constexpr std::size_t kPerLine = WcbTraits<T>::kPerLine;
+                        ScratchLease<T> wcb_lease(2 * kRadixBuckets * kPerLine + kPerLine);
+                        RadixScatterScratch<T> sc;
+                        bool local_stream = false;
+                        if (wcb_lease.valid()) {
+                            const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(wcb_lease.get());
+                            const std::uintptr_t mis = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+                            sc.line = reinterpret_cast<T*>(addr + mis);
+                            sc.head = sc.line + kRadixBuckets * kPerLine;
+                            local_stream = can_stream;
+                        }
+                        for (std::size_t c = c_lo; c < c_hi; ++c) {
+                            const std::size_t lo = (c * n) / chunks;
+                            const std::size_t hi = ((c + 1) * n) / chunks;
+                            auto pos = base[c];
+                            if (wcb_lease.valid()) {
+                                radix_scatter_decode_pass<T>(src + lo, hi - lo, p, shift, pos.data(), sc, local_stream);
+                            } else {
+                                for (std::size_t i = lo; i < hi; ++i) {
+                                    const Key k = src[i];
+                                    const unsigned d = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+                                    p[pos[d]++] = RT::decode(k);
+                                }
+                            }
+                        }
+                    };
+                    parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_decode_job);
+                    if (descending) std::reverse(p, p + n);
+                    return true;
                 }
 
                 auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
