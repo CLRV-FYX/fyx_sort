@@ -230,13 +230,21 @@ inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending) {
 
 template <class Key>
 FYX_FORCE_INLINE std::size_t low_card_hash_key(Key k) noexcept {
-    std::uint64_t x = static_cast<std::uint64_t>(k);
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return static_cast<std::size_t>(x);
+    // Low-cardinality tables never hold more than 256 keys in 512/1024 slots;
+    // a full Murmur finalizer was measurable overhead on float/double lowcard
+    // inputs.  Fibonacci-style mixing is enough for these tiny open-addressed
+    // tables and costs one multiply instead of two expensive 64-bit finalizer
+    // rounds.
+    if constexpr (sizeof(Key) <= 4) {
+        const std::uint32_t x = static_cast<std::uint32_t>(k);
+        return static_cast<std::size_t>(x * 2654435761u);
+    } else {
+        std::uint64_t x = static_cast<std::uint64_t>(k);
+        x ^= x >> 32;
+        x *= 0x9E3779B97F4A7C15ULL;
+        x ^= x >> 32;
+        return static_cast<std::size_t>(x);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,10 +1217,76 @@ inline bool try_string_msd_sort(T* p, std::size_t n, Comp comp, bool descending)
 inline std::size_t adaptive_parallel_chunks(std::size_t n) {
     ThreadPool& pool = global_pool();
     std::size_t chunks = (n + kParallelThreshold - 1) / kParallelThreshold;
-    const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * 4);
+    const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * 8);
     if (chunks < 2) chunks = 2;
     if (chunks > max_chunks) chunks = max_chunks;
     return chunks;
+}
+
+template <class T>
+inline void radix_scatter_value_pass(const T* FYX_RESTRICT src, std::size_t n,
+                                     T* FYX_RESTRICT dst, unsigned shift,
+                                     std::size_t* FYX_RESTRICT offset,
+                                     RadixScatterScratch<T>& sc,
+                                     bool can_stream) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr std::size_t kPerLine = WcbTraits<T>::kPerLine;
+
+    T* FYX_RESTRICT line = sc.line;
+    T* FYX_RESTRICT head = sc.head;
+
+    for (unsigned b = 0; b < kRadixBuckets; ++b) {
+        sc.fill[b] = 0;
+        sc.hn[b]   = 0;
+        sc.base[b] = offset[b];
+        if (can_stream) {
+            const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(dst + offset[b]);
+            const std::size_t misalign = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+            sc.need[b] = static_cast<std::uint32_t>(misalign / sizeof(T));
+        } else {
+            sc.need[b] = 0;
+        }
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        prefetch_stream(src, i, n);
+        const T v = src[i];
+        const Key k = RT::encode(v);
+        const unsigned b = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+
+        if (FYX_UNLIKELY(sc.hn[b] < sc.need[b])) {
+            head[static_cast<std::size_t>(b) * kPerLine + sc.hn[b]] = v;
+            ++sc.hn[b];
+            continue;
+        }
+
+        T* L = line + static_cast<std::size_t>(b) * kPerLine;
+        const std::uint32_t f = sc.fill[b];
+        L[f] = v;
+
+        if (FYX_UNLIKELY(f + 1 == kPerLine)) {
+            T* out = dst + offset[b] + sc.need[b];
+            if (can_stream) stream_cache_line(out, L);
+            else std::memcpy(out, L, kCacheLine);
+            offset[b] += kPerLine;
+            sc.fill[b] = 0;
+        } else {
+            sc.fill[b] = f + 1;
+        }
+    }
+
+    for (unsigned b = 0; b < kRadixBuckets; ++b) {
+        if (sc.hn[b])
+            std::memcpy(dst + sc.base[b],
+                        head + static_cast<std::size_t>(b) * kPerLine,
+                        static_cast<std::size_t>(sc.hn[b]) * sizeof(T));
+        if (sc.fill[b])
+            std::memcpy(dst + offset[b] + sc.need[b],
+                        line + static_cast<std::size_t>(b) * kPerLine,
+                        static_cast<std::size_t>(sc.fill[b]) * sizeof(T));
+        offset[b] += sc.fill[b] + sc.hn[b];
+    }
 }
 
 template <class T>
@@ -1224,15 +1298,116 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending) {
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
         constexpr unsigned Passes = RT::passes;
-        // The chunked parallel radix path is intended for the remaining large
-        // 64-bit high-entropy cases.  32-bit keys are already faster through the
-        // existing split/merge path on the tested 2-4 core machines, while this
-        // path removes compare-merge overhead from 64-bit random data.
-        if constexpr (sizeof(Key) < 8) {
-            (void)p; (void)n; (void)descending;
-            return false;
-        } else {
+        // Chunked parallel radix removes the old sort-halves-and-compare-merge
+        // fallback for large high-entropy numeric inputs.
+        {
             if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+
+            if constexpr ((std::is_integral<T>::value && !std::is_same<T, bool>::value) ||
+                          std::is_same<T, float>::value) {
+                ScratchLease<T> tmp_lease(n);
+                if (!tmp_lease.valid()) return false;
+                T* tmp = tmp_lease.get();
+
+                const std::size_t chunks = adaptive_parallel_chunks(n);
+                std::vector<RadixHistogram<Passes>> local(chunks);
+                for (std::size_t c = 0; c < chunks; ++c) local[c].clear();
+                auto hist_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                    for (std::size_t c = c_lo; c < c_hi; ++c) {
+                        const std::size_t lo = (c * n) / chunks;
+                        const std::size_t hi = ((c + 1) * n) / chunks;
+                        auto& h = local[c];
+                        for (std::size_t i = lo; i < hi; ++i) {
+                            const Key k = RT::encode(p[i]);
+                            for (unsigned pass = 0; pass < Passes; ++pass)
+                                ++h.count[pass][radix_digit(k, pass)];
+                        }
+                    }
+                };
+                parallel_for_index(std::size_t(0), chunks, std::size_t(1), hist_job);
+
+                RadixHistogram<Passes> hist;
+                hist.clear();
+                for (std::size_t c = 0; c < chunks; ++c) {
+                    for (unsigned pass = 0; pass < Passes; ++pass)
+                        for (unsigned d = 0; d < kRadixBuckets; ++d)
+                            hist.count[pass][d] += local[c].count[pass][d];
+                }
+                const RadixPlan<Passes> plan = plan_radix<Passes>(hist, n);
+                if (plan.count == 0) { if (descending) std::reverse(p, p + n); return true; }
+
+                T* src = p;
+                T* dst = tmp;
+                std::vector<std::array<std::size_t, kRadixBuckets>> base(chunks);
+                std::vector<std::array<std::size_t, kRadixBuckets>> pass_local(chunks);
+                const bool can_stream = have_nt_stores();
+
+                for (unsigned pi = 0; pi < plan.count; ++pi) {
+                    const unsigned pass = plan.active[pi];
+                    const unsigned shift = pass * kRadixBits;
+                    if (pi != 0) {
+                        auto pass_count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                            for (std::size_t c = c_lo; c < c_hi; ++c) {
+                                auto& pc = pass_local[c];
+                                pc.fill(0);
+                                const std::size_t lo = (c * n) / chunks;
+                                const std::size_t hi = ((c + 1) * n) / chunks;
+                                for (std::size_t i = lo; i < hi; ++i) {
+                                    const Key k = RT::encode(src[i]);
+                                    ++pc[static_cast<unsigned>((k >> shift) & Key(kRadixMask))];
+                                }
+                            }
+                        };
+                        parallel_for_index(std::size_t(0), chunks, std::size_t(1), pass_count_job);
+                    }
+                    std::size_t run = 0;
+                    for (unsigned d = 0; d < kRadixBuckets; ++d) {
+                        for (std::size_t c = 0; c < chunks; ++c) {
+                            base[c][d] = run;
+                            run += (pi == 0) ? static_cast<std::size_t>(local[c].count[pass][d])
+                                             : pass_local[c][d];
+                        }
+                    }
+                    auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        constexpr std::size_t kPerLine = WcbTraits<T>::kPerLine;
+                        ScratchLease<T> wcb_lease(2 * kRadixBuckets * kPerLine + kPerLine);
+                        RadixScatterScratch<T> sc;
+                        bool local_stream = false;
+                        if (wcb_lease.valid()) {
+                            const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(wcb_lease.get());
+                            const std::uintptr_t mis = (kCacheLine - (addr & (kCacheLine - 1))) & (kCacheLine - 1);
+                            sc.line = reinterpret_cast<T*>(addr + mis);
+                            sc.head = sc.line + kRadixBuckets * kPerLine;
+                            local_stream = can_stream;
+                        }
+                        for (std::size_t c = c_lo; c < c_hi; ++c) {
+                            const std::size_t lo = (c * n) / chunks;
+                            const std::size_t hi = ((c + 1) * n) / chunks;
+                            auto pos = base[c];
+                            if (wcb_lease.valid()) {
+                                radix_scatter_value_pass<T>(src + lo, hi - lo, dst, shift, pos.data(), sc, local_stream);
+                            } else {
+                                for (std::size_t i = lo; i < hi; ++i) {
+                                    const T v = src[i];
+                                    const Key k = RT::encode(v);
+                                    const unsigned d = static_cast<unsigned>((k >> shift) & Key(kRadixMask));
+                                    dst[pos[d]++] = v;
+                                }
+                            }
+                        }
+                    };
+                    parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
+                    T* t = src; src = dst; dst = t;
+                }
+                if (src != p) {
+                    auto copy_job = [&](std::size_t lo, std::size_t hi) {
+                        for (std::size_t i = lo; i < hi; ++i) p[i] = src[i];
+                    };
+                    parallel_for_index(std::size_t(0), n, kParallelThreshold, copy_job);
+                }
+                if (descending) std::reverse(p, p + n);
+                return true;
+            }
 
             ScratchLease<Key> lease(n * 2);
             if (!lease.valid()) return false;
@@ -1283,23 +1458,26 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending) {
                 const unsigned pass = plan.active[pi];
                 const unsigned shift = pass * kRadixBits;
 
-                auto pass_count_job = [&](std::size_t c_lo, std::size_t c_hi) {
-                    for (std::size_t c = c_lo; c < c_hi; ++c) {
-                        auto& pc = pass_local[c];
-                        pc.fill(0);
-                        const std::size_t lo = (c * n) / chunks;
-                        const std::size_t hi = ((c + 1) * n) / chunks;
-                        for (std::size_t i = lo; i < hi; ++i)
-                            ++pc[static_cast<unsigned>((src[i] >> shift) & Key(kRadixMask))];
-                    }
-                };
-                parallel_for_index(std::size_t(0), chunks, std::size_t(1), pass_count_job);
+                if (pi != 0) {
+                    auto pass_count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        for (std::size_t c = c_lo; c < c_hi; ++c) {
+                            auto& pc = pass_local[c];
+                            pc.fill(0);
+                            const std::size_t lo = (c * n) / chunks;
+                            const std::size_t hi = ((c + 1) * n) / chunks;
+                            for (std::size_t i = lo; i < hi; ++i)
+                                ++pc[static_cast<unsigned>((src[i] >> shift) & Key(kRadixMask))];
+                        }
+                    };
+                    parallel_for_index(std::size_t(0), chunks, std::size_t(1), pass_count_job);
+                }
 
                 std::size_t run = 0;
                 for (unsigned d = 0; d < kRadixBuckets; ++d) {
                     for (std::size_t c = 0; c < chunks; ++c) {
                         base[c][d] = run;
-                        run += pass_local[c][d];
+                        run += (pi == 0) ? static_cast<std::size_t>(local[c].count[pass][d])
+                                         : pass_local[c][d];
                     }
                 }
 
@@ -1341,6 +1519,154 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending) {
             if (descending) std::reverse(p, p + n);
             return true;
         }
+    }
+}
+
+template <class T>
+inline bool radix_key_sparse_probe_ok(T* p, std::size_t n) {
+    if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
+        (void)p; (void)n;
+        return false;
+    } else {
+        using RT = RadixTraits<T>;
+        using Key = typename RT::Key;
+        constexpr std::size_t Cap = 512;
+        constexpr std::size_t Mask = Cap - 1;
+        std::array<Key, Cap> keys{};
+        std::array<unsigned char, Cap> used{};
+        std::size_t distinct = 0;
+        const std::size_t s = std::min<std::size_t>(n, kCountingProbeLimit);
+        for (std::size_t j = 0; j < s; ++j) {
+            const std::size_t idx = (j * n) / s;
+            const Key k = RT::encode(p[idx]);
+            std::size_t h = low_card_hash_key(k) & Mask;
+            for (;;) {
+                if (!used[h]) {
+                    if (distinct++ >= kCountingClassLimit) return false;
+                    used[h] = 1;
+                    keys[h] = k;
+                    break;
+                }
+                if (keys[h] == k) break;
+                h = (h + 1) & Mask;
+            }
+        }
+        return true;
+    }
+}
+
+template <class T>
+inline bool try_radix_key_sparse_count_sort_parallel(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        if (n < kParallelThreshold || !parallel_available()) return false;
+        if (!radix_key_sparse_probe_ok(p, n)) return false;
+
+        using RT = RadixTraits<T>;
+        using Key = typename RT::Key;
+        constexpr std::size_t Cap = 1024;
+        constexpr std::size_t Mask = Cap - 1;
+
+        const std::size_t chunks = adaptive_parallel_chunks(n);
+        std::vector<std::array<Key, Cap>> local_keys(chunks);
+        std::vector<std::array<std::size_t, Cap>> local_counts(chunks);
+        std::vector<std::array<unsigned char, Cap>> local_used(chunks);
+        std::vector<std::vector<Key>> local_distinct(chunks);
+        std::vector<unsigned char> overflow(chunks, 0);
+        for (std::size_t c = 0; c < chunks; ++c) {
+            local_used[c].fill(0);
+            local_counts[c].fill(0);
+            local_distinct[c].reserve(kCountingClassLimit);
+        }
+
+        auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+            for (std::size_t c = c_lo; c < c_hi; ++c) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                auto& keys = local_keys[c];
+                auto& counts = local_counts[c];
+                auto& used = local_used[c];
+                auto& distinct = local_distinct[c];
+                for (std::size_t i = lo; i < hi; ++i) {
+                    const Key k = RT::encode(p[i]);
+                    std::size_t h = low_card_hash_key(k) & Mask;
+                    for (;;) {
+                        if (!used[h]) {
+                            if (distinct.size() >= kCountingClassLimit) { overflow[c] = 1; goto done_chunk; }
+                            used[h] = 1;
+                            keys[h] = k;
+                            counts[h] = 1;
+                            distinct.push_back(k);
+                            break;
+                        }
+                        if (keys[h] == k) { ++counts[h]; break; }
+                        h = (h + 1) & Mask;
+                    }
+                }
+            done_chunk: ;
+            }
+        };
+        parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+        for (unsigned char v : overflow) if (v) return false;
+
+        std::array<Key, Cap> keys{};
+        std::array<std::size_t, Cap> counts{};
+        std::array<unsigned char, Cap> used{};
+        std::vector<Key> distinct;
+        distinct.reserve(kCountingClassLimit);
+        auto global_add = [&](Key k, std::size_t add) -> bool {
+            std::size_t h = low_card_hash_key(k) & Mask;
+            for (;;) {
+                if (!used[h]) {
+                    if (distinct.size() >= kCountingClassLimit) return false;
+                    used[h] = 1; keys[h] = k; counts[h] = add; distinct.push_back(k); return true;
+                }
+                if (keys[h] == k) { counts[h] += add; return true; }
+                h = (h + 1) & Mask;
+            }
+        };
+        auto local_lookup = [&](std::size_t c, Key k) noexcept -> std::size_t {
+            std::size_t h = low_card_hash_key(k) & Mask;
+            while (local_used[c][h]) {
+                if (local_keys[c][h] == k) return local_counts[c][h];
+                h = (h + 1) & Mask;
+            }
+            return 0;
+        };
+        for (std::size_t c = 0; c < chunks; ++c) {
+            for (Key k : local_distinct[c])
+                if (!global_add(k, local_lookup(c, k))) return false;
+        }
+        if (distinct.size() <= 1) return true;
+        std::sort(distinct.begin(), distinct.end());
+
+        auto global_lookup = [&](Key k) noexcept -> std::size_t {
+            std::size_t h = low_card_hash_key(k) & Mask;
+            while (used[h]) {
+                if (keys[h] == k) return counts[h];
+                h = (h + 1) & Mask;
+            }
+            return 0;
+        };
+        const std::size_t d = distinct.size();
+        std::vector<Key> order(d);
+        std::vector<std::size_t> offset(d + 1, 0);
+        for (std::size_t r = 0; r < d; ++r) {
+            const std::size_t src = descending ? (d - 1 - r) : r;
+            order[r] = distinct[src];
+            offset[r + 1] = offset[r] + global_lookup(order[r]);
+        }
+
+        auto fill_job = [&](std::size_t lo, std::size_t hi) {
+            for (std::size_t r = lo; r < hi; ++r) {
+                const T v = RT::decode(order[r]);
+                std::fill(p + offset[r], p + offset[r + 1], v);
+            }
+        };
+        parallel_for_index(std::size_t(0), d, std::size_t(8), fill_job);
+        return true;
     }
 }
 
@@ -2010,6 +2336,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
             if (!high_entropy) {
                 if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                if (detail::try_radix_key_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }

@@ -200,6 +200,18 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        std::vector<std::int32_t> v((std::size_t(1) << 20) + 17);
+        for (auto& x : v) x = static_cast<std::int32_t>(rng());
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::On;
+        fyx::sort(v.begin(), v.end(), o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
+              "parallel int32 high-entropy uses chunked radix dispatch");
+        CHECK(std::is_sorted(v.begin(), v.end()), "parallel int32 high-entropy output");
+    }
+    {
+        namespace fd = fyx::detail;
         std::vector<std::uint64_t> v((std::size_t(1) << 20) + 17);
         for (auto& x : v) x = rng();
         fd::test_reset_dispatch();
@@ -209,6 +221,21 @@ int main() {
         CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
               "parallel uint64 high-entropy uses chunked radix dispatch");
         CHECK(std::is_sorted(v.begin(), v.end()), "parallel uint64 high-entropy output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<float> keys(16);
+        for (std::size_t i = 0; i < keys.size(); ++i)
+            keys[i] = static_cast<float>(static_cast<int>(i) - 8) * 0.5f;
+        std::vector<float> v((std::size_t(1) << 20) + 17);
+        for (auto& x : v) x = keys[rng() % keys.size()];
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::On;
+        fyx::sort(v.begin(), v.end(), o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::LowCardinality,
+              "parallel float low-cardinality uses radix-key sparse count");
+        CHECK(std::is_sorted(v.begin(), v.end()), "parallel float low-cardinality output");
     }
     {
         namespace fd = fyx::detail;
