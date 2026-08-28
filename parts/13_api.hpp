@@ -177,6 +177,389 @@ inline bool try_radix_monotonic_sort(T* p, std::size_t n,
     }
 }
 
+
+template <class T, class = void>
+struct has_equal_operator : std::false_type {};
+template <class T>
+struct has_equal_operator<T, std::void_t<decltype(std::declval<const T&>() == std::declval<const T&>())>>
+    : std::true_type {};
+
+enum class FastOrderKind : unsigned char {
+    None,
+    Sorted,
+    Reverse,
+    AllEqual
+};
+
+template <class T>
+FYX_FORCE_INLINE bool fast_string_equal_value(const T* p, std::size_t n) {
+    (void)p; (void)n;
+    return false;
+}
+
+template <>
+FYX_FORCE_INLINE bool fast_string_equal_value<std::string>(const std::string* p, std::size_t n) {
+#if FYX_USE_STRING_VIEW
+    if (n < 2) return true;
+    const std::string& first = p[0];
+    const char* first_data = first.data();
+    const std::size_t first_size = first.size();
+    for (std::size_t i = 1; i < n; ++i) {
+        const std::string& cur = p[i];
+        if (cur.size() != first_size) return false;
+        if (first_size != 0 && std::char_traits<char>::compare(cur.data(), first_data, first_size) != 0)
+            return false;
+    }
+    return true;
+#else
+    (void)p; (void)n;
+    return false;
+#endif
+}
+
+template <class T, class Comp>
+inline FastOrderKind detect_fast_order_kind(T* p, std::size_t n, Comp comp) {
+    if (n < 2) return FastOrderKind::AllEqual;
+#if !FYX_ENABLE_FAST_PATHS
+    (void)p; (void)comp;
+    return FastOrderKind::None;
+#else
+    if constexpr (std::is_arithmetic<T>::value && !std::is_same<T, bool>::value &&
+                  std::is_trivially_copyable<T>::value) {
+        if (std::memcmp(p, p + 1, (n - 1) * sizeof(T)) == 0)
+            return FastOrderKind::AllEqual;
+    }
+    constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    if constexpr (radix_order) {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        const bool descending = is_descending_v<Comp, T>;
+        Key prev = RT::encode(p[0]);
+        for (std::size_t i = 1; i < n; ++i) {
+            Key cur = RT::encode(p[i]);
+            if (cur == prev) continue;
+
+            const bool already_in_target_order = descending ? (cur < prev) : (prev < cur);
+            prev = cur;
+            if (already_in_target_order) {
+                for (++i; i < n; ++i) {
+                    cur = RT::encode(p[i]);
+                    if (descending ? (prev < cur) : (cur < prev)) return FastOrderKind::None;
+                    prev = cur;
+                }
+                return FastOrderKind::Sorted;
+            }
+
+            for (++i; i < n; ++i) {
+                cur = RT::encode(p[i]);
+                if (descending ? (cur < prev) : (prev < cur)) return FastOrderKind::None;
+                prev = cur;
+            }
+            return FastOrderKind::Reverse;
+        }
+        return FastOrderKind::AllEqual;
+    } else {
+        // Exact-value equality is the cheapest all-equal proof for strings and
+        // trivial payloads.  It is also safe for custom comparators because a
+        // strict weak ordering cannot order an object before itself.
+        if constexpr (std::is_same<T, std::string>::value) {
+            if (fast_string_equal_value(p, n)) return FastOrderKind::AllEqual;
+        } else if constexpr (has_equal_operator<T>::value) {
+            const T& first = p[0];
+            std::size_t i = 1;
+            for (; i < n; ++i) {
+                if (!(p[i] == first)) break;
+            }
+            if (i == n) return FastOrderKind::AllEqual;
+        }
+
+        for (std::size_t i = 1; i < n; ++i) {
+            if (comp(p[i], p[i - 1])) {          // reverse of comp order
+                for (++i; i < n; ++i)
+                    if (comp(p[i - 1], p[i])) return FastOrderKind::None;
+                return FastOrderKind::Reverse;
+            }
+            if (comp(p[i - 1], p[i])) {          // already in comp order
+                for (++i; i < n; ++i)
+                    if (comp(p[i], p[i - 1])) return FastOrderKind::None;
+                return FastOrderKind::Sorted;
+            }
+        }
+        return FastOrderKind::AllEqual;
+    }
+#endif
+}
+
+template <class T, class Comp>
+inline bool pdq_preferred_order_sample(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < std::size_t(1024)) return false;
+    constexpr bool radix_order = radix_supported_v<T> &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    const std::size_t contiguous = std::min<std::size_t>(n, 2048);
+    if (contiguous < 8) return false;
+
+    if constexpr (std::is_arithmetic<T>::value && !std::is_same<T, bool>::value) {
+        constexpr std::size_t Cap = 512;
+        constexpr std::size_t Mask = Cap - 1;
+        std::array<std::uint64_t, Cap> seen{};
+        std::array<unsigned char, Cap> used{};
+        std::size_t distinct = 0;
+        for (std::size_t i = 0; i < contiguous; ++i) {
+            std::uint64_t key = 0;
+            if constexpr (radix_order) {
+                key = static_cast<std::uint64_t>(RadixTraits<T>::encode(p[i]));
+            } else {
+                std::memcpy(&key, &p[i], sizeof(T));
+            }
+            std::uint64_t hbits = key;
+            hbits ^= hbits >> 33;
+            hbits *= 0xff51afd7ed558ccdULL;
+            hbits ^= hbits >> 33;
+            std::size_t h = static_cast<std::size_t>(hbits) & Mask;
+            for (;;) {
+                if (!used[h]) {
+                    used[h] = 1;
+                    seen[h] = key;
+                    if (++distinct > kCountingClassLimit) goto high_distinct_sample;
+                    break;
+                }
+                if (seen[h] == key) break;
+                h = (h + 1) & Mask;
+            }
+        }
+        return false;
+    high_distinct_sample: ;
+    }
+
+    auto before = [&](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            using Key = typename RT::Key;
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            return comp(a, b);
+        }
+    };
+
+    std::size_t inv = 0;
+    std::size_t ordered = 0;
+    std::size_t turns = 0;
+    int prev_dir = 0;
+    for (std::size_t i = 1; i < contiguous; ++i) {
+        const bool down = before(p[i], p[i - 1]);
+        const bool up = before(p[i - 1], p[i]);
+        if (down) ++inv;
+        if (up || down) ++ordered;
+        const int dir = up ? 1 : (down ? -1 : 0);
+        if (dir != 0) {
+            if (prev_dir != 0 && dir != prev_dir) ++turns;
+            prev_dir = dir;
+        }
+    }
+    if (ordered == 0) return false;
+
+    // Nearly sorted inputs are pdqsort's best case; random inputs have about
+    // 50% local inversions, so this does not steal high-entropy radix/sample
+    // wins.  Zigzag/organ-pipe style inputs flip direction almost every step;
+    // pdqsort handles those structured partitions better than a full radix or
+    // sample-sort permutation at 1M-scale.
+    if (inv * 20 <= ordered) return true; // <= 5% inversions
+    if (turns * 10 >= ordered * 9 && inv * 100 >= ordered * 35 && inv * 100 <= ordered * 65)
+        return true;
+    return false;
+#endif
+}
+
+
+template <class T, class Comp>
+inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < std::size_t(1024)) return false;
+    constexpr bool radix_order = radix_supported_v<T> &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    if constexpr (radix_order && std::is_floating_point<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        const std::size_t max_dirty = std::max<std::size_t>(64, n / 8);
+        std::vector<unsigned char> dirty(n, 0);
+        std::size_t dirty_count = 0;
+        auto mark_dirty = [&](std::size_t idx) {
+            if (!dirty[idx]) {
+                dirty[idx] = 1;
+                ++dirty_count;
+            }
+        };
+        for (std::size_t i = 1; i < n; ++i) {
+            if (comp(p[i], p[i - 1])) {
+                mark_dirty(i - 1);
+                mark_dirty(i);
+                if (dirty_count > max_dirty) return false;
+            }
+        }
+        if (dirty_count == 0) return true;
+
+        const T* last_clean = nullptr;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (dirty[i]) continue;
+            if (last_clean && comp(p[i], *last_clean)) return false;
+            last_clean = p + i;
+        }
+
+        std::vector<T> clean;
+        std::vector<T> patch;
+        clean.reserve(n - dirty_count);
+        patch.reserve(dirty_count);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (dirty[i]) patch.push_back(std::move(p[i]));
+            else          clean.push_back(std::move(p[i]));
+        }
+        std::sort(patch.begin(), patch.end(), comp);
+        std::size_t ci = 0, pi = 0, out = 0;
+        while (ci < clean.size() && pi < patch.size()) {
+            if (comp(patch[pi], clean[ci])) p[out++] = std::move(patch[pi++]);
+            else                           p[out++] = std::move(clean[ci++]);
+        }
+        while (ci < clean.size())  p[out++] = std::move(clean[ci++]);
+        while (pi < patch.size())  p[out++] = std::move(patch[pi++]);
+        return true;
+    }
+#endif
+}
+
+
+template <class T, class Comp>
+inline void pdqsort_for_profile_pattern(T* p, std::size_t n, Comp comp) {
+    constexpr bool radix_order = radix_supported_v<T> &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    if constexpr (radix_order && std::is_floating_point<T>::value) {
+        using RT = RadixTraits<T>;
+        using Key = typename RT::Key;
+        if constexpr (is_descending_v<Comp, T>) {
+            pdqsort(p, p + n, [](const T& a, const T& b) {
+                return RT::encode(b) < RT::encode(a);
+            });
+        } else {
+            pdqsort(p, p + n, [](const T& a, const T& b) {
+                return RT::encode(a) < RT::encode(b);
+            });
+        }
+    } else {
+        pdqsort(p, p + n, comp);
+    }
+}
+
+
+template <class T, class Comp>
+inline bool try_interleaved_runs_sort(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < std::size_t(1024)) return false;
+    constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    auto before = [&](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            using Key = typename RT::Key;
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            return comp(a, b);
+        }
+    };
+    if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        bool even_asc_odd_desc = true;
+        bool even_desc_odd_asc = true;
+        for (std::size_t i = 2; i < n && (even_asc_odd_desc || even_desc_odd_asc); i += 2) {
+            if (before(p[i], p[i - 2])) even_asc_odd_desc = false;
+            if (before(p[i - 2], p[i])) even_desc_odd_asc = false;
+        }
+        for (std::size_t i = 3; i < n && (even_asc_odd_desc || even_desc_odd_asc); i += 2) {
+            if (before(p[i - 2], p[i])) even_asc_odd_desc = false;
+            if (before(p[i], p[i - 2])) even_desc_odd_asc = false;
+        }
+        if (!even_asc_odd_desc && !even_desc_odd_asc) return false;
+
+        std::vector<T> tmp;
+        tmp.reserve(n);
+
+        if (even_asc_odd_desc) {
+            std::size_t e = 0;
+            bool have_even = e < n;
+            std::size_t o = (n < 2) ? 0 : ((n % 2 == 0) ? n - 1 : n - 2);
+            bool have_odd = n >= 2;
+            while (have_even && have_odd) {
+                if (before(p[o], p[e])) {
+                    tmp.push_back(std::move(p[o]));
+                    if (o >= 2) o -= 2; else have_odd = false;
+                } else {
+                    tmp.push_back(std::move(p[e]));
+                    e += 2;
+                    have_even = e < n;
+                }
+            }
+            while (have_even) {
+                tmp.push_back(std::move(p[e]));
+                e += 2;
+                have_even = e < n;
+            }
+            while (have_odd) {
+                tmp.push_back(std::move(p[o]));
+                if (o >= 2) o -= 2; else have_odd = false;
+            }
+        } else {
+            std::size_t e = (n % 2 == 1) ? n - 1 : n - 2;
+            bool have_even = n >= 1;
+            std::size_t o = 1;
+            bool have_odd = o < n;
+            while (have_even && have_odd) {
+                if (before(p[o], p[e])) {
+                    tmp.push_back(std::move(p[o]));
+                    o += 2;
+                    have_odd = o < n;
+                } else {
+                    tmp.push_back(std::move(p[e]));
+                    if (e >= 2) e -= 2; else have_even = false;
+                }
+            }
+            while (have_even) {
+                tmp.push_back(std::move(p[e]));
+                if (e >= 2) e -= 2; else have_even = false;
+            }
+            while (have_odd) {
+                tmp.push_back(std::move(p[o]));
+                o += 2;
+                have_odd = o < n;
+            }
+        }
+
+        for (std::size_t i = 0; i < n; ++i) p[i] = std::move(tmp[i]);
+        return true;
+    }
+#endif
+}
+
 template <class T>
 inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending) {
     if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
@@ -292,6 +675,155 @@ inline void record_dispatch(DispatchDecision d) noexcept { test_dispatch_slot() 
 #else
 inline void record_dispatch(DispatchDecision) noexcept {}
 #endif
+
+
+inline std::size_t configured_min_parallel_size() noexcept;
+
+template <class T>
+inline void reverse_range_adaptive(T* p, std::size_t n) {
+    // `std::reverse` is already a tight bidirectional swap loop for contiguous
+    // ranges.  Earlier task-splitting experiments helped some object-heavy
+    // cases but regressed 4H numeric reverse inputs, so keep the fast-path
+    // detector and the reversal as one predictable serial pass.
+    std::reverse(p, p + n);
+}
+
+template <class T, class Comp>
+inline bool try_fast_order_exit(T* p, std::size_t n, Comp comp, bool allow_reverse) {
+#if !FYX_ENABLE_FAST_PATHS
+    (void)p; (void)n; (void)comp; (void)allow_reverse;
+    return false;
+#else
+    const FastOrderKind k = detect_fast_order_kind(p, n, comp);
+    if (k == FastOrderKind::AllEqual) {
+        record_dispatch(DispatchDecision::ProfileAllEqual);
+        return true;
+    }
+    if (k == FastOrderKind::Sorted) {
+        record_dispatch(DispatchDecision::ProfileSorted);
+        return true;
+    }
+    if (k == FastOrderKind::Reverse && allow_reverse) {
+        reverse_range_adaptive(p, n);
+        record_dispatch(DispatchDecision::ProfileReverse);
+        return true;
+    }
+    return false;
+#endif
+}
+
+
+
+inline std::size_t parse_parallel_size_env(const char* s) noexcept {
+    if (!s || !*s) return 0;
+    std::size_t v = 0;
+    for (; *s; ++s) {
+        if (*s < '0' || *s > '9') return 0;
+        const std::size_t digit = static_cast<std::size_t>(*s - '0');
+        if (v > (std::numeric_limits<std::size_t>::max() - digit) / 10) return 0;
+        v = v * 10 + digit;
+    }
+    return v;
+}
+
+inline std::size_t configured_min_parallel_size() noexcept {
+#if FYX_ENABLE_PARALLEL
+    static const std::size_t env_min = parse_parallel_size_env(std::getenv("FYX_MIN_PARALLEL_SIZE"));
+    // Keep the old kernels available at 1M+ (the public benchmark sizes) but
+    // avoid launching the pool for small Auto-mode calls where a serial path or
+    // a fast monotone exit is cheaper than task scheduling.
+    return env_min != 0 ? env_min : std::size_t(1000000);
+#else
+    return std::numeric_limits<std::size_t>::max();
+#endif
+}
+
+template <class T>
+inline bool dynamic_parallel_allowed(std::size_t n, const Options& o) {
+#if FYX_ENABLE_PARALLEL
+    if (o.parallel == Tri::Off || o.threads == 1) return false;
+    if (!parallel_available()) return false;
+    if (o.parallel != Tri::On && n < configured_min_parallel_size()) return false;
+
+    ThreadPool& pool = global_pool();
+    std::size_t workers = static_cast<std::size_t>(pool.nworkers());
+    if (o.threads != 0) workers = std::min<std::size_t>(workers, o.threads);
+    workers = std::max<std::size_t>(workers, 1);
+    constexpr std::size_t min_bytes_per_worker = 128u * 1024u;
+    const std::size_t bytes_per_elem = std::max<std::size_t>(std::size_t(1), sizeof(T));
+    const std::size_t elems_per_worker = std::max<std::size_t>(1, min_bytes_per_worker / bytes_per_elem);
+    if (o.parallel != Tri::On && n / workers < elems_per_worker) return false;
+    return true;
+#else
+    (void)n; (void)o;
+    return false;
+#endif
+}
+
+
+template <class T, class Comp>
+inline bool try_parallel_all_equal_exit(T* p, std::size_t n, Comp comp) {
+#if !FYX_ENABLE_FAST_PATHS || !FYX_ENABLE_PARALLEL
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if constexpr (std::is_arithmetic<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    }
+    if (n < configured_min_parallel_size() || !parallel_available()) return false;
+    constexpr bool radix_order = radix_supported_v<T> &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+
+    auto equal_first = [&](const T& x) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            return RT::encode(x) == RT::encode(p[0]);
+        } else if constexpr (std::is_same<T, std::string>::value) {
+#if FYX_USE_STRING_VIEW
+            const std::string& first = p[0];
+            return x.size() == first.size() &&
+                (x.size() == 0 || std::char_traits<char>::compare(x.data(), first.data(), x.size()) == 0);
+#else
+            return x == p[0];
+#endif
+        } else if constexpr (has_equal_operator<T>::value) {
+            return x == p[0];
+        } else {
+            return false;
+        }
+    };
+
+    if constexpr (!radix_order && !std::is_same<T, std::string>::value && !has_equal_operator<T>::value) {
+        (void)equal_first;
+        return false;
+    } else {
+        const std::size_t probe = std::min<std::size_t>(n, 64);
+        for (std::size_t j = 1; j < probe; ++j) {
+            const std::size_t idx = (j * (n - 1)) / (probe - 1);
+            if (!equal_first(p[idx])) return false;
+        }
+
+        ThreadPool& pool = global_pool();
+        std::size_t chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * 8);
+        if (chunks > n) chunks = n;
+        std::vector<unsigned char> miss(chunks, 0);
+        auto job = [&](std::size_t c_lo, std::size_t c_hi) {
+            for (std::size_t c = c_lo; c < c_hi; ++c) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                for (std::size_t i = lo; i < hi; ++i) {
+                    if (!equal_first(p[i])) { miss[c] = 1; break; }
+                }
+            }
+        };
+        parallel_for_index(std::size_t(0), chunks, std::size_t(1), job);
+        for (unsigned char v : miss) if (v) return false;
+        record_dispatch(DispatchDecision::ProfileAllEqual);
+        return true;
+    }
+#endif
+}
 
 template <class T, class Comp>
 struct InputProfile {
@@ -539,7 +1071,7 @@ inline bool apply_profile_fast_exit(T* p, std::size_t n,
     if (prof.is_all_equal) { record_dispatch(DispatchDecision::ProfileAllEqual); return true; }
     if (prof.is_sorted)    { record_dispatch(DispatchDecision::ProfileSorted); return true; }
     if (allow_reverse && prof.is_reverse) {
-        std::reverse(p, p + n);
+        reverse_range_adaptive(p, n);
         record_dispatch(DispatchDecision::ProfileReverse);
         return true;
     }
@@ -4148,6 +4680,26 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
     const bool ascending  = detail::is_ascending_v<Comp, T>;
     const bool radix_ok   = detail::radix_supported_v<T> && (ascending || descending);
 
+#if FYX_ENABLE_FAST_PATHS
+    if (n > detail::kNetworkMax && detail::try_parallel_all_equal_exit(p, n, comp)) return;
+    if (n > detail::kNetworkMax && detail::try_fast_order_exit(p, n, comp, true)) return;
+    if (n > detail::kNetworkMax && detail::try_interleaved_runs_sort(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+    if (n <= detail::kProfilePartialPdqMax && detail::pdq_preferred_order_sample(p, n, comp)) {
+        if constexpr (!std::is_arithmetic<T>::value) {
+            if (detail::try_nearly_sorted_repair(p, n, comp)) {
+                detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                return;
+            }
+        }
+        detail::pdqsort_for_profile_pattern(p, n, comp);
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+#endif
+
     detail::InputProfile<T, Comp> top_profile;
     const detail::InputProfile<T, Comp>* prof = nullptr;
     if (n >= detail::kProfileMinN) {
@@ -4157,10 +4709,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
     }
 
 #if FYX_ENABLE_PARALLEL
-    const bool want_parallel = (o.threads != 1) &&
-        ((o.parallel == Tri::On) ||
-         (o.parallel == Tri::Auto && n >= detail::kParallelThreshold &&
-          detail::parallel_available()));
+    const bool want_parallel = detail::dynamic_parallel_allowed<T>(n, o);
     // Before creating tasks, let the unified top-level profile and O(n)
     // counting/string/key-specialized paths win the whole range.  High-entropy
     // samples skip low-cardinality probes, but still allow MSD string radix and

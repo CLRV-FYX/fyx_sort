@@ -2,3 +2,6 @@
 *.o
 *.s
 /build/
+
+# local generated-header safety backups
+fyx_sort.hpp.backup.*

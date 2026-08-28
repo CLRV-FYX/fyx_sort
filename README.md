@@ -68,18 +68,20 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 
 ## 算法与自适应调度
 
-`fyx::sort` 在编译期/运行期自动选择内核。入口处有统一的输入分布预检测层：
-先采样 1024 个元素判断是否值得全量验证；当样本显示已排序、逆序、全等或部分有序时，
-再用一次线性扫描同时验证 monotonicity、等价性、 distinct≤256 上限 与相邻逆序边计数。低基数样本只作为候选信号，
+`fyx::sort` 在编译期/运行期自动选择内核。入口处有可用 `FYX_ENABLE_FAST_PATHS` 关闭的快速分布层：
+算术类型全等先用 shifted `memcmp` 证明，字符串大输入全等可并行验证；已排序/逆序用一次线性扫描验证后直接返回或反转；
+交错 zigzag / organ-pipe 形态会被识别为两个已排序的交错 run，并用线性 merge 生成结果。随后统一 profile 层再采样 1024 个元素判断是否值得全量验证；
+当样本显示已排序、逆序、全等或部分有序时，再用一次线性扫描同时验证 monotonicity、等价性、 distinct≤256 上限 与相邻逆序边计数。低基数样本只作为候选信号，
 真正提交前仍由现有计数排序路径完整验证，避免 profile 本身给低基数场景额外增加一趟 O(n) 税。所有提前退出都必须由线性校验证明，
 不会靠猜测返回；明显随机高基数样本会跳过完整 distinct 预检，直接进入 radix / MSD / sample 路径。
 
 | 条件 | 选择的内核 |
 |---|---|
 | 数值类型 + 默认 `<`/`>` + `n ≤ 64` | 分支无关 SIMD 双调网络（AVX-512 / AVX2 / SSE4.2 / NEON） |
-| 已排序 / 全等 | 统一 profile 一次验证后直接返回 |
-| 逆序（非 stable） | 统一 profile 一次验证后反转 |
-| 部分有序（相邻逆序边 ≤ n/64，且规模合理） | pdqsort |
+| 已排序 / 全等 | 快速分布层或统一 profile 一次验证后直接返回；算术全等优先 shifted `memcmp` |
+| 逆序（非 stable） | 快速分布层或统一 profile 一次验证后反转 |
+| 交错 zigzag / organ-pipe 两 run | 验证偶/奇位置各自单调后线性 merge |
+| 部分有序（相邻逆序边 ≤ n/64，且规模合理） | pdqsort；浮点默认顺序使用 radix-key comparator 以保留 NaN / `-0/+0` 总序 |
 | 整数小值域 | 计数排序（O(n + range)）；大输入先用 sample-gated 并行 dense-range count/fill 加速 256-way lowcard |
 | 数值/浮点默认顺序低基数（≤256 radix keys） | radix-key 稀疏计数排序；大输入可并行计数/填充，浮点/32/64-bit 稀疏键先尝试 rank16 direct-map 计数，dense integer range 与浮点 compact prefix direct-map 仍优先处理小值域（O(n)，保留 `-0/+0`/NaN 总序语义） |
 | 任意类型低基数（≤256 等价类） | 压缩计数排序，保留原始对象 payload；`stable_sort` 保持稳定 |
@@ -91,7 +93,7 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | `stable_sort` 非低基数通用类型 | 自底向上归并排序（稳定） |
 | `partial_sort` / `nth_element` | 堆 + 内省选择（quickselect） |
 
-并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，
+并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，`Auto` 默认从约 1,000,000 元素开始启用线程池，并同时检查每个线程至少约 128 KiB 数据；可用环境变量 `FYX_MIN_PARALLEL_SIZE` 覆写最小并行规模。
 高熵数值默认顺序会先尝试 32-bit integer 11/11/10 三趟 wide-key radix（减少一轮全数组 count/scatter，并沿用 2 chunks/worker 的较粗粒度调度以降低 4H/VM 调度和 WCB 压力）以及 64-bit high-prefix radix（sample 确认高 prefix 近似唯一后，`int64/uint64` 只排 encoded top33 key，`double` 只排 encoded top39 key，最后一趟 scatter 时直接解码回用户数组，再用单次 cached-prefix 扫描修复相同 prefix 的小桶），用更少全数组 pass 攻击 random 短板；不适用时回到 chunked parallel radix（保留全 pass 快速规划、32-bit/value-buffer 优化，并用 32-bit local hist / 按 key 宽度自适应 chunk 数降低 64-bit recount/cache 压力；64-bit 整数 value-buffer radix 保持 4H2G 实测更稳的 3 chunks/worker；`double` key-buffer 路径最后一趟直接 scatter+decode 回用户数组），2-worker/bandwidth-constrained 环境仍保留 `float` top-byte / 64-bit top16 MSD-bucket hybrid fallback；
 低基数 radix-key 场景走并行 sparse counting；整数 64..65536 小值域会优先走 sample-gated 并行 dense-range count/fill，浮点/32/64-bit 稀疏低基数会先尝试 collision-free rank16 direct-map，浮点小值域也保留 compact prefix direct-map，以避免逐元素 hash probe；通用大输入走并行 sample sort（并行分类、散射和桶递归）；其它中等输入保留任务并行分治，
 归并阶段优先使用 scratch-buffered 并行分块归并，分配失败或不适用时回退到 `std::inplace_merge`。默认 `Auto`。
@@ -112,6 +114,11 @@ fyx::sort(v, o);              // 或 fyx::sort(v.begin(), v.end(), o)
 ## 编译期开关（均可选，默认「直接 include 就能用」）
 
 - `FYX_ENABLE_PARALLEL`（默认开；定义 `FYX_DISABLE_PARALLEL` 得到无 `<thread>` 依赖的纯单线程构建）
+- `FYX_ENABLE_FAST_PATHS`（默认开；关闭后禁用入口 sorted/all-equal/reverse/zigzag 快速分布层）
+- `FYX_USE_PDQ_PARTITION`（默认开；控制部分有序/zigzag 的 pdq/两 run 处理）
+- `FYX_USE_STRING_VIEW`（默认开；字符串全等验证使用 `data()+size()`/`char_traits::compare`，避免构造 view/拷贝）
+- `FYX_SAMPLE_SORT_V2`（默认开；保留 sample-sort v2 调整的编译期开关）
+- 运行期环境变量：`FYX_MIN_PARALLEL_SIZE=<元素数>` 可覆写 Auto 并行最小规模。
 - `FYX_DISABLE_AVX512` / `FYX_DISABLE_AVX2` / `FYX_DISABLE_SSE42` / `FYX_DISABLE_NEON`
   （关掉某一档 ISA 的内核；`FYX_DISABLE_SIMD` 一次性关掉全部）
 - `FYX_FORCE_SIMD_HISTOGRAM`（强制使用 AVX-512 冲突检测直方图）
@@ -133,7 +140,7 @@ done
 `test/t_api.cpp` 覆盖：所有重载形态、`std::sort` / `std::stable_sort` 逐元素比对、
 稳定排序的 (key,idx) 稳定性验证、`partial_sort` / `nth_element` 契约验证、
 `-0`/`+0`/NaN 的浮点全序、以及 `extern "C"` ABI。
-`test/t_counting.cpp` 覆盖低基数整数/字符串/结构体、稀疏 256 distinct、MSD 字符串边界、并行 sample sort 显式路径，以及武器七 profile 调度（已排序、逆序、全等、低基数、部分有序、高熵 comparator-key）。
+`test/t_counting.cpp` 覆盖低基数整数/字符串/结构体、稀疏 256 distinct、MSD 字符串边界、并行 sample sort 显式路径，以及快速/profile 调度（已排序、逆序、全等、低基数、部分有序、interleaved zigzag、高熵 comparator-key）。
 
 ---
 

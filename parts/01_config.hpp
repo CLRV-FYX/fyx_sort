@@ -47,6 +47,16 @@
 //    FYX_FORCE_SIMD_HISTOGRAM
 //                            force the AVX-512 conflict-detection histogram
 //                            even when the heuristic prefers the scalar one.
+//    FYX_ENABLE_FAST_PATHS   on by default; set to 0 to disable the entry
+//                            sorted/all-equal/reverse/zigzag fast paths.
+//    FYX_USE_PDQ_PARTITION   on by default; controls the partially-sorted and
+//                            interleaved-run pdq/two-run handling.
+//    FYX_USE_STRING_VIEW     on by default; string all-equal probes compare
+//                            string data/size directly without copies.
+//    FYX_SAMPLE_SORT_V2      on by default; keeps sample-sort v2 tuning behind
+//                            an explicit compile-time gate.
+//    FYX_MIN_PARALLEL_SIZE   runtime environment variable: Auto-mode minimum
+//                            element count before launching the thread pool.
 //    FYX_NO_EXCEPTIONS       do not throw; failed allocations degrade to an
 //                            in-place algorithm instead.
 //    FYX_ASSERT(x)           user-supplied assertion hook.
@@ -131,6 +141,19 @@
 
 #ifndef FYX_ENABLE_TEST_HOOKS
 #  define FYX_ENABLE_TEST_HOOKS 0
+#endif
+
+#ifndef FYX_ENABLE_FAST_PATHS
+#  define FYX_ENABLE_FAST_PATHS 1
+#endif
+#ifndef FYX_USE_PDQ_PARTITION
+#  define FYX_USE_PDQ_PARTITION 1
+#endif
+#ifndef FYX_USE_STRING_VIEW
+#  define FYX_USE_STRING_VIEW 1
+#endif
+#ifndef FYX_SAMPLE_SORT_V2
+#  define FYX_SAMPLE_SORT_V2 1
 #endif
 
 // ---------------------------------------------------------------------------

@@ -699,11 +699,15 @@ inline void parallel_sample_sort(It first, It last, Comp comp) {
     using T = typename std::iterator_traits<It>::value_type;
     const std::size_t n = static_cast<std::size_t>(last - first);
     unsigned depth = static_cast<unsigned>(2 * log2_floor(static_cast<std::uint64_t>(n ? n : 1)) + 8);
+#if FYX_SAMPLE_SORT_V2
     if constexpr (std::is_arithmetic<T>::value && !std::is_same<T, bool>::value) {
         parallel_sample_sort_arithmetic64_top(first, last, comp, depth);
     } else {
         parallel_sample_sort_impl(first, last, comp, depth);
     }
+#else
+    parallel_sample_sort_impl(first, last, comp, depth);
+#endif
 }
 
 #endif // FYX_ENABLE_PARALLEL
