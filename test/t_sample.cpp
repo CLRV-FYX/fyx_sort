@@ -135,16 +135,48 @@ int main() {
     }
     {
         auto cmp_f = [](float a, float b) { return a < b; };
-        std::vector<float> vals(16);
+        std::vector<float> vals(256);
         for (std::size_t i = 0; i < vals.size(); ++i)
-            vals[i] = static_cast<float>(static_cast<int>(i) - 8) * 0.25f;
+            vals[i] = static_cast<float>(static_cast<int>(i) - 128) * 0.25f;
         std::vector<float> v(200000);
         for (auto& x : v) x = vals[rng() % vals.size()];
         sample_sort(v.data(), v.data() + v.size(), cmp_f);
-        CHECK(std::is_sorted(v.begin(), v.end(), cmp_f), "float low-card sample fallback");
+        CHECK(std::is_sorted(v.begin(), v.end(), cmp_f), "float 256-way low-card sample fallback");
+    }
+    {
+        auto cmp_d = [](double a, double b) { return a < b; };
+        std::vector<double> vals(256);
+        for (std::size_t i = 0; i < vals.size(); ++i)
+            vals[i] = static_cast<double>(static_cast<int>(i) - 128) * 0.125;
+        std::vector<double> v(200000);
+        for (auto& x : v) x = vals[rng() % vals.size()];
+        sample_sort(v.data(), v.data() + v.size(), cmp_d);
+        CHECK(std::is_sorted(v.begin(), v.end(), cmp_d), "double 256-way low-card sample fallback");
     }
 
-    // ---- 5. performance sketch: sample sort vs pdqsort on strings --------
+#if FYX_ENABLE_PARALLEL
+    // ---- 5. arithmetic parallel sample-sort 64-way top partition ----------
+    printf("arithmetic parallel sample sort\n");
+    {
+        auto cmp_i = [](int a, int b) { return a < b; };
+        std::vector<int> v(300000);
+        for (auto& x : v) x = static_cast<int>(rng());
+        parallel_sample_sort(v.data(), v.data() + v.size(), cmp_i);
+        CHECK(std::is_sorted(v.begin(), v.end(), cmp_i), "int random parallel sample sort");
+    }
+    {
+        auto cmp_d = [](double a, double b) { return a < b; };
+        std::vector<double> vals(256);
+        for (std::size_t i = 0; i < vals.size(); ++i)
+            vals[i] = static_cast<double>(static_cast<int>(i) - 128) * 0.125;
+        std::vector<double> v(300000);
+        for (auto& x : v) x = vals[rng() % vals.size()];
+        parallel_sample_sort(v.data(), v.data() + v.size(), cmp_d);
+        CHECK(std::is_sorted(v.begin(), v.end(), cmp_d), "double low-card parallel sample sort");
+    }
+#endif
+
+    // ---- 6. performance sketch: sample sort vs pdqsort on strings --------
     printf("perf: fyx::sort vs std::sort on strings\n");
     {
         const std::size_t n = 2'000'000;

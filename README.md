@@ -87,12 +87,12 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 | 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀）；低基数字符串在 comparator 模式下也可走 unordered value-count/fill，大输入会并行计数/填充且只对 distinct key 排序 |
 | 自定义比较器但采样等价于自然升/降序的数值或 `std::string` | guarded radix/count/MSD recovery（采样确认 + 最终 `is_sorted(comp)` 校验；失败则继续比较排序） |
 | trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
-| 结构体 / 自定义比较器大输入 | 256 路 sample sort（cheap/trivial payload 使用 unrolled Eytzinger 分类；`std::string` fallback 保持 looped classifier + 128K handoff + block scatter；非字符串串行路径单趟 prefix scatter，并行路径分 chunk 计数/散射；低 distinct 算术样本先走 sparse value counting） |
+| 结构体 / 自定义比较器大输入 | 256 路 sample sort（cheap/trivial payload 使用 unrolled Eytzinger 分类；并行 arithmetic comparator fallback 顶层用 64 路 partition + 256 路采样预算以减少 random 数值分类比较；`std::string` fallback 保持 looped classifier + 128K handoff + block scatter；非字符串串行路径单趟 prefix scatter，并行路径分 chunk 计数/散射；低 distinct 算术样本先走 rank16/sparse exact value counting，float/double 256-way comparator 低基数也优先尝试该 exact counter） |
 | `stable_sort` 非低基数通用类型 | 自底向上归并排序（稳定） |
 | `partial_sort` / `nth_element` | 堆 + 内省选择（quickselect） |
 
 并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，
-高熵数值默认顺序会先尝试 32-bit integer 11/11/10 三趟 wide-key radix（减少一轮全数组 count/scatter，并用较少 chunk 降低 4H/VM 调度和 WCB 压力）以及 64-bit high-prefix radix（sample 确认高 prefix 近似唯一后，`int64/uint64` 只排 encoded top33 key，`double` 只排 encoded top39 key，最后一趟 scatter 时直接解码回用户数组，再对相同 prefix 的小桶补排），用更少全数组 pass 攻击 random 短板；不适用时回到 chunked parallel radix（保留全 pass 快速规划、32-bit/value-buffer 优化，并用 32-bit local hist / 按 key 宽度自适应 chunk 数降低 64-bit recount/cache 压力；64-bit 整数 value-buffer radix 保持 4H2G 实测更稳的 3 chunks/worker；`double` key-buffer 路径最后一趟直接 scatter+decode 回用户数组），2-worker/bandwidth-constrained 环境仍保留 `float` top-byte / 64-bit top16 MSD-bucket hybrid fallback；
+高熵数值默认顺序会先尝试 32-bit integer 11/11/10 三趟 wide-key radix（减少一轮全数组 count/scatter，并沿用 2 chunks/worker 的较粗粒度调度以降低 4H/VM 调度和 WCB 压力）以及 64-bit high-prefix radix（sample 确认高 prefix 近似唯一后，`int64/uint64` 只排 encoded top33 key，`double` 只排 encoded top39 key，最后一趟 scatter 时直接解码回用户数组，再用单次 cached-prefix 扫描修复相同 prefix 的小桶），用更少全数组 pass 攻击 random 短板；不适用时回到 chunked parallel radix（保留全 pass 快速规划、32-bit/value-buffer 优化，并用 32-bit local hist / 按 key 宽度自适应 chunk 数降低 64-bit recount/cache 压力；64-bit 整数 value-buffer radix 保持 4H2G 实测更稳的 3 chunks/worker；`double` key-buffer 路径最后一趟直接 scatter+decode 回用户数组），2-worker/bandwidth-constrained 环境仍保留 `float` top-byte / 64-bit top16 MSD-bucket hybrid fallback；
 低基数 radix-key 场景走并行 sparse counting；整数 64..65536 小值域会优先走 sample-gated 并行 dense-range count/fill，浮点/32/64-bit 稀疏低基数会先尝试 collision-free rank16 direct-map，浮点小值域也保留 compact prefix direct-map，以避免逐元素 hash probe；通用大输入走并行 sample sort（并行分类、散射和桶递归）；其它中等输入保留任务并行分治，
 归并阶段优先使用 scratch-buffered 并行分块归并，分配失败或不适用时回退到 `std::inplace_merge`。默认 `Auto`。
 

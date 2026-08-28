@@ -1586,23 +1586,29 @@ inline void radix_sort_high_prefix_value_ties(T* p, std::size_t n) {
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
     constexpr unsigned Shift = 64u - PrefixBits;
-    std::size_t i = 0;
-    while (i < n) {
-        const Key prefix = RT::encode(p[i]) >> Shift;
-        std::size_t j = i + 1;
-        while (j < n && (RT::encode(p[j]) >> Shift) == prefix) ++j;
-        const std::size_t sz = j - i;
-        if (sz > 1) {
-            if (sz <= kNetworkMax) {
-                small_sort_numeric(p + i, sz);
-            } else {
-                std::sort(p + i, p + j, [](const T& a, const T& b) {
-                    return RT::encode(a) < RT::encode(b);
-                });
-            }
+    if (n < 2) return;
+    std::size_t group_lo = 0;
+    Key prev_prefix = RT::encode(p[0]) >> Shift;
+    auto repair_group = [&](std::size_t lo, std::size_t hi) {
+        const std::size_t sz = hi - lo;
+        if (sz <= 1) return;
+        if (sz <= kNetworkMax) {
+            small_sort_numeric(p + lo, sz);
+        } else {
+            std::sort(p + lo, p + hi, [](const T& a, const T& b) {
+                return RT::encode(a) < RT::encode(b);
+            });
         }
-        i = j;
+    };
+    for (std::size_t i = 1; i < n; ++i) {
+        const Key cur_prefix = RT::encode(p[i]) >> Shift;
+        if (cur_prefix != prev_prefix) {
+            repair_group(group_lo, i);
+            group_lo = i;
+            prev_prefix = cur_prefix;
+        }
     }
+    repair_group(group_lo, n);
 }
 
 template <class Key, unsigned PrefixBits>
@@ -2041,23 +2047,30 @@ inline void radix_sort_high_prefix_decoded_ties(T* p, std::size_t n) {
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
     constexpr unsigned Shift = 64u - PrefixBits;
-    std::size_t i = 0;
-    while (i < n) {
-        const Key prefix = RT::encode(p[i]) >> Shift;
-        std::size_t j = i + 1;
-        while (j < n && (RT::encode(p[j]) >> Shift) == prefix) ++j;
-        for (std::size_t a = i + 1; a < j; ++a) {
+    if (n < 2) return;
+    std::size_t group_lo = 0;
+    Key prev_prefix = RT::encode(p[0]) >> Shift;
+    auto repair_group = [&](std::size_t lo, std::size_t hi) {
+        for (std::size_t a = lo + 1; a < hi; ++a) {
             T v = p[a];
             const Key kv = RT::encode(v);
             std::size_t b = a;
-            while (b > i && RT::encode(p[b - 1]) > kv) {
+            while (b > lo && RT::encode(p[b - 1]) > kv) {
                 p[b] = p[b - 1];
                 --b;
             }
             p[b] = v;
         }
-        i = j;
+    };
+    for (std::size_t i = 1; i < n; ++i) {
+        const Key cur_prefix = RT::encode(p[i]) >> Shift;
+        if (cur_prefix != prev_prefix) {
+            repair_group(group_lo, i);
+            group_lo = i;
+            prev_prefix = cur_prefix;
+        }
     }
+    repair_group(group_lo, n);
 }
 
 template <class T, unsigned PrefixBits, unsigned Bits>
