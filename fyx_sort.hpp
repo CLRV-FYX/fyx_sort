@@ -7102,6 +7102,111 @@ inline bool radix_sample_all_passes_vary(const T* p, std::size_t n) noexcept {
     }
 }
 
+template <unsigned Bits, class CountOne, class ScatterOne>
+inline void parallel_radix_wide_count_scatter(std::size_t chunks,
+                                              CountOne count_one,
+                                              ScatterOne scatter_one) {
+    constexpr std::size_t Buckets = std::size_t(1) << Bits;
+    std::vector<std::array<std::uint32_t, Buckets>> local(chunks);
+    std::vector<std::array<std::size_t, Buckets>> base(chunks);
+
+    auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+        for (std::size_t c = c_lo; c < c_hi; ++c)
+            count_one(c, local[c].data());
+    };
+    parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+
+    std::size_t run = 0;
+    for (std::size_t d = 0; d < Buckets; ++d) {
+        for (std::size_t c = 0; c < chunks; ++c) {
+            base[c][d] = run;
+            run += local[c][d];
+        }
+    }
+
+    auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+        for (std::size_t c = c_lo; c < c_hi; ++c) {
+            auto pos = base[c];
+            scatter_one(c, pos.data());
+        }
+    };
+    parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
+}
+
+template <class T>
+inline std::size_t adaptive_parallel_radix32_wide_chunks(std::size_t n) {
+    ThreadPool& pool = global_pool();
+    std::size_t chunks = (n + kParallelThreshold - 1) / kParallelThreshold;
+    const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * 2);
+    if (chunks < 2) chunks = 2;
+    if (chunks > max_chunks) chunks = max_chunks;
+    (void)sizeof(T);
+    return chunks;
+}
+
+template <class T>
+inline bool try_parallel_radix32_wide_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value &&
+                    radix_supported_v<T> && sizeof(T) == 4)) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+        if (!radix_sample_all_passes_vary<T>(p, n)) return false;
+
+        ScratchLease<Key> lease(n * 2);
+        if (!lease.valid()) return false;
+        Key* a = lease.get();
+        Key* b = a + n;
+
+        const std::size_t chunks = adaptive_parallel_radix32_wide_chunks<T>(n);
+        if ((n + chunks - 1) / chunks >
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
+        const bool can_stream = have_nt_stores();
+
+        parallel_radix_wide_count_scatter<11>(chunks,
+            [&](std::size_t c, std::uint32_t* out) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_count_value_pass_banked_wide<T, 11>(p + lo, hi - lo, 0, out);
+            },
+            [&](std::size_t c, std::size_t* pos) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_scatter_encode_pass_wide<T, Key, 11>(p + lo, hi - lo, a, 0, pos, can_stream);
+            });
+
+        parallel_radix_wide_count_scatter<11>(chunks,
+            [&](std::size_t c, std::uint32_t* out) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_count_key_pass_banked_wide<Key, 11>(a + lo, hi - lo, 11, out);
+            },
+            [&](std::size_t c, std::size_t* pos) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_scatter_key_pass_wide<Key, 11>(a + lo, hi - lo, b, 11, pos, can_stream);
+            });
+
+        parallel_radix_wide_count_scatter<10>(chunks,
+            [&](std::size_t c, std::uint32_t* out) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_count_key_pass_banked_wide<Key, 10>(b + lo, hi - lo, 22, out);
+            },
+            [&](std::size_t c, std::size_t* pos) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_scatter_key_decode_pass_wide<T, Key, 10>(b + lo, hi - lo, p, 22, pos, can_stream);
+            });
+
+        if (descending) std::reverse(p, p + n);
+        return true;
+    }
+}
+
 template <class T>
 inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool assume_all_passes = false) {
     if constexpr (!radix_supported_v<T>) {
@@ -7564,11 +7669,16 @@ inline bool try_radix_key_rank16_count_sort_parallel(T* p, std::size_t n, bool d
             }
         }
         if (distinct.empty()) return false;
-        if constexpr (std::is_integral<T>::value && sizeof(T) <= 4) {
-            return false;
-        }
         if constexpr (std::is_integral<T>::value) {
-            if (distinct.size() <= 32) return false;
+            Key smn = distinct[0], smx = distinct[0];
+            for (Key k : distinct) { if (k < smn) smn = k; if (smx < k) smx = k; }
+            const Key sample_span = static_cast<Key>(smx - smn);
+            if (sample_span != std::numeric_limits<Key>::max() &&
+                static_cast<unsigned long long>(sample_span) + 1ull <= 65536ull)
+                return false;
+            if constexpr (sizeof(T) > 4) {
+                if (distinct.size() <= 32) return false;
+            }
         }
         std::sort(distinct.begin(), distinct.end());
 
@@ -8428,7 +8538,8 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
 
 #if FYX_ENABLE_PARALLEL
         if (!done && prefer_parallel && high_entropy)
-            done = try_parallel_radix_high_prefix_sort(p, n, descending);
+            done = try_parallel_radix32_wide_sort(p, n, descending) ||
+                   try_parallel_radix_high_prefix_sort(p, n, descending);
         if (!done && prefer_parallel)
             done = try_parallel_radix_sort(p, n, descending, high_entropy);
 #else
@@ -8968,6 +9079,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
             if (partial_pdq) { detail::pdqsort(p, p + n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_parallel_radix_sort(p, n, descending, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
@@ -8994,6 +9106,10 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
 #if FYX_ENABLE_PARALLEL
         if (want_parallel) {
             const bool high_entropy = prof && prof->is_high_entropy;
+            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;

@@ -115,6 +115,23 @@ int main(){
             printf("  double ascending: %s\n", ok ? "OK" : "FAIL");
             if (!ok) failures++;
         }
+        printf("parallel wide 32-bit random\n");
+        {
+            std::vector<uint32_t> v(n);
+            for (auto& x : v) x = static_cast<uint32_t>(rng());
+            bool path = try_parallel_radix32_wide_sort(v.data(), v.size(), false);
+            bool ok = path && std::is_sorted(v.begin(), v.end());
+            printf("  uint32 ascending: %s\n", ok ? "OK" : "FAIL");
+            if (!ok) failures++;
+        }
+        {
+            std::vector<int32_t> v(n);
+            for (auto& x : v) x = static_cast<int32_t>(rng());
+            bool path = try_parallel_radix32_wide_sort(v.data(), v.size(), true);
+            bool ok = path && std::is_sorted(v.begin(), v.end(), std::greater<int32_t>{});
+            printf("  int32 descending: %s\n", ok ? "OK" : "FAIL");
+            if (!ok) failures++;
+        }
     }
 #endif
 

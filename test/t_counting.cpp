@@ -60,6 +60,21 @@ int main() {
         std::shuffle(v.begin(), v.end(), rng);
         check_against_std("i64 sparse 257 distinct fallback", v);
     }
+#if FYX_ENABLE_PARALLEL
+    {
+        std::vector<std::uint32_t> keys;
+        keys.reserve(256);
+        while (keys.size() < 256) {
+            const std::uint32_t x = static_cast<std::uint32_t>(rng());
+            if (std::find(keys.begin(), keys.end(), x) == keys.end()) keys.push_back(x);
+        }
+        std::vector<std::uint32_t> v(350000);
+        for (auto& x : v) x = keys[rng() % keys.size()];
+        const bool ok_path = fyx::detail::try_radix_key_rank16_count_sort_parallel(v.data(), v.size(), false);
+        CHECK(ok_path, "parallel uint32 rank16 count path accepted sparse 256-way lowcard");
+        CHECK(std::is_sorted(v.begin(), v.end()), "parallel uint32 rank16 count output");
+    }
+#endif
 
     std::printf("counting: strings and payload structs\n");
     {
