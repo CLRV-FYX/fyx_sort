@@ -69,6 +69,8 @@ int main() {
         for (auto& s : v) s = alpha[rng() % alpha.size()];
         check_against_std("string 64 distinct", v);
         check_against_std("string 64 distinct descending", v, std::greater<std::string>{});
+        auto natural = [](const std::string& a, const std::string& b) { return a < b; };
+        check_against_std("string 64 distinct custom natural comparator", v, natural);
     }
     {
         struct Rec {
@@ -212,6 +214,7 @@ int main() {
               "vector iterator float low-cardinality uses radix-key sparse count");
         CHECK(std::is_sorted(v.begin(), v.end()), "vector iterator float low-cardinality output");
     }
+#if FYX_ENABLE_PARALLEL
     {
         namespace fd = fyx::detail;
         std::vector<float> keys(256);
@@ -224,9 +227,26 @@ int main() {
         o.parallel = fyx::Tri::On;
         fyx::sort(v.begin(), v.end(), o);
         CHECK(fd::test_last_dispatch() == fd::DispatchDecision::LowCardinality,
-              "parallel float low-cardinality uses dense-prefix count");
+              "parallel float low-cardinality uses rank/direct-map count");
         CHECK(std::is_sorted(v.begin(), v.end()), "parallel float low-cardinality output");
     }
+#endif
+#if FYX_ENABLE_PARALLEL
+    {
+        std::uniform_real_distribution<float> dist(-1000000.0f, 1000000.0f);
+        std::vector<float> keys;
+        keys.reserve(256);
+        while (keys.size() < 256) {
+            const float x = dist(rng);
+            if (std::find(keys.begin(), keys.end(), x) == keys.end()) keys.push_back(x);
+        }
+        std::vector<float> v((std::size_t(1) << 20) + 17);
+        for (auto& x : v) x = keys[rng() % keys.size()];
+        const bool ok_path = fyx::detail::try_radix_key_rank16_count_sort_parallel(v.data(), v.size(), false);
+        CHECK(ok_path, "parallel float rank16 count path accepted arbitrary 256-way lowcard");
+        CHECK(std::is_sorted(v.begin(), v.end()), "parallel float rank16 count output");
+    }
+#endif
 #if FYX_ENABLE_PARALLEL
     {
         std::vector<std::int32_t> v((std::size_t(1) << 20) + 17);

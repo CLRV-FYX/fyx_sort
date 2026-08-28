@@ -5575,7 +5575,6 @@ inline bool try_string_value_count_sort(T* p, std::size_t n, Comp comp, bool des
         return false;
     } else {
         if (n < kCountingMinN) return false;
-        if (!(is_ascending_v<Comp, T> || is_descending_v<Comp, T>)) return false;
 
         std::unordered_map<std::string, std::size_t> counts;
         counts.reserve(kCountingClassLimit * 2);
@@ -5602,7 +5601,11 @@ inline bool try_string_value_count_sort(T* p, std::size_t n, Comp comp, bool des
             out += c;
         }
         (void)descending;
-        return true;
+        if constexpr (is_ascending_v<Comp, T> || is_descending_v<Comp, T>) {
+            return true;
+        } else {
+            return std::is_sorted(p, p + n, comp);
+        }
     }
 }
 
@@ -7458,6 +7461,142 @@ inline bool try_radix_key_dense_prefix_count_sort_parallel(T* p, std::size_t n, 
 }
 
 template <class T>
+inline bool try_radix_key_rank16_count_sort_parallel(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        if (n < kParallelThreshold || !parallel_available()) return false;
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        constexpr std::size_t Limit = kCountingClassLimit;
+        constexpr std::size_t HashCap = 1024;
+        constexpr std::size_t HashMask = HashCap - 1;
+        constexpr unsigned short Sentinel = std::numeric_limits<unsigned short>::max();
+
+        std::array<Key, HashCap> sample_keys{};
+        std::array<unsigned char, HashCap> sample_used{};
+        std::vector<Key> distinct;
+        distinct.reserve(Limit);
+        const std::size_t s = std::min<std::size_t>(n, kCountingProbeLimit);
+        for (std::size_t j = 0; j < s; ++j) {
+            const std::size_t idx = (j * n) / s;
+            const Key k = RT::encode(p[idx]);
+            std::size_t h = low_card_hash_key(k) & HashMask;
+            for (;;) {
+                if (!sample_used[h]) {
+                    if (distinct.size() >= Limit) return false;
+                    sample_used[h] = 1;
+                    sample_keys[h] = k;
+                    distinct.push_back(k);
+                    break;
+                }
+                if (sample_keys[h] == k) break;
+                h = (h + 1) & HashMask;
+            }
+        }
+        if (distinct.empty()) return false;
+        if constexpr (std::is_integral<T>::value && sizeof(T) <= 4) {
+            return false;
+        }
+        if constexpr (std::is_integral<T>::value) {
+            if (distinct.size() <= 32) return false;
+        }
+        std::sort(distinct.begin(), distinct.end());
+
+        auto project = [](Key k, unsigned kind) noexcept -> unsigned short {
+            if constexpr (sizeof(Key) <= 4) {
+                const std::uint32_t x = static_cast<std::uint32_t>(k);
+                switch (kind) {
+                    case 0: return static_cast<unsigned short>(x >> 16);
+                    case 1: return static_cast<unsigned short>(x);
+                    case 2: return static_cast<unsigned short>(x >> 8);
+                    case 3: return static_cast<unsigned short>((x >> 16) ^ x);
+                    case 4: return static_cast<unsigned short>((x * 2654435761u) >> 16);
+                    case 5: return static_cast<unsigned short>((x * 2246822519u) >> 16);
+                    case 6: return static_cast<unsigned short>(((x ^ 0x9E3779B9u) * 3266489917u) >> 16);
+                    case 7: return static_cast<unsigned short>(((x ^ 0x85EBCA6Bu) * 668265263u) >> 16);
+                    case 8: return static_cast<unsigned short>(x >> 12);
+                    case 9: return static_cast<unsigned short>(x >> 4);
+                    default:return static_cast<unsigned short>((x >> 8) ^ x);
+                }
+            } else {
+                const std::uint64_t x = static_cast<std::uint64_t>(k);
+                switch (kind) {
+                    case 0: return static_cast<unsigned short>(x >> 48);
+                    case 1: return static_cast<unsigned short>(x >> 32);
+                    case 2: return static_cast<unsigned short>(x >> 16);
+                    case 3: return static_cast<unsigned short>(x);
+                    case 4: return static_cast<unsigned short>(x >> 40);
+                    case 5: return static_cast<unsigned short>(x >> 24);
+                    case 6: return static_cast<unsigned short>(x >> 8);
+                    case 7: return static_cast<unsigned short>((x >> 48) ^ (x >> 32) ^ (x >> 16) ^ x);
+                    case 8: return static_cast<unsigned short>((x * 0x9E3779B97F4A7C15ULL) >> 48);
+                    case 9: return static_cast<unsigned short>((x * 0xC2B2AE3D27D4EB4FULL) >> 48);
+                    case 10:return static_cast<unsigned short>(((x ^ 0xD6E8FEB86659FD93ULL) * 0x94D049BB133111EBULL) >> 48);
+                    case 11:return static_cast<unsigned short>(((x ^ 0x9E3779B97F4A7C15ULL) * 0xBF58476D1CE4E5B9ULL) >> 48);
+                    default:return static_cast<unsigned short>((x >> 36) ^ (x >> 20) ^ (x >> 4));
+                }
+            }
+        };
+
+        std::vector<unsigned short> rank_of(65536, Sentinel);
+        unsigned chosen = std::numeric_limits<unsigned>::max();
+        constexpr unsigned Projections = (sizeof(Key) <= 4) ? 11u : 13u;
+        for (unsigned kind = 0; kind < Projections; ++kind) {
+            std::fill(rank_of.begin(), rank_of.end(), Sentinel);
+            bool ok = true;
+            for (std::size_t r = 0; r < distinct.size(); ++r) {
+                const unsigned short q = project(distinct[r], kind);
+                if (rank_of[q] != Sentinel) { ok = false; break; }
+                rank_of[q] = static_cast<unsigned short>(r);
+            }
+            if (ok) { chosen = kind; break; }
+        }
+        if (chosen == std::numeric_limits<unsigned>::max()) return false;
+
+        const std::size_t d = distinct.size();
+        const std::size_t chunks = adaptive_parallel_chunks(n);
+        std::vector<std::size_t> local(chunks * d, 0);
+        std::vector<unsigned char> miss(chunks, 0);
+        auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+            for (std::size_t c = c_lo; c < c_hi; ++c) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                std::size_t* lc = local.data() + c * d;
+                for (std::size_t i = lo; i < hi; ++i) {
+                    const Key k = RT::encode(p[i]);
+                    const unsigned short r = rank_of[project(k, chosen)];
+                    if (r == Sentinel || distinct[r] != k) { miss[c] = 1; break; }
+                    ++lc[r];
+                }
+            }
+        };
+        parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+        for (unsigned char v : miss) if (v) return false;
+
+        std::vector<std::size_t> offset(d + 1, 0);
+        for (std::size_t out_rank = 0; out_rank < d; ++out_rank) {
+            const std::size_t src_rank = descending ? (d - 1 - out_rank) : out_rank;
+            std::size_t total = 0;
+            for (std::size_t c = 0; c < chunks; ++c)
+                total += local[c * d + src_rank];
+            offset[out_rank + 1] = offset[out_rank] + total;
+        }
+
+        auto fill_job = [&](std::size_t lo, std::size_t hi) {
+            for (std::size_t out_rank = lo; out_rank < hi; ++out_rank) {
+                const std::size_t src_rank = descending ? (d - 1 - out_rank) : out_rank;
+                const T v = RT::decode(distinct[src_rank]);
+                std::fill(p + offset[out_rank], p + offset[out_rank + 1], v);
+            }
+        };
+        parallel_for_index(std::size_t(0), d, std::size_t(8), fill_job);
+        return true;
+    }
+}
+
+template <class T>
 inline bool radix_key_sparse_probe_ok(T* p, std::size_t n) {
     if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
         (void)p; (void)n;
@@ -8206,8 +8345,9 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
 #if FYX_ENABLE_PARALLEL
             if (prefer_parallel) {
                 done = try_integer_range_count_sort_parallel(p, n, descending) ||
-                       try_integer_sparse_count_sort_parallel(p, n, descending) ||
                        try_radix_key_dense_prefix_count_sort_parallel(p, n, descending) ||
+                       try_radix_key_rank16_count_sort_parallel(p, n, descending) ||
+                       try_integer_sparse_count_sort_parallel(p, n, descending) ||
                        try_radix_key_sparse_count_sort_parallel(p, n, descending);
             }
 #endif
@@ -8742,16 +8882,18 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                     // range counting is sample-gated so sparse huge-span data can
                     // decline before paying a full min/max scan.
                     if (detail::try_integer_range_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
-                    if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_dense_prefix_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_radix_key_rank16_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 } else {
                     if (detail::try_integer_range_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_integer_range_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
-                    if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_dense_prefix_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_radix_key_rank16_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+                    if (detail::try_integer_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                     if (detail::try_radix_key_sparse_count_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 }
