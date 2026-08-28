@@ -621,8 +621,7 @@ inline bool try_radix_key_sparse_count_sort(T* p, std::size_t n, bool descending
         using Key = typename RT::Key;
         constexpr std::size_t Cap  = 1024;
         constexpr std::size_t Mask = Cap - 1;
-        constexpr std::size_t Limit =
-            (std::is_floating_point<T>::value && sizeof(T) == 4) ? 64 : kCountingClassLimit;
+        constexpr std::size_t Limit = kCountingClassLimit;
 
         std::array<Key, Cap> keys{};
         std::array<std::size_t, Cap> counts{};
@@ -750,13 +749,15 @@ inline bool try_string_value_count_sort_parallel(T* p, std::size_t n, Comp comp,
 
         const std::size_t d = distinct.size();
         const std::size_t chunks = adaptive_parallel_chunks(n);
-        std::vector<std::size_t> local(chunks * d, 0);
+        if ((n + chunks - 1) / chunks >
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
+        std::vector<std::uint32_t> local(chunks * d, 0);
         std::vector<unsigned char> miss(chunks, 0);
         auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
             for (std::size_t c = c_lo; c < c_hi; ++c) {
                 const std::size_t lo = (c * n) / chunks;
                 const std::size_t hi = ((c + 1) * n) / chunks;
-                std::size_t* lc = local.data() + c * d;
+                std::uint32_t* lc = local.data() + c * d;
                 for (std::size_t i = lo; i < hi; ++i) {
                     const auto it = rank_ref.find(p[i]);
                     if (it == rank_ref.end()) { miss[c] = 1; break; }
@@ -2261,8 +2262,7 @@ inline bool try_parallel_radix32_wide_sort(T* p, std::size_t n, bool descending)
     } else {
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
-        if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
-        if (!radix_sample_all_passes_vary<T>(p, n)) return false;
+        if (n < (std::size_t(1) << 18) || !parallel_available()) return false;
 
         ScratchLease<Key> lease(n * 2);
         if (!lease.valid()) return false;
@@ -2698,13 +2698,15 @@ inline bool try_radix_key_dense_prefix_count_sort_parallel(T* p, std::size_t n, 
         }
 
         const std::size_t chunks = adaptive_parallel_chunks(n);
-        std::vector<std::size_t> local(chunks * d, 0);
+        if ((n + chunks - 1) / chunks >
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
+        std::vector<std::uint32_t> local(chunks * d, 0);
         std::vector<unsigned char> miss(chunks, 0);
         auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
             for (std::size_t c = c_lo; c < c_hi; ++c) {
                 const std::size_t lo = (c * n) / chunks;
                 const std::size_t hi = ((c + 1) * n) / chunks;
-                std::size_t* lc = local.data() + c * d;
+                std::uint32_t* lc = local.data() + c * d;
                 for (std::size_t i = lo; i < hi; ++i) {
                     const Key k = RT::encode(p[i]);
                     const Key q = k >> chosen_shift;
@@ -2843,13 +2845,15 @@ inline bool try_radix_key_rank16_count_sort_parallel(T* p, std::size_t n, bool d
 
         const std::size_t d = distinct.size();
         const std::size_t chunks = adaptive_parallel_chunks(n);
-        std::vector<std::size_t> local(chunks * d, 0);
+        if ((n + chunks - 1) / chunks >
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
+        std::vector<std::uint32_t> local(chunks * d, 0);
         std::vector<unsigned char> miss(chunks, 0);
         auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
             for (std::size_t c = c_lo; c < c_hi; ++c) {
                 const std::size_t lo = (c * n) / chunks;
                 const std::size_t hi = ((c + 1) * n) / chunks;
-                std::size_t* lc = local.data() + c * d;
+                std::uint32_t* lc = local.data() + c * d;
                 for (std::size_t i = lo; i < hi; ++i) {
                     const Key k = RT::encode(p[i]);
                     const unsigned short r = rank_of[project(k, chosen)];
@@ -2892,8 +2896,7 @@ inline bool radix_key_sparse_probe_ok(T* p, std::size_t n) {
         using Key = typename RT::Key;
         constexpr std::size_t Cap = 512;
         constexpr std::size_t Mask = Cap - 1;
-        constexpr std::size_t Limit =
-            (std::is_floating_point<T>::value && sizeof(T) == 4) ? 64 : kCountingClassLimit;
+        constexpr std::size_t Limit = kCountingClassLimit;
         std::array<Key, Cap> keys{};
         std::array<unsigned char, Cap> used{};
         std::size_t distinct = 0;
@@ -2930,8 +2933,7 @@ inline bool try_radix_key_sparse_count_sort_parallel(T* p, std::size_t n, bool d
         using Key = typename RT::Key;
         constexpr std::size_t Cap = 1024;
         constexpr std::size_t Mask = Cap - 1;
-        constexpr std::size_t Limit =
-            (std::is_floating_point<T>::value && sizeof(T) == 4) ? 64 : kCountingClassLimit;
+        constexpr std::size_t Limit = kCountingClassLimit;
 
         const std::size_t chunks = adaptive_parallel_chunks(n);
         std::vector<std::array<Key, Cap>> local_keys(chunks);
