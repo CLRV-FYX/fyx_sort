@@ -71,6 +71,13 @@ int main() {
         check_against_std("string 64 distinct descending", v, std::greater<std::string>{});
         auto natural = [](const std::string& a, const std::string& b) { return a < b; };
         check_against_std("string 64 distinct custom natural comparator", v, natural);
+#if FYX_ENABLE_PARALLEL
+        std::vector<std::string> pv(300000);
+        for (auto& s : pv) s = alpha[rng() % alpha.size()];
+        const bool ok_parallel = fyx::detail::try_string_value_count_sort_parallel(pv.data(), pv.size(), natural, false);
+        CHECK(ok_parallel, "parallel string value-count accepted custom comparator lowcard");
+        CHECK(std::is_sorted(pv.begin(), pv.end(), natural), "parallel string value-count output");
+#endif
     }
     {
         struct Rec {

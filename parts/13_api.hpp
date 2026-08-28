@@ -709,14 +709,82 @@ inline bool try_string_value_count_sort(T* p, std::size_t n, Comp comp, bool des
             out += c;
         }
         (void)descending;
-        if constexpr (is_ascending_v<Comp, T> || is_descending_v<Comp, T>) {
-            return true;
-        } else {
-            return std::is_sorted(p, p + n, comp);
-        }
+        return true;
     }
 }
 
+#if FYX_ENABLE_PARALLEL
+inline std::size_t adaptive_parallel_chunks(std::size_t n);
+
+template <class T, class Comp>
+inline bool try_string_value_count_sort_parallel(T* p, std::size_t n, Comp comp, bool descending) {
+    if constexpr (!std::is_same<T, std::string>::value) {
+        (void)p; (void)n; (void)comp; (void)descending;
+        return false;
+    } else {
+        if (n < kParallelThreshold || !parallel_available()) return false;
+        (void)descending;
+
+        std::unordered_map<std::string, unsigned short> seen;
+        seen.reserve(kCountingClassLimit * 2);
+        std::vector<std::string> distinct;
+        distinct.reserve(kCountingClassLimit);
+        const std::size_t s = std::min<std::size_t>(n, kCountingProbeLimit);
+        for (std::size_t j = 0; j < s; ++j) {
+            const std::size_t idx = (j * n) / s;
+            if (seen.find(p[idx]) == seen.end()) {
+                if (distinct.size() >= kCountingClassLimit) return false;
+                const unsigned short id = static_cast<unsigned short>(distinct.size());
+                seen.emplace(p[idx], id);
+                distinct.push_back(p[idx]);
+            }
+        }
+        if (distinct.empty()) return false;
+        std::sort(distinct.begin(), distinct.end(), comp);
+
+        std::unordered_map<std::string, unsigned short> rank;
+        rank.reserve(distinct.size() * 2);
+        for (std::size_t r = 0; r < distinct.size(); ++r)
+            rank.emplace(distinct[r], static_cast<unsigned short>(r));
+        const auto& rank_ref = rank;
+
+        const std::size_t d = distinct.size();
+        const std::size_t chunks = adaptive_parallel_chunks(n);
+        std::vector<std::size_t> local(chunks * d, 0);
+        std::vector<unsigned char> miss(chunks, 0);
+        auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
+            for (std::size_t c = c_lo; c < c_hi; ++c) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                std::size_t* lc = local.data() + c * d;
+                for (std::size_t i = lo; i < hi; ++i) {
+                    const auto it = rank_ref.find(p[i]);
+                    if (it == rank_ref.end()) { miss[c] = 1; break; }
+                    ++lc[it->second];
+                }
+            }
+        };
+        parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+        for (unsigned char v : miss) if (v) return false;
+
+        std::vector<std::size_t> offset(d + 1, 0);
+        for (std::size_t out_rank = 0; out_rank < d; ++out_rank) {
+            std::size_t total = 0;
+            for (std::size_t c = 0; c < chunks; ++c)
+                total += local[c * d + out_rank];
+            offset[out_rank + 1] = offset[out_rank] + total;
+        }
+
+        auto fill_job = [&](std::size_t lo, std::size_t hi) {
+            for (std::size_t out_rank = lo; out_rank < hi; ++out_rank) {
+                std::fill_n(p + offset[out_rank], offset[out_rank + 1] - offset[out_rank], distinct[out_rank]);
+            }
+        };
+        parallel_for_index(std::size_t(0), d, std::size_t(8), fill_job);
+        return true;
+    }
+}
+#endif
 
 
 template <class Field, class T>
@@ -4014,6 +4082,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
         } else {
             if (detail::try_guarded_radix_order_sort(p, n, comp, want_parallel, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (!high_entropy) {
+                if (detail::try_string_value_count_sort_parallel(p, n, comp, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_string_value_count_sort(p, n, comp, false)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_guarded_string_value_count_sort(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_trivial_prefix_key_count_sort_parallel(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
