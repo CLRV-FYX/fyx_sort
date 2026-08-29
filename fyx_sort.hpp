@@ -8146,7 +8146,8 @@ template <class T>
 inline std::size_t adaptive_parallel_radix32_wide_chunks(std::size_t n) {
     ThreadPool& pool = global_pool();
     std::size_t chunks = (n + kParallelThreshold - 1) / kParallelThreshold;
-    const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * 2);
+    const std::size_t per_worker = (n <= (std::size_t(1) << 22)) ? std::size_t(1) : std::size_t(2);
+    const std::size_t max_chunks = std::max<std::size_t>(2, static_cast<std::size_t>(pool.nworkers()) * per_worker);
     if (chunks < 2) chunks = 2;
     if (chunks > max_chunks) chunks = max_chunks;
     (void)sizeof(T);
