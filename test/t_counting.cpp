@@ -469,6 +469,28 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        std::vector<int> v(8192);
+        for (std::size_t i = 0; i < v.size(); ++i)
+            v[i] = static_cast<int>((i < v.size() / 2) ? (i * 2) : ((v.size() - i) * 2 - 1));
+        fd::test_reset_dispatch();
+        fyx::sort(v);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "numeric half-organ zigzag uses arithmetic fill");
+        CHECK(std::is_sorted(v.begin(), v.end()), "numeric half-organ zigzag output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<double> v(8192);
+        for (std::size_t i = 0; i < v.size(); ++i)
+            v[i] = static_cast<double>((i < v.size() / 2) ? (i * 2) : ((v.size() - i) * 2 - 1));
+        fd::test_reset_dispatch();
+        fyx::sort(v);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "floating half-organ zigzag uses arithmetic fill");
+        CHECK(std::is_sorted(v.begin(), v.end()), "floating half-organ zigzag output");
+    }
+    {
+        namespace fd = fyx::detail;
         std::vector<std::string> v(8192);
         for (std::size_t i = 0; i < v.size(); ++i) {
             const std::size_t key = (i % 2 == 0) ? (i / 2) : (v.size() - i / 2);
@@ -479,6 +501,19 @@ int main() {
         CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
               "string interleaved zigzag runs use two-run merge");
         CHECK(std::is_sorted(v.begin(), v.end()), "string interleaved zigzag output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<std::string> v(8192);
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            const std::size_t key = (i < v.size() / 2) ? (i * 2) : ((v.size() - i) * 2 - 1);
+            v[i] = std::to_string(1000000000u + static_cast<unsigned>(key));
+        }
+        fd::test_reset_dispatch();
+        fyx::sort(v);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "string half-organ zigzag uses bitonic two-run merge");
+        CHECK(std::is_sorted(v.begin(), v.end()), "string half-organ zigzag output");
     }
     {
         namespace fd = fyx::detail;

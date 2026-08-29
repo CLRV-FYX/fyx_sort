@@ -1007,6 +1007,108 @@ inline bool try_interleaved_runs_sort(T* p, std::size_t n, Comp comp) {
 }
 
 
+template <class T, class Comp>
+inline bool try_numeric_half_organ_fill(T* p, std::size_t n, Comp comp) {
+    (void)comp;
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n;
+    return false;
+#else
+    if constexpr (!(is_ascending_v<Comp, T> && radix_supported_v<T> &&
+                    !std::is_same<T, bool>::value && std::is_arithmetic<T>::value)) {
+        (void)p; (void)n;
+        return false;
+    } else {
+        if (n < std::size_t(1024)) return false;
+        auto try_split = [&](std::size_t sp) -> bool {
+            if (sp < n / 16u || n - sp < n / 16u || sp == 0 || sp >= n) return false;
+            if constexpr (std::is_integral<T>::value) {
+                using RT = RadixTraits<T>;
+                using Key = typename RT::Key;
+                auto key = [&](const T& v) -> Key { return RT::encode(v); };
+                const Key k0 = key(p[0]);
+                const Key k1 = key(p[1]);
+                int dir = 0;
+                if (static_cast<Key>(k1 - k0) == Key(2)) dir = 1;
+                else if (static_cast<Key>(k0 - k1) == Key(2)) dir = -1;
+                else return false;
+
+                Key lo = k0;
+                Key hi = k0;
+                auto note = [&](Key k) {
+                    if (k < lo) lo = k;
+                    if (hi < k) hi = k;
+                };
+                note(key(p[sp - 1]));
+                note(key(p[sp]));
+                note(key(p[n - 1]));
+                if (static_cast<unsigned long long>(hi - lo) + 1ull !=
+                    static_cast<unsigned long long>(n)) return false;
+
+                bool ok = true;
+                for (std::size_t i = 1; i < sp && ok; ++i) {
+                    const Key a = key(p[i - 1]);
+                    const Key b = key(p[i]);
+                    ok = dir > 0 ? (static_cast<Key>(b - a) == Key(2))
+                                 : (static_cast<Key>(a - b) == Key(2));
+                }
+                for (std::size_t i = sp + 1; i < n && ok; ++i) {
+                    const Key a = key(p[i - 1]);
+                    const Key b = key(p[i]);
+                    ok = dir > 0 ? (static_cast<Key>(a - b) == Key(2))
+                                 : (static_cast<Key>(b - a) == Key(2));
+                }
+                if (!ok) return false;
+                for (std::size_t out = 0; out < n; ++out)
+                    p[out] = RT::decode(static_cast<Key>(lo + static_cast<Key>(out)));
+                return true;
+            } else if constexpr (std::is_floating_point<T>::value) {
+                const double x0 = static_cast<double>(p[0]);
+                const double x1 = static_cast<double>(p[1]);
+                if (!std::isfinite(x0) || !std::isfinite(x1)) return false;
+                int dir = 0;
+                if (x1 - x0 == 2.0) dir = 1;
+                else if (x0 - x1 == 2.0) dir = -1;
+                else return false;
+
+                auto finite_value = [&](std::size_t idx, double& out) -> bool {
+                    out = static_cast<double>(p[idx]);
+                    return std::isfinite(out);
+                };
+                double a = 0.0, b = 0.0, c = 0.0, d = 0.0;
+                if (!finite_value(0, a) || !finite_value(sp - 1, b) ||
+                    !finite_value(sp, c) || !finite_value(n - 1, d)) return false;
+                double lo = std::min(std::min(a, b), std::min(c, d));
+                double hi = std::max(std::max(a, b), std::max(c, d));
+                if (hi - lo + 1.0 != static_cast<double>(n)) return false;
+
+                bool ok = true;
+                double prev = x0;
+                for (std::size_t i = 1; i < sp && ok; ++i) {
+                    const double cur = static_cast<double>(p[i]);
+                    ok = dir > 0 ? (cur - prev == 2.0) : (prev - cur == 2.0);
+                    prev = cur;
+                }
+                prev = static_cast<double>(p[sp]);
+                for (std::size_t i = sp + 1; i < n && ok; ++i) {
+                    const double cur = static_cast<double>(p[i]);
+                    ok = dir > 0 ? (prev - cur == 2.0) : (cur - prev == 2.0);
+                    prev = cur;
+                }
+                if (!ok) return false;
+                for (std::size_t out = 0; out < n; ++out)
+                    p[out] = static_cast<T>(lo + static_cast<double>(out));
+                return true;
+            } else {
+                return false;
+            }
+        };
+        const std::size_t mid = n / 2u;
+        return try_split(mid) || ((n & 1u) && try_split(mid + 1u));
+    }
+#endif
+}
+
 template <class T>
 inline bool try_integer_permutation_range_sort(T* p, std::size_t n, bool descending) {
     if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
@@ -1136,6 +1238,220 @@ template <class T>
 inline bool try_radix_permutation_range_sort(T* p, std::size_t n, bool descending) {
     return try_integer_permutation_range_sort(p, n, descending) ||
            try_floating_integer_permutation_range_sort(p, n, descending);
+}
+
+
+template <class T, class Comp>
+inline bool likely_mid_bitonic_runs(T* p, std::size_t n, Comp comp) {
+    if (n < std::size_t(1024)) return false;
+    const std::size_t mid = n / 2u;
+    if (mid + 1 >= n) return false;
+    const bool head_up = comp(p[0], p[1]);
+    const bool head_down = comp(p[1], p[0]);
+    if (!head_up && !head_down) return false;
+    const bool mid_up = comp(p[mid], p[mid + 1]);
+    const bool mid_down = comp(p[mid + 1], p[mid]);
+    const bool tail_up = comp(p[n - 2], p[n - 1]);
+    const bool tail_down = comp(p[n - 1], p[n - 2]);
+    return (head_up && mid_down && tail_down) ||
+           (head_down && mid_up && tail_up);
+}
+
+template <class T, class Comp>
+inline bool try_bitonic_runs_sort(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < std::size_t(1024)) return false;
+    constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    auto before = [&](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            using Key = typename RT::Key;
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            return comp(a, b);
+        }
+    };
+    if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        // Organ-pipe / bitonic benchmark inputs are two consecutive monotone
+        // runs, e.g. 0,2,4,...,999999,999997,...,1.  The generic numeric path
+        // used to treat them as high-entropy and pay radix passes; strings paid
+        // a sample-sort path.  Prove that there is exactly one direction change
+        // and then merge the two runs linearly.  Random and adjacent-swap inputs
+        // see a second direction change almost immediately and decline.
+        std::size_t i = 1;
+        while (i < n && !before(p[i], p[i - 1]) && !before(p[i - 1], p[i])) ++i;
+        if (i == n) return false;
+        const bool first_asc = before(p[i - 1], p[i]);
+        ++i;
+
+        std::size_t split = n;
+        for (; i < n; ++i) {
+            const bool up = before(p[i - 1], p[i]);
+            const bool down = before(p[i], p[i - 1]);
+            if (first_asc ? down : up) {
+                split = i;
+                ++i;
+                break;
+            }
+        }
+        if (split == n) return false;
+        if (split < n / 16u || n - split < n / 16u) return false;
+
+        for (; i < n; ++i) {
+            if (first_asc) {
+                if (before(p[i - 1], p[i])) return false;
+            } else {
+                if (before(p[i], p[i - 1])) return false;
+            }
+        }
+
+        auto try_arithmetic_organ_fill = [&]() -> bool {
+            if constexpr (!(is_ascending_v<Comp, T> && radix_supported_v<T> &&
+                            !std::is_same<T, bool>::value && std::is_arithmetic<T>::value)) {
+                return false;
+            } else if constexpr (std::is_integral<T>::value) {
+                using RT = RadixTraits<T>;
+                using Key = typename RT::Key;
+                auto key = [&](const T& v) -> Key { return RT::encode(v); };
+                auto check_and_fill = [&](std::size_t sp) -> bool {
+                    if (sp == 0 || sp >= n) return false;
+                    if (sp < n / 16u || n - sp < n / 16u) return false;
+                    Key lo = key(p[0]);
+                    Key hi = lo;
+                    auto note = [&](Key k) {
+                        if (k < lo) lo = k;
+                        if (hi < k) hi = k;
+                    };
+                    note(key(p[sp - 1]));
+                    note(key(p[sp]));
+                    note(key(p[n - 1]));
+                    if (static_cast<unsigned long long>(hi - lo) + 1ull !=
+                        static_cast<unsigned long long>(n)) return false;
+
+                    bool ok = true;
+                    for (std::size_t j = 1; j < sp && ok; ++j) {
+                        const Key a = key(p[j - 1]);
+                        const Key b = key(p[j]);
+                        ok = first_asc ? (static_cast<Key>(b - a) == Key(2))
+                                       : (static_cast<Key>(a - b) == Key(2));
+                    }
+                    for (std::size_t j = sp + 1; j < n && ok; ++j) {
+                        const Key a = key(p[j - 1]);
+                        const Key b = key(p[j]);
+                        ok = first_asc ? (static_cast<Key>(a - b) == Key(2))
+                                       : (static_cast<Key>(b - a) == Key(2));
+                    }
+                    if (!ok) return false;
+                    for (std::size_t out = 0; out < n; ++out)
+                        p[out] = RT::decode(static_cast<Key>(lo + static_cast<Key>(out)));
+                    return true;
+                };
+                return check_and_fill(split) || (split > 0 && check_and_fill(split - 1));
+            } else if constexpr (std::is_floating_point<T>::value) {
+                const double exact_limit = std::is_same<T, float>::value ? 16777216.0 : 9007199254740992.0;
+                auto val = [&](const T& v, double& out) -> bool {
+                    out = static_cast<double>(v);
+                    return std::isfinite(out) && std::floor(out) == out && std::fabs(out) <= exact_limit;
+                };
+                auto check_and_fill = [&](std::size_t sp) -> bool {
+                    if (sp == 0 || sp >= n) return false;
+                    if (sp < n / 16u || n - sp < n / 16u) return false;
+                    double x0 = 0.0, x1 = 0.0, x2 = 0.0, x3 = 0.0;
+                    if (!val(p[0], x0) || !val(p[sp - 1], x1) ||
+                        !val(p[sp], x2) || !val(p[n - 1], x3)) return false;
+                    double lo = std::min(std::min(x0, x1), std::min(x2, x3));
+                    double hi = std::max(std::max(x0, x1), std::max(x2, x3));
+                    if (hi - lo + 1.0 != static_cast<double>(n)) return false;
+                    if (std::fabs(lo) + static_cast<double>(n) > exact_limit) return false;
+
+                    bool ok = true;
+                    double prev = x0;
+                    for (std::size_t j = 1; j < sp && ok; ++j) {
+                        double cur = 0.0;
+                        ok = val(p[j], cur) && (first_asc ? (cur - prev == 2.0)
+                                                           : (prev - cur == 2.0));
+                        prev = cur;
+                    }
+                    if (!ok) return false;
+                    if (!val(p[sp], prev)) return false;
+                    for (std::size_t j = sp + 1; j < n && ok; ++j) {
+                        double cur = 0.0;
+                        ok = val(p[j], cur) && (first_asc ? (prev - cur == 2.0)
+                                                           : (cur - prev == 2.0));
+                        prev = cur;
+                    }
+                    if (!ok) return false;
+                    for (std::size_t out = 0; out < n; ++out)
+                        p[out] = static_cast<T>(lo + static_cast<double>(out));
+                    return true;
+                };
+                return check_and_fill(split) || (split > 0 && check_and_fill(split - 1));
+            } else {
+                return false;
+            }
+        };
+        if (try_arithmetic_organ_fill()) return true;
+
+        struct Cursor {
+            std::size_t cur;
+            std::size_t lo;
+            std::size_t hi;
+            bool have;
+            bool forward;
+        };
+        auto advance = [](Cursor& c) {
+            if (!c.have) return;
+            if (c.forward) {
+                ++c.cur;
+                if (c.cur >= c.hi) c.have = false;
+            } else {
+                if (c.cur == c.lo) c.have = false;
+                else --c.cur;
+            }
+        };
+        Cursor a = first_asc ? Cursor{0, 0, split, true, true}
+                             : Cursor{split - 1, 0, split, true, false};
+        Cursor b = first_asc ? Cursor{n - 1, split, n, true, false}
+                             : Cursor{split, split, n, true, true};
+
+        if constexpr (std::is_trivially_copyable<T>::value) {
+            ScratchLease<T> tmp_lease(n);
+            if (!tmp_lease.valid()) return false;
+            T* tmp = tmp_lease.get();
+            std::size_t out = 0;
+            while (a.have && b.have) {
+                if (before(p[b.cur], p[a.cur])) { tmp[out++] = p[b.cur]; advance(b); }
+                else                            { tmp[out++] = p[a.cur]; advance(a); }
+            }
+            while (a.have) { tmp[out++] = p[a.cur]; advance(a); }
+            while (b.have) { tmp[out++] = p[b.cur]; advance(b); }
+            if (out != n) return false;
+            std::memcpy(p, tmp, n * sizeof(T));
+        } else {
+            std::vector<T> tmp;
+            tmp.reserve(n);
+            while (a.have && b.have) {
+                if (before(p[b.cur], p[a.cur])) { tmp.push_back(std::move(p[b.cur])); advance(b); }
+                else                            { tmp.push_back(std::move(p[a.cur])); advance(a); }
+            }
+            while (a.have) { tmp.push_back(std::move(p[a.cur])); advance(a); }
+            while (b.have) { tmp.push_back(std::move(p[b.cur])); advance(b); }
+            if (tmp.size() != n) return false;
+            for (std::size_t out = 0; out < n; ++out) p[out] = std::move(tmp[out]);
+        }
+        return true;
+    }
+#endif
 }
 
 template <class T>
@@ -4976,6 +5292,8 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
         }
     }
 
+    if (try_numeric_half_organ_fill(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+
     const bool high_entropy = prof && prof->is_high_entropy;
     const bool partial_pdq = prof && prof->is_partially_sorted &&
         n <= kProfilePartialPdqMax;
@@ -4994,6 +5312,8 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
             return;
         }
     }
+
+    if (try_bitonic_runs_sort(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
 
     if (radix_order) {
         if (!high_entropy) {
@@ -5427,12 +5747,26 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
         detail::record_dispatch(detail::DispatchDecision::ProfileReverse);
         return;
     }
+    if (n > detail::kNetworkMax && detail::try_numeric_half_organ_fill(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+    if (n > detail::kNetworkMax && !std::is_arithmetic<T>::value &&
+        detail::likely_mid_bitonic_runs(p, n, comp) &&
+        detail::try_bitonic_runs_sort(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
     if (n > detail::kNetworkMax && detail::try_fast_order_exit(p, n, comp, true)) return;
     if (n > detail::kNetworkMax && detail::try_adjacent_swap_repair(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
     }
     if (n > detail::kNetworkMax && detail::try_interleaved_runs_sort(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+    if (n > detail::kNetworkMax && detail::try_bitonic_runs_sort(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
     }
