@@ -185,6 +185,36 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        auto natural = [](const int& a, const int& b) { return a < b; };
+        std::vector<int> v(4096);
+        std::iota(v.begin(), v.end(), 0);
+        fd::test_reset_dispatch();
+        fyx::sort(v, natural);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::ProfileSorted,
+              "natural comparator sorted fast exit");
+    }
+    {
+        namespace fd = fyx::detail;
+        auto natural = [](const int& a, const int& b) { return a < b; };
+        std::vector<int> v(4096);
+        for (std::size_t i = 0; i < v.size(); ++i) v[i] = static_cast<int>(v.size() - i);
+        fd::test_reset_dispatch();
+        fyx::sort(v, natural);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::ProfileReverse,
+              "natural comparator reverse fast exit");
+        CHECK(std::is_sorted(v.begin(), v.end(), natural), "natural comparator reverse output");
+    }
+    {
+        namespace fd = fyx::detail;
+        auto natural = [](const int& a, const int& b) { return a < b; };
+        std::vector<int> v(4096, 7);
+        fd::test_reset_dispatch();
+        fyx::sort(v, natural);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::ProfileAllEqual,
+              "natural comparator all-equal fast exit");
+    }
+    {
+        namespace fd = fyx::detail;
         std::vector<int> v(200000);
         for (auto& x : v) x = static_cast<int>(rng() % 17) - 8;
         fd::test_reset_dispatch();
@@ -395,6 +425,24 @@ int main() {
         CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
               "long-distance numeric nearly-sorted goes straight to radix");
         CHECK(std::is_sorted(v.begin(), v.end()), "long-distance numeric nearly-sorted output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<double> v((std::size_t(1) << 20) + 17);
+        for (std::size_t i = 0; i < v.size(); ++i)
+            v[i] = static_cast<double>(i);
+        for (std::size_t k = 0; k < v.size() / 100; ++k) {
+            const std::size_t a = static_cast<std::size_t>(rng() % v.size());
+            const std::size_t b = static_cast<std::size_t>(rng() % v.size());
+            std::swap(v[a], v[b]);
+        }
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::On;
+        fyx::sort(v, o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
+              "floating integer-permutation nearly-sorted uses radix permutation fill");
+        CHECK(std::is_sorted(v.begin(), v.end()), "floating integer-permutation nearly-sorted output");
     }
     {
         namespace fd = fyx::detail;

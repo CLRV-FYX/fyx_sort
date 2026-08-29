@@ -5970,6 +5970,130 @@ inline bool try_interleaved_runs_sort(T* p, std::size_t n, Comp comp) {
                 concat = 1;
             }
 
+            auto run_length = [&](std::size_t parity) -> std::size_t {
+                return parity >= n ? std::size_t(0) : ((n - 1 - parity) / 2 + 1);
+            };
+            auto try_concat_reorder = [&](std::size_t first_parity, bool first_forward,
+                                          std::size_t second_parity, bool second_forward) -> bool {
+                const std::size_t first_len = run_length(first_parity);
+                const std::size_t second_len = run_length(second_parity);
+                if (first_len + second_len != n) return false;
+
+                // The common high/low zigzag is "ascending even run" followed by
+                // the odd run read backwards.  Verify that ordered output while
+                // moving it, so strings do not pay an additional full
+                // std::is_sorted pass after millions of moves.  The rarer
+                // backwards-first cases keep the old post-check because their
+                // overwrite-avoiding copy order is not the final output order.
+                bool verified_output_order = false;
+                bool output_ordered = true;
+
+                if constexpr (std::is_trivially_copyable<T>::value) {
+                    if (first_forward) {
+                        ScratchLease<T> tmp_lease(second_len);
+                        if (!tmp_lease.valid() && second_len != 0) return false;
+                        T* tmp = tmp_lease.get();
+                        Cursor s = make_cursor(second_parity, second_forward);
+                        for (std::size_t i = 0; i < second_len; ++i) {
+                            tmp[i] = p[s.cur];
+                            advance(s);
+                        }
+                        Cursor f = make_cursor(first_parity, first_forward);
+                        for (std::size_t out = 0; out < first_len; ++out) {
+                            const std::size_t src = f.cur;
+                            if (out != 0 && before(p[src], p[out - 1])) output_ordered = false;
+                            p[out] = p[src];
+                            advance(f);
+                        }
+                        for (std::size_t i = 0; i < second_len; ++i) {
+                            if (first_len + i != 0 && before(tmp[i], p[first_len + i - 1]))
+                                output_ordered = false;
+                            p[first_len + i] = tmp[i];
+                        }
+                        verified_output_order = true;
+                    } else {
+                        ScratchLease<T> tmp_lease(first_len);
+                        if (!tmp_lease.valid() && first_len != 0) return false;
+                        T* tmp = tmp_lease.get();
+                        Cursor f = make_cursor(first_parity, first_forward);
+                        for (std::size_t i = 0; i < first_len; ++i) {
+                            tmp[i] = p[f.cur];
+                            advance(f);
+                        }
+                        if (second_forward) {
+                            Cursor s = make_cursor(second_parity, !second_forward);
+                            for (std::size_t off = second_len; off-- > 0;) {
+                                p[first_len + off] = p[s.cur];
+                                advance(s);
+                            }
+                        } else {
+                            Cursor s = make_cursor(second_parity, second_forward);
+                            for (std::size_t out = 0; out < second_len; ++out) {
+                                p[first_len + out] = p[s.cur];
+                                advance(s);
+                            }
+                        }
+                        if (first_len != 0)
+                            std::memcpy(p, tmp, first_len * sizeof(T));
+                    }
+                } else {
+                    if (first_forward) {
+                        std::vector<T> tmp;
+                        tmp.reserve(second_len);
+                        Cursor s = make_cursor(second_parity, second_forward);
+                        for (std::size_t i = 0; i < second_len; ++i) {
+                            tmp.push_back(std::move(p[s.cur]));
+                            advance(s);
+                        }
+                        Cursor f = make_cursor(first_parity, first_forward);
+                        for (std::size_t out = 0; out < first_len; ++out) {
+                            const std::size_t src = f.cur;
+                            if (out != 0 && before(p[src], p[out - 1])) output_ordered = false;
+                            if (out != src) p[out] = std::move(p[src]);
+                            advance(f);
+                        }
+                        for (std::size_t i = 0; i < second_len; ++i) {
+                            if (first_len + i != 0 && before(tmp[i], p[first_len + i - 1]))
+                                output_ordered = false;
+                            p[first_len + i] = std::move(tmp[i]);
+                        }
+                        verified_output_order = true;
+                    } else {
+                        std::vector<T> tmp;
+                        tmp.reserve(first_len);
+                        Cursor f = make_cursor(first_parity, first_forward);
+                        for (std::size_t i = 0; i < first_len; ++i) {
+                            tmp.push_back(std::move(p[f.cur]));
+                            advance(f);
+                        }
+                        if (second_forward) {
+                            Cursor s = make_cursor(second_parity, !second_forward);
+                            for (std::size_t off = second_len; off-- > 0;) {
+                                p[first_len + off] = std::move(p[s.cur]);
+                                advance(s);
+                            }
+                        } else {
+                            Cursor s = make_cursor(second_parity, second_forward);
+                            for (std::size_t out = 0; out < second_len; ++out) {
+                                p[first_len + out] = std::move(p[s.cur]);
+                                advance(s);
+                            }
+                        }
+                        for (std::size_t i = 0; i < first_len; ++i)
+                            p[i] = std::move(tmp[i]);
+                    }
+                }
+                if (verified_output_order) {
+                    if (!output_ordered) pdqsort_for_profile_pattern(p, n, comp);
+                } else if (!std::is_sorted(p, p + n, before)) {
+                    pdqsort_for_profile_pattern(p, n, comp);
+                }
+                return true;
+            };
+
+            if (concat == 1 && try_concat_reorder(0, even_forward, 1, odd_forward)) return true;
+            if (concat == 2 && try_concat_reorder(1, odd_forward, 0, even_forward)) return true;
+
             Cursor e = make_cursor(0, even_forward);
             Cursor o = make_cursor(1, odd_forward);
             bool sorted = true;
@@ -6038,6 +6162,138 @@ inline bool try_interleaved_runs_sort(T* p, std::size_t n, Comp comp) {
         return false;
     }
 #endif
+}
+
+
+template <class T>
+inline bool try_integer_permutation_range_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        if (n < kCountingMinN) return false;
+        using RT = RadixTraits<T>;
+        using Key = typename RT::Key;
+        {
+            const std::size_t sample_n = std::min<std::size_t>(n, std::size_t(257));
+            Key smn = RT::encode(p[0]);
+            Key smx = smn;
+            for (std::size_t j = 1; j < sample_n; ++j) {
+                const std::size_t idx = (j * (n - 1)) / (sample_n - 1);
+                const Key k = RT::encode(p[idx]);
+                if (k < smn) smn = k;
+                if (smx < k) smx = k;
+            }
+            const Key sample_span = static_cast<Key>(smx - smn);
+            const unsigned long long limit = static_cast<unsigned long long>(
+                std::min<std::size_t>(n, std::numeric_limits<std::size_t>::max() / 4u)) * 4ull;
+            if (static_cast<unsigned long long>(sample_span) + 1ull > limit)
+                return false;
+        }
+        T mn = p[0], mx = p[0];
+        for (std::size_t i = 1; i < n; ++i) {
+            if (p[i] < mn) mn = p[i];
+            if (mx < p[i]) mx = p[i];
+        }
+        const Key lo = RT::encode(mn);
+        const Key hi = RT::encode(mx);
+        const Key span = static_cast<Key>(hi - lo);
+        if (span == std::numeric_limits<Key>::max()) return false;
+        if (static_cast<unsigned long long>(span) + 1ull != static_cast<unsigned long long>(n))
+            return false;
+
+        const std::size_t words = (n + 63u) / 64u;
+        ScratchLease<std::uint64_t> seen_lease(words);
+        if (!seen_lease.valid()) return false;
+        std::uint64_t* seen = seen_lease.get();
+        std::memset(seen, 0, words * sizeof(std::uint64_t));
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t idx = static_cast<std::size_t>(RT::encode(p[i]) - lo);
+            const std::uint64_t bit = std::uint64_t(1) << (idx & 63u);
+            std::uint64_t& w = seen[idx >> 6];
+            if (w & bit) return false;
+            w |= bit;
+        }
+        if (!descending) {
+            for (std::size_t i = 0; i < n; ++i)
+                p[i] = RT::decode(static_cast<Key>(lo + static_cast<Key>(i)));
+        } else {
+            for (std::size_t i = 0; i < n; ++i)
+                p[i] = RT::decode(static_cast<Key>(hi - static_cast<Key>(i)));
+        }
+        return true;
+    }
+}
+
+
+template <class T>
+inline bool try_floating_integer_permutation_range_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!(std::is_floating_point<T>::value && radix_supported_v<T>)) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        if (n < kCountingMinN) return false;
+        {
+            const std::size_t sample_n = std::min<std::size_t>(n, std::size_t(257));
+            double smn = static_cast<double>(p[0]);
+            double smx = smn;
+            if (!std::isfinite(smn) || std::floor(smn) != smn) return false;
+            for (std::size_t j = 1; j < sample_n; ++j) {
+                const std::size_t idx = (j * (n - 1)) / (sample_n - 1);
+                const double x = static_cast<double>(p[idx]);
+                if (!std::isfinite(x) || std::floor(x) != x) return false;
+                if (x < smn) smn = x;
+                if (smx < x) smx = x;
+            }
+            if (smx - smn + 1.0 > static_cast<double>(n) * 4.0) return false;
+        }
+        double mn = static_cast<double>(p[0]);
+        double mx = mn;
+        if (!std::isfinite(mn)) return false;
+        for (std::size_t i = 1; i < n; ++i) {
+            const double x = static_cast<double>(p[i]);
+            if (!std::isfinite(x)) return false;
+            if (x < mn) mn = x;
+            if (mx < x) mx = x;
+        }
+        if (std::floor(mn) != mn || std::floor(mx) != mx) return false;
+        const double span_d = mx - mn;
+        if (!(span_d >= 0.0) || span_d > static_cast<double>(std::numeric_limits<std::size_t>::max()))
+            return false;
+        const std::size_t span = static_cast<std::size_t>(span_d);
+        if (static_cast<double>(span) != span_d || span != n - 1u) return false;
+
+        const std::size_t words = (n + 63u) / 64u;
+        ScratchLease<std::uint64_t> seen_lease(words);
+        if (!seen_lease.valid()) return false;
+        std::uint64_t* seen = seen_lease.get();
+        std::memset(seen, 0, words * sizeof(std::uint64_t));
+        for (std::size_t i = 0; i < n; ++i) {
+            const double off_d = static_cast<double>(p[i]) - mn;
+            if (!(off_d >= 0.0) || off_d > span_d) return false;
+            const std::size_t idx = static_cast<std::size_t>(off_d);
+            if (static_cast<double>(idx) != off_d) return false;
+            const std::uint64_t bit = std::uint64_t(1) << (idx & 63u);
+            std::uint64_t& w = seen[idx >> 6];
+            if (w & bit) return false;
+            w |= bit;
+        }
+        if (!descending) {
+            for (std::size_t i = 0; i < n; ++i)
+                p[i] = static_cast<T>(mn + static_cast<double>(i));
+        } else {
+            for (std::size_t i = 0; i < n; ++i)
+                p[i] = static_cast<T>(mx - static_cast<double>(i));
+        }
+        return true;
+    }
+}
+
+
+template <class T>
+inline bool try_radix_permutation_range_sort(T* p, std::size_t n, bool descending) {
+    return try_integer_permutation_range_sort(p, n, descending) ||
+           try_floating_integer_permutation_range_sort(p, n, descending);
 }
 
 template <class T>
@@ -9811,6 +10067,8 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
             }
         }
 
+        if (!done)
+            done = try_radix_permutation_range_sort(p, n, descending);
 #if FYX_ENABLE_PARALLEL
         if (!done && prefer_parallel && high_entropy)
             done = try_parallel_radix32_wide_sort(p, n, descending) ||
@@ -9882,6 +10140,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
     if (partial_pdq && !(prof && prof->is_low_cardinality)) {
         if (radix_order) {
             if (try_partially_sorted_local_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+            if (try_radix_permutation_range_sort(p, n, descending)) { record_dispatch(DispatchDecision::Radix); return; }
             // High-entropy nearly-sorted numeric data with long-distance swaps
             // is usually faster on FYX radix than on comparison pdq/patch.
             // Continue into the radix block below instead of committing here.
@@ -9901,6 +10160,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
             if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         }
         if (partial_pdq && try_partially_sorted_local_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+        if (try_radix_permutation_range_sort(p, n, descending)) { record_dispatch(DispatchDecision::Radix); return; }
         if constexpr (radix_type) {
             if (n >= kRadixThreshold || std::is_floating_point<T>::value) {
 #if FYX_ENABLE_PARALLEL
@@ -10340,6 +10600,10 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                 return;
             }
+            if (detail::try_radix_permutation_range_sort(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
             // Numeric long-distance nearly-sorted inputs should not pay the
             // full profile scan plus comparison pdq.  Once adjacent/local
             // repairs decline, send them straight to the radix family.
@@ -10410,6 +10674,10 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                     detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                     return;
                 }
+                if (detail::try_radix_permutation_range_sort(p, n, descending)) {
+                    detail::record_dispatch(detail::DispatchDecision::Radix);
+                    return;
+                }
                 // Numeric nearly-sorted with remote swaps falls through to
                 // radix; adjacent/local repairs have already had first chance.
             } else {
@@ -10454,6 +10722,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
             if (partial_pdq && detail::try_partially_sorted_local_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (detail::try_radix_permutation_range_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
@@ -10481,6 +10750,10 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
 #if FYX_ENABLE_PARALLEL
         if (want_parallel) {
             const bool high_entropy = prof && prof->is_high_entropy;
+            if (detail::try_radix_permutation_range_sort(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
             if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
