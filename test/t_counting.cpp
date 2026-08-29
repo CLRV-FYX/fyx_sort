@@ -470,6 +470,17 @@ int main() {
     {
         namespace fd = fyx::detail;
         std::vector<int> v(8192);
+        std::iota(v.begin(), v.end(), 0);
+        std::reverse(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2));
+        fd::test_reset_dispatch();
+        fyx::sort(v);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "front-reversed organ-pipe zigzag only reverses first half");
+        CHECK(std::is_sorted(v.begin(), v.end()), "front-reversed organ-pipe output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<int> v(8192);
         for (std::size_t i = 0; i < v.size(); ++i)
             v[i] = static_cast<int>((i < v.size() / 2) ? (i * 2) : ((v.size() - i) * 2 - 1));
         fd::test_reset_dispatch();
@@ -501,6 +512,18 @@ int main() {
         CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
               "string interleaved zigzag runs use two-run merge");
         CHECK(std::is_sorted(v.begin(), v.end()), "string interleaved zigzag output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<std::string> v(8192);
+        for (std::size_t i = 0; i < v.size(); ++i)
+            v[i] = std::to_string(1000000000u + static_cast<unsigned>(i));
+        std::reverse(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2));
+        fd::test_reset_dispatch();
+        fyx::sort(v);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "string front-reversed organ-pipe zigzag only reverses first half");
+        CHECK(std::is_sorted(v.begin(), v.end()), "string front-reversed organ-pipe output");
     }
     {
         namespace fd = fyx::detail;

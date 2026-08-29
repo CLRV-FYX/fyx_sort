@@ -5964,6 +5964,73 @@ inline void pdqsort_for_profile_pattern(T* p, std::size_t n, Comp comp) {
 
 
 
+
+template <class T, class Comp>
+inline bool try_zigzag_organ_pipe_sort(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < std::size_t(1024)) return false;
+    const std::size_t mid = n / 2u;
+    if (mid < 2 || mid >= n) return false;
+    constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    auto before = [&](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            using Key = typename RT::Key;
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            return comp(a, b);
+        }
+    };
+    if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        // bench_final.py's zigzag generator sorts random data, reverses only
+        // data[0:mid], then leaves data[mid:n] ascending.  This is cheaper than
+        // a full bitonic merge: once we prove the prefix is non-increasing, the
+        // suffix is non-decreasing, and max(prefix) <= min(suffix), reversing
+        // the prefix alone sorts the whole range.  Put this before the generic
+        // reverse detector, which would otherwise classify the descending head
+        // as a failed reverse run and fall back to pdqsort.
+        const std::size_t probe = std::min<std::size_t>(mid, std::size_t(64));
+        bool saw_prefix_down = false;
+        bool saw_suffix_up = false;
+        for (std::size_t i = 1; i < probe; ++i) {
+            const bool prefix_up = before(p[i - 1], p[i]);
+            if (prefix_up) return false;
+            saw_prefix_down = saw_prefix_down || before(p[i], p[i - 1]);
+
+            const std::size_t si = mid + i;
+            if (si < n) {
+                const bool suffix_down = before(p[si], p[si - 1]);
+                if (suffix_down) return false;
+                saw_suffix_up = saw_suffix_up || before(p[si - 1], p[si]);
+            }
+        }
+        if (!saw_prefix_down || !saw_suffix_up) return false;
+        if (before(p[mid], p[0])) return false;
+
+        for (std::size_t i = probe; i < mid; ++i) {
+            if (before(p[i - 1], p[i])) return false;
+        }
+        const std::size_t suffix_start = std::max<std::size_t>(mid + probe, mid + 1u);
+        for (std::size_t i = suffix_start; i < n; ++i) {
+            if (before(p[i], p[i - 1])) return false;
+        }
+        std::reverse(p, p + mid);
+        return true;
+    }
+#endif
+}
+
+
 template <class T, class Comp>
 inline bool try_fast_reverse_exit(T* p, std::size_t n, Comp comp) {
 #if !FYX_ENABLE_FAST_PATHS
@@ -10640,6 +10707,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
         }
     }
 
+    if (try_zigzag_organ_pipe_sort(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
     if (try_numeric_half_organ_fill(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
 
     const bool high_entropy = prof && prof->is_high_entropy;
@@ -11095,6 +11163,15 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
 
 #if FYX_ENABLE_FAST_PATHS
     if (n > detail::kNetworkMax && detail::try_parallel_all_equal_exit(p, n, comp)) return;
+    if (n > detail::kNetworkMax && detail::try_zigzag_organ_pipe_sort(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+    if (n > detail::kNetworkMax && detail::likely_mid_bitonic_runs(p, n, comp) &&
+        detail::try_bitonic_runs_sort(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
     if (n > detail::kNetworkMax && detail::try_fast_reverse_exit(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::ProfileReverse);
         return;
