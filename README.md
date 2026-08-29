@@ -16,8 +16,8 @@ Chase-Lev 工作窃取线程池、自适应算法调度、稳定排序接口、�
   `fyx::nth_element`，以及指针+长度、迭代器对、容器、`Options`、`extern "C"` ABI 等全部重载形态。
 - **验证环境**：Intel Xeon Ice Lake-SP，2 vCPU，g++ 12.2.0，
   `-O2 -march=native -pthread -Wall -Wextra -Werror`。
-  既有 6 个测试（t_scalar / t_net / t_radix / t_pdq / t_pool / t_deque_race）全绿，
-  新增 `test/t_api.cpp`（837 项断言）全绿。
+  既有内核测试（t_scalar / t_net / t_radix / t_pdq / t_pool / t_deque_race）全绿，
+  公开 API、sample sort 与 counting/string/IPS4o 对比相关测试全绿。
 - **性能数字只看 `BENCHMARKS.md`**（本机实测）。旧文档里那些「1 亿 int 2.5~4 秒」之类的
   营销数字**没有在本环境实测过**，请当作未经证实的参考，不要照搬到你的机器上。
 - **我们能站得住脚的承诺**：在本机上，对测试过的分布，`fyx::sort` **不会比 `std::sort` 慢**，
@@ -41,7 +41,7 @@ Chase-Lev 工作窃取线程池、自适应算法调度、稳定排序接口、�
 std::vector<int> v = {5, 3, 8, 1, 9, 2};
 
 fyx::sort(v);                        // 容器重载
-fyx::sort(v.begin(), v.end());       // 迭代器对
+fyx::sort(v.begin(), v.end());       // 迭代器对；vector/string 等连续迭代器会进入同一指针快路径
 fyx::sort(v.data(), v.size());       // 指针 + 长度
 fyx::sort(v, std::greater<int>());   // 自定义比较器（降序）
 
@@ -68,21 +68,38 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 
 ## 算法与自适应调度
 
-`fyx::sort` 在编译期/运行期自动选择内核（只走它**能证明等价于请求顺序**的路径，
-不做「已排序就直接返回」之类的猜测，避免误判返回乱序）：
+`fyx::sort` 在编译期/运行期自动选择内核。入口处有可用 `FYX_ENABLE_FAST_PATHS` 关闭的快速分布层：
+算术类型全等先用 shifted `memcmp` 证明，字符串大输入全等可并行验证；已排序用一次线性扫描证明后直接返回，逆序可在验证时同步交换以减少第二趟 reversal 成本；
+adjacent-swap zigzag 先用 in-place pair repair 验证并直接交换相邻逆序对；bench_final 风格的“前半反转、后半升序” organ-pipe zigzag 会在 reverse 快速路径之前识别，证明后只反转前半段；局部 sawtooth/小位移 zigzag 先用样本位移预算保护的 bounded insertion repair；half-organ/bitonic zigzag 会先识别前后两个单调 run，连续数值域直接算术填充，固定半幅字符串 organ 形态用半缓冲交错重排，其他对象走线性两 run merge；更一般的交错 zigzag 仍会被识别为偶/奇两个单调 run（四种方向组合），当两个 run 只需串接时改用半缓冲 deinterleave，其他情况再线性 merge。随后统一 profile 层再采样 1024 个元素判断是否值得全量验证；
+当样本显示已排序、逆序、全等或部分有序时，再用一次线性扫描同时验证 monotonicity、等价性、 distinct≤256 上限 与相邻逆序边计数。低基数样本只作为候选信号，
+真正提交前仍由现有计数排序路径完整验证，避免 profile 本身给低基数场景额外增加一趟 O(n) 税。所有提前退出都必须由线性校验证明，
+不会靠猜测返回；明显随机高基数样本会跳过完整 distinct 预检，直接进入 radix / MSD / sample 路径。
 
 | 条件 | 选择的内核 |
 |---|---|
-| 数值类型 + 默认 `<` + `n ≤ 64` | 分支无关 SIMD 双调网络（AVX-512 / AVX2 / SSE4.2 / NEON） |
-| 数值类型 + 默认 `<` + `n > 64` | LSD 基数排序（8 位桶，单趟融合直方图，非临时散射写，稳定） |
-| 数值类型 + 默认 `>` | 基数排序 + 反转 |
-| 其它（自定义比较器 / 非数值类型） | pdqsort（无分支块分区，堆排序兜底） |
-| `stable_sort` 数值升序 | 基数排序（天然稳定） |
-| `stable_sort` 其它 | 自底向上归并排序（稳定） |
+| 数值类型 + 默认 `<`/`>` + `n ≤ 64` | 分支无关 SIMD 双调网络（AVX-512 / AVX2 / SSE4.2 / NEON） |
+| 已排序 / 全等 | 快速分布层或统一 profile 一次验证后直接返回；算术全等优先 shifted `memcmp` |
+| 逆序（非 stable） | 快速分布层可验证时同步交换；否则统一 profile 一次验证后反转 |
+| adjacent-swap / local sawtooth zigzag | adjacent pair 先证明后原地交换；更小块 sawtooth 用样本保护的 bounded insertion repair，随机/低基数样本会快速拒绝 |
+| 前半反转 organ-pipe zigzag | 验证前半非增、后半非降且边界有序后，只反转前半段；避免被 reverse 探测误送 pdqsort |
+| half-organ / bitonic zigzag | 数值连续域验证两半 ±2 步长后直接填充；字符串半幅 organ 可半缓冲交错重排；其他类型验证单转折后线性 merge 两个单调 run |
+| 交错 zigzag 两 run | 验证偶/奇位置各自单调；可串接时半缓冲 deinterleave，重叠时线性 merge |
+| 部分有序（相邻逆序边 ≤ n/64，且规模合理） | adjacent/local repair 先处理；数值默认顺序的长距离 nearlysorted 先检测连续整数/整数值浮点 permutation 并直接填充，否则进入 radix，避免 pdq 比较瓶颈；非数值长距离扰动用 dirty-patch merge，失败才退到 pdqsort；浮点默认顺序使用 radix-key comparator 以保留 NaN / `-0/+0` 总序 |
+| 整数小值域 | 计数排序（O(n + range)）；大输入先用 sample-gated 并行 dense-range count/fill 加速 256-way lowcard |
+| 数值/浮点默认顺序低基数（≤256 radix keys） | radix-key 稀疏计数排序；大输入可并行计数/填充，浮点/32/64-bit 稀疏键先尝试 rank16 direct-map 计数，dense integer range 与浮点 compact prefix direct-map 仍优先处理小值域（O(n)，保留 `-0/+0`/NaN 总序语义） |
+| 任意类型低基数（≤256 等价类） | 压缩计数排序，保留原始对象 payload；`stable_sort` 保持稳定 |
+| 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，SIMD/scalar 直方图，非临时散射写；大规模高熵 32-bit integer random 先走 10/11/11 三趟 wide-key radix，64-bit random 先走 high-prefix radix：`int64/uint64` 在 1M 级别排序 encoded top24、较大输入排序 top26 后修复 tie，`double` 在 1M 级别排序 encoded top36、较大输入保留 top39，并在最后一趟解码；其它 numeric 回退 chunked parallel radix；2-worker/bandwidth-constrained 环境仍保留 MSD-bucket hybrid fallback） |
+| 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀）；低基数字符串在 comparator 模式下也可走 unordered value-count/fill，大输入会并行计数/填充且只对 distinct key 排序 |
+| 自定义比较器但采样等价于自然升/降序的数值或 `std::string` | guarded radix/count/MSD recovery（采样确认 + 最终 `is_sorted(comp)` 校验；高熵 64-bit/`double` comparator 串行路径也可用自适应 high-prefix radix；失败则继续比较排序） |
+| trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
+| 结构体 / 自定义比较器大输入 | 256 路 sample sort（cheap/trivial payload 使用 unrolled Eytzinger 分类；并行 arithmetic comparator fallback 顶层用 64 路 partition + 256 路采样预算以减少 random 数值分类比较；`std::string` fallback 保持 looped classifier + 128K handoff + block scatter；非字符串串行路径单趟 prefix scatter，并行路径分 chunk 计数/散射；低 distinct 算术样本先走 rank16/sparse exact value counting，float/double 256-way comparator 低基数也优先尝试该 exact counter） |
+| `stable_sort` 非低基数通用类型 | 自底向上归并排序（稳定） |
 | `partial_sort` / `nth_element` | 堆 + 内省选择（quickselect） |
 
-并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，
-在 Chase-Lev 工作窃取池上做任务并行分治，合并两路已排序区间。默认 `Auto`。
+并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，`Auto` 默认从约 1,000,000 元素开始启用线程池，并同时检查每个线程至少约 128 KiB 数据；可用环境变量 `FYX_MIN_PARALLEL_SIZE` 覆写最小并行规模。
+高熵数值默认顺序会先尝试 32-bit integer 10/11/11 三趟 wide-key radix（减少一轮全数组 count/scatter，1M 级别用 1 chunk/worker 降低调度/WCB 开销，并在 ≤2M 元素时关闭 NT store 以减少短数组写合并成本；较大输入保留 2 chunks/worker 的粗粒度调度）以及 64-bit high-prefix radix（sample 确认高 prefix 近似唯一后，`int64/uint64` 在 1M 级别只排 encoded top24 key、较大输入排 top26 key，`double` 在 1M 级别排 top36 key、较大输入保留 top39 key，最后一趟 scatter 时直接解码回用户数组，再用单次 cached-prefix 扫描修复相同 prefix 的小桶），用更少全数组 pass 攻击 random 短板；不适用时回到 chunked parallel radix（保留全 pass 快速规划、32-bit/value-buffer 优化，并用 32-bit local hist / 按 key 宽度自适应 chunk 数降低 64-bit recount/cache 压力；64-bit 整数 value-buffer radix 保持 4H2G 实测更稳的 3 chunks/worker；`double` key-buffer 路径最后一趟直接 scatter+decode 回用户数组），2-worker/bandwidth-constrained 环境仍保留 `float` top-byte / 64-bit top16 MSD-bucket hybrid fallback；
+低基数 radix-key 场景走并行 sparse counting；整数 64..65536 小值域会优先走 sample-gated 并行 dense-range count/fill，浮点/32/64-bit 稀疏低基数会先尝试 collision-free rank16 direct-map，浮点小值域也保留 compact prefix direct-map，以避免逐元素 hash probe；通用大输入走并行 sample sort（并行分类、散射和桶递归）；其它中等输入保留任务并行分治，
+归并阶段优先使用 scratch-buffered 并行分块归并，分配失败或不适用时回退到 `std::inplace_merge`。默认 `Auto`。
 
 ---
 
@@ -100,6 +117,11 @@ fyx::sort(v, o);              // 或 fyx::sort(v.begin(), v.end(), o)
 ## 编译期开关（均可选，默认「直接 include 就能用」）
 
 - `FYX_ENABLE_PARALLEL`（默认开；定义 `FYX_DISABLE_PARALLEL` 得到无 `<thread>` 依赖的纯单线程构建）
+- `FYX_ENABLE_FAST_PATHS`（默认开；关闭后禁用入口 sorted/all-equal/reverse/zigzag 快速分布层）
+- `FYX_USE_PDQ_PARTITION`（默认开；控制部分有序/zigzag 的 pdq/两 run 处理）
+- `FYX_USE_STRING_VIEW`（默认开；字符串全等验证使用 `data()+size()`/`char_traits::compare`，避免构造 view/拷贝）
+- `FYX_SAMPLE_SORT_V2`（默认开；保留 sample-sort v2 调整的编译期开关）
+- 运行期环境变量：`FYX_MIN_PARALLEL_SIZE=<元素数>` 可覆写 Auto 并行最小规模。
 - `FYX_DISABLE_AVX512` / `FYX_DISABLE_AVX2` / `FYX_DISABLE_SSE42` / `FYX_DISABLE_NEON`
   （关掉某一档 ISA 的内核；`FYX_DISABLE_SIMD` 一次性关掉全部）
 - `FYX_FORCE_SIMD_HISTOGRAM`（强制使用 AVX-512 冲突检测直方图）
@@ -113,7 +135,7 @@ fyx::sort(v, o);              // 或 fyx::sort(v.begin(), v.end(), o)
 
 ```bash
 ./build.sh
-for t in t_scalar t_net t_radix t_pdq t_pool t_deque_race t_api; do
+for t in t_scalar t_net t_radix t_pdq t_pool t_deque_race t_api t_sample t_counting; do
   g++ -std=c++17 -O2 -march=native -pthread -Wall -Wextra -Werror test/$t.cpp -o /tmp/$t && /tmp/$t
 done
 ```
@@ -121,12 +143,25 @@ done
 `test/t_api.cpp` 覆盖：所有重载形态、`std::sort` / `std::stable_sort` 逐元素比对、
 稳定排序的 (key,idx) 稳定性验证、`partial_sort` / `nth_element` 契约验证、
 `-0`/`+0`/NaN 的浮点全序、以及 `extern "C"` ABI。
+`test/t_counting.cpp` 覆盖低基数整数/字符串/结构体、稀疏 256 distinct、MSD 字符串边界、并行 sample sort 显式路径，以及快速/profile 调度（已排序、逆序、全等、低基数、部分有序、floating repair、front-reversed-organ/adjacent-swap/local-sawtooth/interleaved/half-organ zigzag、长距离 nearlysorted 数值 permutation/radix、高熵 comparator-key）。
 
 ---
 
 ## 性能
 
-见 [`BENCHMARKS.md`](./BENCHMARKS.md) —— 本机实测，不写没跑过的数。
+基础数值 benchmark 见 [`BENCHMARKS.md`](./BENCHMARKS.md)。IPS4o 对比 harness 与完整表格见 [`bench/README_ips4o_compare.md`](./bench/README_ips4o_compare.md)。
+
+在本沙箱（2 vCPU Intel Xeon，GCC 12.2，`-O3 -march=native`）的 IPS4o sequential 与真实 oneTBB parallel 矩阵中，FYX 当前在已跟踪的 7 个分布上全部领先：
+
+| case | FYX seq | IPS4o seq | FYX par | IPS4o par |
+|---|---:|---:|---:|---:|
+| i32 random, 5M | 0.0688s | 0.1299s | 0.0585s | 0.0687s |
+| i32 low distinct 16, 5M | 0.0072s | 0.0184s | 0.0073s | 0.0108s |
+| i64 sparse distinct 256, 3M | 0.0160s | 0.0197s | 0.0103s | 0.0114s |
+| string random len16, 1M | 0.1540s | 0.1970s | 0.0941s | 0.1115s |
+| string low distinct 64, 1M | 0.0212s | 0.0652s | 0.0209s | 0.0378s |
+| struct key distinct 64, 1M | 0.0048s | 0.0052s | 0.0040s | 0.0050s |
+| struct key random, 1M | 0.0138s | 0.0278s | 0.0127s | 0.0142s |
 
 ---
 

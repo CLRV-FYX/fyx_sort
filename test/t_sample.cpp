@@ -1,7 +1,7 @@
 // Sample-sort (Module C) conformance + sanity test.
 // Validates the Eytzinger classifier against brute force, and checks that
-// fyx::sort on strings/structs (which now route through sample_sort) matches
-// std::sort for both high- and low-distinct data (guard on/off paths).
+// explicit sample_sort on strings/structs matches std::sort for both high-
+// and low-distinct data (guard on/off paths).
 #include "../fyx_sort.hpp"
 #include <cstdio>
 #include <vector>
@@ -34,15 +34,16 @@ int main() {
         const unsigned m = 255;
         std::vector<int> s(m);
         for (unsigned i = 0; i < m; ++i) s[i] = static_cast<int>(rng() % 1000000);
-        std::排序(s.begin(), s.end());
+        std::sort(s.begin(), s.end());
         std::vector<int> tree(2 * m + 1);
         build_classifier_tree(tree, s.data(), 1, 0, (int)m - 1, std::less<int>());
         int ok = 1;
         for (int t = 0; t < 20000; ++t) {
             int x = static_cast<int>(rng() % 2000000) - 1000000;
             unsigned a = classify_bucket(x, tree.data(), m, std::less<int>());
+            unsigned au = classify_bucket_256(x, tree.data(), std::less<int>());
             unsigned b = brute_bucket(x, s, std::less<int>());
-            if (a != b) { ok = 0; break; }
+            if (a != b || au != b) { ok = 0; break; }
         }
         CHECK(ok, "classify matches brute force (int)");
     }
@@ -50,23 +51,24 @@ int main() {
         const unsigned m = 255;
         std::vector<std::string> s(m);
         for (unsigned i = 0; i < m; ++i) s[i] = std::to_string(rng() % 100000);
-        std::排序(s.begin(), s.end());
+        std::sort(s.begin(), s.end());
         std::vector<std::string> tree(2 * m + 1);
         build_classifier_tree(tree, s.data(), 1, 0, (int)m - 1, std::less<std::string>());
         int ok = 1;
         for (int t = 0; t < 20000; ++t) {
             std::string x = std::to_string(rng() % 200000);
             unsigned a = classify_bucket(x, tree.data(), m, std::less<std::string>());
+            unsigned au = classify_bucket_256(x, tree.data(), std::less<std::string>());
             unsigned b = brute_bucket(x, s, std::less<std::string>());
-            if (a != b) { ok = 0; break; }
+            if (a != b || au != b) { ok = 0; break; }
         }
         CHECK(ok, "classify matches brute force (string)");
     }
 
     // ---- 2. fyx::sort on strings: high + low distinct --------------------
     auto check_str = [&](const char* tag, const std::vector<std::string>& in) {
-        std::vector<std::string> ref = in; std::排序(ref.begin(), ref.end());
-        std::vector<std::string> got = in; fyx::排序(got);
+        std::vector<std::string> ref = in; std::sort(ref.begin(), ref.end());
+        std::vector<std::string> got = in; fyx::sort(got);
         CHECK(got == ref, tag);
     };
     printf("string sorting (sample path)\n");
@@ -106,8 +108,8 @@ int main() {
         };
         std::vector<Rec> v(300000);
         for (auto& r : v) { r.k = static_cast<int>(rng() % 1000); r.v = static_cast<int>(rng() % 1000); }
-        std::vector<Rec> ref = v; std::排序(ref.begin(), ref.end(), cmp);
-        fyx::排序(v, cmp);
+        std::vector<Rec> ref = v; std::sort(ref.begin(), ref.end(), cmp);
+        fyx::sort(v, cmp);
         CHECK(v == ref, "struct custom comparator");
         // descending
         auto gcmp = [](const Rec& a, const Rec& b) {
@@ -115,20 +117,74 @@ int main() {
             return a.v > b.v;
         };
         std::vector<Rec> v2 = v; std::vector<Rec> ref2 = v2;
-        std::排序(ref2.begin(), ref2.end(), gcmp);
-        fyx::排序(v2, gcmp);
+        std::sort(ref2.begin(), ref2.end(), gcmp);
+        fyx::sort(v2, gcmp);
         CHECK(v2 == ref2, "struct custom comparator descending");
     }
 
-    // ---- 4. performance sketch: sample sort vs pdqsort on strings --------
+    // ---- 4. arithmetic low-cardinality sample fallback -------------------
+    printf("arithmetic low-cardinality sample fallback\n");
+    {
+        auto cmp_i = [](int a, int b) { return a < b; };
+        std::vector<int> v(200000);
+        for (auto& x : v) x = static_cast<int>(rng() % 16) - 8;
+        std::vector<int> ref = v;
+        std::sort(ref.begin(), ref.end(), cmp_i);
+        sample_sort(v.data(), v.data() + v.size(), cmp_i);
+        CHECK(v == ref, "int low-card sample fallback");
+    }
+    {
+        auto cmp_f = [](float a, float b) { return a < b; };
+        std::vector<float> vals(256);
+        for (std::size_t i = 0; i < vals.size(); ++i)
+            vals[i] = static_cast<float>(static_cast<int>(i) - 128) * 0.25f;
+        std::vector<float> v(200000);
+        for (auto& x : v) x = vals[rng() % vals.size()];
+        sample_sort(v.data(), v.data() + v.size(), cmp_f);
+        CHECK(std::is_sorted(v.begin(), v.end(), cmp_f), "float 256-way low-card sample fallback");
+    }
+    {
+        auto cmp_d = [](double a, double b) { return a < b; };
+        std::vector<double> vals(256);
+        for (std::size_t i = 0; i < vals.size(); ++i)
+            vals[i] = static_cast<double>(static_cast<int>(i) - 128) * 0.125;
+        std::vector<double> v(200000);
+        for (auto& x : v) x = vals[rng() % vals.size()];
+        sample_sort(v.data(), v.data() + v.size(), cmp_d);
+        CHECK(std::is_sorted(v.begin(), v.end(), cmp_d), "double 256-way low-card sample fallback");
+    }
+
+#if FYX_ENABLE_PARALLEL
+    // ---- 5. arithmetic parallel sample-sort 64-way top partition ----------
+    printf("arithmetic parallel sample sort\n");
+    {
+        auto cmp_i = [](int a, int b) { return a < b; };
+        std::vector<int> v(300000);
+        for (auto& x : v) x = static_cast<int>(rng());
+        parallel_sample_sort(v.data(), v.data() + v.size(), cmp_i);
+        CHECK(std::is_sorted(v.begin(), v.end(), cmp_i), "int random parallel sample sort");
+    }
+    {
+        auto cmp_d = [](double a, double b) { return a < b; };
+        std::vector<double> vals(256);
+        for (std::size_t i = 0; i < vals.size(); ++i)
+            vals[i] = static_cast<double>(static_cast<int>(i) - 128) * 0.125;
+        std::vector<double> v(300000);
+        for (auto& x : v) x = vals[rng() % vals.size()];
+        parallel_sample_sort(v.data(), v.data() + v.size(), cmp_d);
+        CHECK(std::is_sorted(v.begin(), v.end(), cmp_d), "double low-card parallel sample sort");
+    }
+#endif
+
+    // ---- 6. performance sketch: sample sort vs pdqsort on strings --------
     printf("perf: fyx::sort vs std::sort on strings\n");
     {
         const std::size_t n = 2'000'000;
         std::vector<std::string> v(n);
         for (auto& s : v) { s.resize(16); for (char& c : s) c = (char)('a' + (rng() % 26)); }
         std::vector<std::string> a = v, b = v;
-        auto t0 = std::chrono::steady_clock::now(); fyx::排序(a);
-        auto t1 = std::chrono::steady_clock::now(); std::排序(b.begin(), b.end());
+        auto t0 = std::chrono::steady_clock::now(); fyx::sort(a);
+        auto t1 = std::chrono::steady_clock::now(); std::sort(b.begin(), b.end());
         auto t2 = std::chrono::steady_clock::now();
         double tf = std::chrono::duration<double>(t1 - t0).count();
         double ts = std::chrono::duration<double>(t2 - t1).count();

@@ -47,6 +47,16 @@
 //    FYX_FORCE_SIMD_HISTOGRAM
 //                            force the AVX-512 conflict-detection histogram
 //                            even when the heuristic prefers the scalar one.
+//    FYX_ENABLE_FAST_PATHS   on by default; set to 0 to disable the entry
+//                            sorted/all-equal/reverse/zigzag fast paths.
+//    FYX_USE_PDQ_PARTITION   on by default; controls the partially-sorted and
+//                            interleaved-run pdq/two-run handling.
+//    FYX_USE_STRING_VIEW     on by default; string all-equal probes compare
+//                            string data/size directly without copies.
+//    FYX_SAMPLE_SORT_V2      on by default; keeps sample-sort v2 tuning behind
+//                            an explicit compile-time gate.
+//    FYX_MIN_PARALLEL_SIZE   runtime environment variable: Auto-mode minimum
+//                            element count before launching the thread pool.
 //    FYX_NO_EXCEPTIONS       do not throw; failed allocations degrade to an
 //                            in-place algorithm instead.
 //    FYX_ASSERT(x)           user-supplied assertion hook.
@@ -129,6 +139,23 @@
 // GCC-or-Clang: the two share the GNU attribute / builtin vocabulary.
 #define FYX_GNUC_LIKE (FYX_COMPILER_GCC || FYX_COMPILER_CLANG)
 
+#ifndef FYX_ENABLE_TEST_HOOKS
+#  define FYX_ENABLE_TEST_HOOKS 0
+#endif
+
+#ifndef FYX_ENABLE_FAST_PATHS
+#  define FYX_ENABLE_FAST_PATHS 1
+#endif
+#ifndef FYX_USE_PDQ_PARTITION
+#  define FYX_USE_PDQ_PARTITION 1
+#endif
+#ifndef FYX_USE_STRING_VIEW
+#  define FYX_USE_STRING_VIEW 1
+#endif
+#ifndef FYX_SAMPLE_SORT_V2
+#  define FYX_SAMPLE_SORT_V2 1
+#endif
+
 // ---------------------------------------------------------------------------
 // Operating system
 // ---------------------------------------------------------------------------
@@ -197,8 +224,10 @@
 #include <iterator>
 #include <functional>
 #include <algorithm>
+#include <string>
 #include <vector>
 #include <array>
+#include <unordered_map>
 #include <new>
 
 // ---------------------------------------------------------------------------
@@ -396,10 +425,11 @@ inline constexpr std::size_t kNetworkMax = 64;
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;
 
-/// Sample-sort bucket count and block size (ips4o terminology).
+/// Sample-sort bucket count.  The serial path uses a single prefix scatter;
+/// the parallel path derives chunk blocks from kParallelThreshold.
 inline constexpr std::size_t kSampleBuckets   = 256;
 inline constexpr std::size_t kSampleBlock     = 1024;
-inline constexpr std::size_t kSampleThreshold = 1u << 17;     // 131072
+inline constexpr std::size_t kSampleThreshold = 1u << 15;     // 32768
 
 /// Hard ceiling on pool size.  Guards against absurd hardware_concurrency
 /// values and bounds the per-thread scratch the pool can pin.
