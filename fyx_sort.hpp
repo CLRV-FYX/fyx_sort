@@ -5499,19 +5499,20 @@ inline bool try_dirty_patch_merge(T* p, std::size_t n, Comp comp,
         }
         if (dirty_count == 0) return true;      // already ordered
 
-        // Pass 2: prove the clean subsequence is ordered.  A single scan is
-        // enough for genuine local disorder (every displaced element is pinned
-        // by its own adjacent inversion); anything that is still out of order
-        // afterwards is a block-level displacement, and the displacement merge
-        // below characterises those exactly instead of growing the patch one
-        // pair at a time.
+        // Pass 2+: prove the clean subsequence is ordered.  Two overlapping
+        // swaps can hide an inversion behind a position that the marking pass
+        // dirtied, so a couple of scans are allowed -- but the whole repair has
+        // to stay inside `grow_cap`, which a block-level displacement (where
+        // the patch would have to swallow entire moved runs) cannot do.  Those
+        // shapes fall through to the displacement merge, which characterises
+        // them exactly in two scans instead of growing a patch pair by pair.
         // The repair budget is deliberately tight: a shape that needs the whole
         // range re-marked (a moved block, say) is not a "local disorder" shape,
         // and the displacement merge below handles it in fewer passes than we
         // would spend discovering that here.
         const std::size_t grow_cap = std::min<std::size_t>(max_dirty, dirty_count * 4 + 64);
         bool ordered = false;
-        for (int pass = 0; pass < 1 && !ordered; ++pass) {
+        for (int pass = 0; pass < 3 && !ordered; ++pass) {
             bool changed = false;
             std::size_t prev = n;
             for (std::size_t i = 0; i < n; ++i) {
