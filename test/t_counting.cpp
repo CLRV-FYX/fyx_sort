@@ -360,8 +360,23 @@ int main() {
         o.parallel = fyx::Tri::Off;
         fyx::sort(v, o);
         CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
-              "profile partially-sorted chooses pdqsort");
+              "profile partially-sorted chooses bounded insertion/pdq repair");
         CHECK(std::is_sorted(v.begin(), v.end()), "profile partially-sorted output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<double> v(200000);
+        for (std::size_t i = 0; i < v.size(); ++i)
+            v[i] = static_cast<double>(i);
+        for (std::size_t i = 2000; i + 1 < v.size(); i += 8192)
+            std::swap(v[i], v[i + 1]);
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::Off;
+        fyx::sort(v, o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "floating nearly-sorted keeps radix-order repair dispatch");
+        CHECK(std::is_sorted(v.begin(), v.end()), "floating nearly-sorted output");
     }
     {
         namespace fd = fyx::detail;
@@ -373,6 +388,18 @@ int main() {
         CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
               "interleaved zigzag runs use linear two-run merge");
         CHECK(std::is_sorted(v.begin(), v.end()), "interleaved zigzag output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<int> v(8192);
+        std::iota(v.begin(), v.end(), 0);
+        for (std::size_t i = 0; i + 1 < v.size(); i += 2)
+            std::swap(v[i], v[i + 1]);
+        fd::test_reset_dispatch();
+        fyx::sort(v);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "adjacent-swap zigzag uses two ascending interleaved runs");
+        CHECK(std::is_sorted(v.begin(), v.end()), "adjacent-swap zigzag output");
     }
     {
         namespace fd = fyx::detail;

@@ -380,18 +380,83 @@ inline bool pdq_preferred_order_sample(T* p, std::size_t n, Comp comp) {
 
 
 template <class T, class Comp>
+inline void pdqsort_for_profile_pattern(T* p, std::size_t n, Comp comp);
+
+template <class T, class Comp>
+inline bool try_nearly_sorted_insertion_repair(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < std::size_t(1024)) return false;
+    constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    auto before = [&](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            using Key = typename RT::Key;
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            return comp(a, b);
+        }
+    };
+    if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        // Bounded insertion repair is pdqsort's killer case: adjacent or
+        // short-distance perturbations are fixed in one streaming pass.  If a
+        // supposedly-near input actually contains a long-distance swap, the
+        // partially repaired range is still a permutation; finish it with the
+        // normal profile pdq path instead of returning a corrupted fallback.
+        const std::size_t max_shifts = std::max<std::size_t>(4096, n / 32);
+        std::size_t shifts = 0;
+        for (std::size_t i = 1; i < n; ++i) {
+            if (!before(p[i], p[i - 1])) continue;
+            T v = std::move(p[i]);
+            std::size_t j = i;
+            while (j > 0 && before(v, p[j - 1])) {
+                p[j] = std::move(p[j - 1]);
+                --j;
+                if (++shifts > max_shifts) {
+                    p[j] = std::move(v);
+                    pdqsort_for_profile_pattern(p, n, comp);
+                    return true;
+                }
+            }
+            p[j] = std::move(v);
+        }
+        return true;
+    }
+#endif
+}
+
+
+template <class T, class Comp>
 inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
 #if !FYX_USE_PDQ_PARTITION
     (void)p; (void)n; (void)comp;
     return false;
 #else
     if (n < std::size_t(1024)) return false;
-    constexpr bool radix_order = radix_supported_v<T> &&
+    constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
         (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
-    if constexpr (radix_order && std::is_floating_point<T>::value) {
-        (void)p; (void)n; (void)comp;
-        return false;
-    } else if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+    auto before = [&](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            using Key = typename RT::Key;
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            return comp(a, b);
+        }
+    };
+    if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
         (void)p; (void)n; (void)comp;
         return false;
     } else {
@@ -405,7 +470,7 @@ inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
             }
         };
         for (std::size_t i = 1; i < n; ++i) {
-            if (comp(p[i], p[i - 1])) {
+            if (before(p[i], p[i - 1])) {
                 mark_dirty(i - 1);
                 mark_dirty(i);
                 if (dirty_count > max_dirty) return false;
@@ -416,7 +481,7 @@ inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
         const T* last_clean = nullptr;
         for (std::size_t i = 0; i < n; ++i) {
             if (dirty[i]) continue;
-            if (last_clean && comp(p[i], *last_clean)) return false;
+            if (last_clean && before(p[i], *last_clean)) return false;
             last_clean = p + i;
         }
 
@@ -428,11 +493,11 @@ inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
             if (dirty[i]) patch.push_back(std::move(p[i]));
             else          clean.push_back(std::move(p[i]));
         }
-        std::sort(patch.begin(), patch.end(), comp);
+        std::sort(patch.begin(), patch.end(), before);
         std::size_t ci = 0, pi = 0, out = 0;
         while (ci < clean.size() && pi < patch.size()) {
-            if (comp(patch[pi], clean[ci])) p[out++] = std::move(patch[pi++]);
-            else                           p[out++] = std::move(clean[ci++]);
+            if (before(patch[pi], clean[ci])) p[out++] = std::move(patch[pi++]);
+            else                              p[out++] = std::move(clean[ci++]);
         }
         while (ci < clean.size())  p[out++] = std::move(clean[ci++]);
         while (pi < patch.size())  p[out++] = std::move(patch[pi++]);
@@ -440,7 +505,6 @@ inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
     }
 #endif
 }
-
 
 template <class T, class Comp>
 inline void pdqsort_for_profile_pattern(T* p, std::size_t n, Comp comp) {
@@ -461,6 +525,64 @@ inline void pdqsort_for_profile_pattern(T* p, std::size_t n, Comp comp) {
     } else {
         pdqsort(p, p + n, comp);
     }
+}
+
+
+
+template <class T, class Comp>
+inline bool try_fast_reverse_exit(T* p, std::size_t n, Comp comp) {
+#if !FYX_ENABLE_FAST_PATHS
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < 2) return false;
+    constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    auto before = [&](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            using Key = typename RT::Key;
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            return comp(a, b);
+        }
+    };
+    if constexpr ((std::is_arithmetic<T>::value && sizeof(T) <= 4) ||
+                  !std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        // Require an immediately descending first pair so random/sorted inputs
+        // pay only one or two comparisons before falling back to the normal
+        // detector.  Reverse inputs then verify while swapping, avoiding the
+        // old full proof scan followed by a second reversal pass.
+        if (!before(p[1], p[0]) || before(p[0], p[1])) return false;
+        const std::size_t probe = std::min<std::size_t>(n, 64);
+        for (std::size_t i = 2; i < probe; ++i) {
+            if (before(p[i - 1], p[i])) return false;
+        }
+
+        std::size_t l = 0;
+        std::size_t r = n - 1;
+        while (l < r) {
+            if (l + 1 < n && before(p[l], p[l + 1])) {
+                pdqsort_for_profile_pattern(p, n, comp);
+                return true;
+            }
+            if (r > l + 1 && before(p[r - 1], p[r])) {
+                pdqsort_for_profile_pattern(p, n, comp);
+                return true;
+            }
+            std::iter_swap(p + l, p + r);
+            ++l;
+            --r;
+        }
+        return true;
+    }
+#endif
 }
 
 
@@ -489,73 +611,148 @@ inline bool try_interleaved_runs_sort(T* p, std::size_t n, Comp comp) {
         (void)p; (void)n; (void)comp;
         return false;
     } else {
-        bool even_asc_odd_desc = true;
-        bool even_desc_odd_asc = true;
-        for (std::size_t i = 2; i < n && (even_asc_odd_desc || even_desc_odd_asc); i += 2) {
-            if (before(p[i], p[i - 2])) even_asc_odd_desc = false;
-            if (before(p[i - 2], p[i])) even_desc_odd_asc = false;
+        // Gate this path on a genuinely alternating adjacent pattern.  Nearly
+        // sorted inputs often have monotone even/odd subsequences too, but they
+        // should stay on the pdq/repair path instead of paying a full merge.
+        const std::size_t probe = std::min<std::size_t>(n, std::size_t(257));
+        std::size_t ordered = 0, inv = 0, turns = 0;
+        int prev_dir = 0;
+        for (std::size_t i = 1; i < probe; ++i) {
+            const bool down = before(p[i], p[i - 1]);
+            const bool up = before(p[i - 1], p[i]);
+            if (down) ++inv;
+            if (up || down) ++ordered;
+            const int dir = up ? 1 : (down ? -1 : 0);
+            if (dir != 0) {
+                if (prev_dir != 0 && dir != prev_dir) ++turns;
+                prev_dir = dir;
+            }
         }
-        for (std::size_t i = 3; i < n && (even_asc_odd_desc || even_desc_odd_asc); i += 2) {
-            if (before(p[i - 2], p[i])) even_asc_odd_desc = false;
-            if (before(p[i], p[i - 2])) even_desc_odd_asc = false;
+        if (ordered == 0) return false;
+        if (turns * 10 < ordered * 8) return false;
+        if (inv * 100 < ordered * 20 || inv * 100 > ordered * 80) return false;
+
+        bool even_asc = true, even_desc = true, odd_asc = true, odd_desc = true;
+        const std::size_t stride_probe = std::min<std::size_t>(n, std::size_t(513));
+        for (std::size_t i = 2; i < stride_probe && (even_asc || even_desc); i += 2) {
+            if (before(p[i], p[i - 2])) even_asc = false;
+            if (before(p[i - 2], p[i])) even_desc = false;
         }
-        if (!even_asc_odd_desc && !even_desc_odd_asc) return false;
+        for (std::size_t i = 3; i < stride_probe && (odd_asc || odd_desc); i += 2) {
+            if (before(p[i], p[i - 2])) odd_asc = false;
+            if (before(p[i - 2], p[i])) odd_desc = false;
+        }
+        if ((!even_asc && !even_desc) || (!odd_asc && !odd_desc)) return false;
 
-        std::vector<T> tmp;
-        tmp.reserve(n);
+        struct Cursor {
+            std::size_t cur;
+            bool have;
+            bool forward;
+        };
+        auto make_cursor = [&](std::size_t parity, bool asc) -> Cursor {
+            if (parity >= n) return Cursor{0, false, true};
+            if (asc) return Cursor{parity, true, true};
+            std::size_t last = ((n - 1) & ~std::size_t(1)) | parity;
+            if (last >= n) last -= 2;
+            return Cursor{last, true, false};
+        };
+        auto advance = [&](Cursor& c) {
+            if (c.forward) {
+                c.cur += 2;
+                if (c.cur >= n) c.have = false;
+            } else {
+                if (c.cur >= 2) c.cur -= 2;
+                else { c.have = false; return; }
+            }
+        };
 
-        if (even_asc_odd_desc) {
-            std::size_t e = 0;
-            bool have_even = e < n;
-            std::size_t o = (n < 2) ? 0 : ((n % 2 == 0) ? n - 1 : n - 2);
-            bool have_odd = n >= 2;
-            while (have_even && have_odd) {
-                if (before(p[o], p[e])) {
-                    tmp.push_back(std::move(p[o]));
-                    if (o >= 2) o -= 2; else have_odd = false;
+        auto run_one = [&](bool even_forward, bool odd_forward) -> bool {
+            auto run_first = [&](std::size_t parity, bool forward) -> std::size_t {
+                return make_cursor(parity, forward).cur;
+            };
+            auto run_last = [&](std::size_t parity, bool forward) -> std::size_t {
+                return make_cursor(parity, !forward).cur;
+            };
+            const bool have_even = n >= 1;
+            const bool have_odd = n >= 2;
+            int concat = 0; // 0 = merge, 1 = even then odd, 2 = odd then even
+            if (have_even && have_odd) {
+                const std::size_t ef = run_first(0, even_forward);
+                const std::size_t el = run_last(0, even_forward);
+                const std::size_t of = run_first(1, odd_forward);
+                const std::size_t ol = run_last(1, odd_forward);
+                if (!before(p[of], p[el])) concat = 1;
+                else if (!before(p[ef], p[ol])) concat = 2;
+            } else {
+                concat = 1;
+            }
+
+            Cursor e = make_cursor(0, even_forward);
+            Cursor o = make_cursor(1, odd_forward);
+            bool sorted = true;
+
+            if constexpr (std::is_trivially_copyable<T>::value) {
+                ScratchLease<T> tmp_lease(n);
+                if (!tmp_lease.valid()) return false;
+                T* tmp = tmp_lease.get();
+                std::size_t out = 0;
+                T prev{};
+                bool have_prev = false;
+                auto emit = [&](std::size_t idx) {
+                    const T v = p[idx];
+                    if (have_prev && before(v, prev)) sorted = false;
+                    tmp[out++] = v;
+                    prev = v;
+                    have_prev = true;
+                };
+                auto drain = [&](Cursor& c) { while (c.have) { emit(c.cur); advance(c); } };
+                if (concat == 1) {
+                    drain(e); drain(o);
+                } else if (concat == 2) {
+                    drain(o); drain(e);
                 } else {
-                    tmp.push_back(std::move(p[e]));
-                    e += 2;
-                    have_even = e < n;
+                    while (e.have && o.have) {
+                        if (before(p[o.cur], p[e.cur])) { emit(o.cur); advance(o); }
+                        else                            { emit(e.cur); advance(e); }
+                    }
+                    drain(e); drain(o);
                 }
-            }
-            while (have_even) {
-                tmp.push_back(std::move(p[e]));
-                e += 2;
-                have_even = e < n;
-            }
-            while (have_odd) {
-                tmp.push_back(std::move(p[o]));
-                if (o >= 2) o -= 2; else have_odd = false;
-            }
-        } else {
-            std::size_t e = (n % 2 == 1) ? n - 1 : n - 2;
-            bool have_even = n >= 1;
-            std::size_t o = 1;
-            bool have_odd = o < n;
-            while (have_even && have_odd) {
-                if (before(p[o], p[e])) {
-                    tmp.push_back(std::move(p[o]));
-                    o += 2;
-                    have_odd = o < n;
+                if (out != n || !sorted) return false;
+                std::memcpy(p, tmp, n * sizeof(T));
+                return true;
+            } else {
+                std::vector<T> tmp;
+                tmp.reserve(n);
+                auto emit = [&](std::size_t idx) {
+                    if (!tmp.empty() && before(p[idx], tmp.back())) sorted = false;
+                    tmp.push_back(std::move(p[idx]));
+                };
+                auto drain = [&](Cursor& c) { while (c.have) { emit(c.cur); advance(c); } };
+                if (concat == 1) {
+                    drain(e); drain(o);
+                } else if (concat == 2) {
+                    drain(o); drain(e);
                 } else {
-                    tmp.push_back(std::move(p[e]));
-                    if (e >= 2) e -= 2; else have_even = false;
+                    while (e.have && o.have) {
+                        if (before(p[o.cur], p[e.cur])) { emit(o.cur); advance(o); }
+                        else                            { emit(e.cur); advance(e); }
+                    }
+                    drain(e); drain(o);
                 }
+                if (tmp.size() != n) return false;
+                if (!sorted) {
+                    pdqsort_for_profile_pattern(tmp.data(), n, comp);
+                }
+                for (std::size_t i = 0; i < n; ++i) p[i] = std::move(tmp[i]);
+                return true;
             }
-            while (have_even) {
-                tmp.push_back(std::move(p[e]));
-                if (e >= 2) e -= 2; else have_even = false;
-            }
-            while (have_odd) {
-                tmp.push_back(std::move(p[o]));
-                o += 2;
-                have_odd = o < n;
-            }
-        }
+        };
 
-        for (std::size_t i = 0; i < n; ++i) p[i] = std::move(tmp[i]);
-        return true;
+        if (even_asc && odd_asc)   return run_one(true,  true);
+        if (even_asc && odd_desc)  return run_one(true,  false);
+        if (even_desc && odd_asc)  return run_one(false, true);
+        if (even_desc && odd_desc) return run_one(false, false);
+        return false;
     }
 #endif
 }
@@ -648,7 +845,7 @@ FYX_FORCE_INLINE std::size_t low_card_hash_key(Key k) noexcept {
 inline constexpr std::size_t kProfileMinN            = 1024;
 inline constexpr std::size_t kProfileSampleLimit     = 1024;
 inline constexpr std::size_t kProfilePartialDivisor  = 64;
-inline constexpr std::size_t kProfilePartialPdqMax   = 1u << 20;
+inline constexpr std::size_t kProfilePartialPdqMax   = 64u << 20;
 
 enum class DispatchDecision : unsigned char {
     None = 0,
@@ -2174,7 +2371,7 @@ inline bool try_parallel_radix_high_prefix_value_sort(T* p, std::size_t n, bool 
         } else {
             constexpr unsigned PrefixBytes = PrefixBits / 8;
             constexpr unsigned FirstShift = 64u - PrefixBits;
-            if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+            if (n < (std::size_t(1) << 19) || !parallel_available()) return false;
             if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
 
             ScratchLease<T> tmp_lease(n);
@@ -2621,7 +2818,7 @@ inline bool try_parallel_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bo
             constexpr unsigned Passes = PrefixBits / Bits;
             constexpr unsigned FirstShift = 64u - PrefixBits;
             constexpr std::size_t Buckets = std::size_t(1) << Bits;
-            if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+            if (n < (std::size_t(1) << 19) || !parallel_available()) return false;
             if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
 
             ScratchLease<Key> lease(n * 2);
@@ -2872,7 +3069,7 @@ inline bool try_parallel_radix_sort(T* p, std::size_t n, bool descending, bool a
         // Chunked parallel radix removes the old sort-halves-and-compare-merge
         // fallback for large high-entropy numeric inputs.
         {
-            if (n < (std::size_t(1) << 20) || !parallel_available()) return false;
+            if (n < (std::size_t(1) << 19) || !parallel_available()) return false;
             assume_all_passes = assume_all_passes && radix_sample_all_passes_vary<T>(p, n);
 
             if constexpr ((std::is_integral<T>::value && !std::is_same<T, bool>::value) ||
@@ -4043,6 +4240,136 @@ inline bool try_string_msd_sort_parallel(T* p, std::size_t n, Comp comp, bool de
     }
 }
 
+
+template <class T, unsigned PrefixBits, unsigned Bits>
+inline bool try_serial_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || PrefixBits == 0 || PrefixBits > 64 ||
+                  Bits <= 8 || Bits > 13 || (PrefixBits % Bits) != 0) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        if constexpr (sizeof(Key) != 8) {
+            (void)p; (void)n; (void)descending;
+            return false;
+        } else {
+            if (n < std::size_t(262144)) return false;
+            if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
+            constexpr unsigned Passes = PrefixBits / Bits;
+            constexpr unsigned FirstShift = 64u - PrefixBits;
+            constexpr std::size_t Buckets = std::size_t(1) << Bits;
+
+            ScratchLease<Key> lease(n * 2);
+            if (!lease.valid()) return false;
+            Key* a = lease.get();
+            Key* b = a + n;
+            Key* src = a;
+            Key* dst = b;
+            std::vector<std::uint32_t> count(Buckets);
+            std::vector<std::size_t> pos(Buckets);
+            const bool can_stream = have_nt_stores();
+
+            for (unsigned pi = 0; pi < Passes; ++pi) {
+                const unsigned shift = FirstShift + pi * Bits;
+                if (pi == 0)
+                    radix_count_value_pass_banked_wide<T, Bits>(p, n, shift, count.data());
+                else
+                    radix_count_key_pass_banked_wide<Key, Bits>(src, n, shift, count.data());
+                std::size_t run = 0;
+                for (std::size_t d = 0; d < Buckets; ++d) {
+                    pos[d] = run;
+                    run += count[d];
+                }
+                if (pi == 0) {
+                    radix_scatter_encode_pass_wide<T, Key, Bits>(p, n, src, shift, pos.data(), can_stream);
+                } else if (pi + 1 == Passes) {
+                    radix_scatter_key_decode_pass_wide<T, Key, Bits>(src, n, p, shift, pos.data(), can_stream);
+                } else {
+                    radix_scatter_key_pass_wide<Key, Bits>(src, n, dst, shift, pos.data(), can_stream);
+                    Key* t = src; src = dst; dst = t;
+                }
+            }
+            radix_sort_high_prefix_decoded_ties<T, PrefixBits>(p, n);
+            if (descending) std::reverse(p, p + n);
+            return true;
+        }
+    }
+}
+
+template <class T>
+inline bool try_serial_radix_high_prefix_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using Key = typename RadixTraits<T>::Key;
+        if constexpr (sizeof(Key) != 8) {
+            (void)p; (void)n; (void)descending;
+            return false;
+        } else if constexpr (std::is_same<T, double>::value) {
+            return try_serial_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
+        } else if constexpr (std::is_integral<T>::value && sizeof(T) == 8) {
+            return try_serial_radix_high_prefix_key_sort_wide<T, 33, 11>(p, n, descending);
+        } else {
+            (void)p; (void)n; (void)descending;
+            return false;
+        }
+    }
+}
+
+template <class T>
+inline bool try_serial_radix32_wide_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value &&
+                    radix_supported_v<T> && sizeof(T) == 4)) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using RT = RadixTraits<T>;
+        using Key = typename RT::Key;
+        if (n < std::size_t(262144)) return false;
+        ScratchLease<Key> lease(n * 2);
+        if (!lease.valid()) return false;
+        Key* a = lease.get();
+        Key* b = a + n;
+        auto pass_value = [&](unsigned bits, unsigned shift, Key* out) {
+            const std::size_t buckets = std::size_t(1) << bits;
+            const Key mask = Key(buckets - 1);
+            std::vector<std::uint32_t> count(buckets, 0);
+            std::vector<std::size_t> pos(buckets);
+            for (std::size_t i = 0; i < n; ++i) {
+                const Key k = RT::encode(p[i]);
+                ++count[static_cast<std::size_t>((k >> shift) & mask)];
+            }
+            std::size_t run = 0;
+            for (std::size_t d = 0; d < buckets; ++d) { pos[d] = run; run += count[d]; }
+            for (std::size_t i = 0; i < n; ++i) {
+                const Key k = RT::encode(p[i]);
+                out[pos[static_cast<std::size_t>((k >> shift) & mask)]++] = k;
+            }
+        };
+        auto pass_key = [&](const Key* in, unsigned bits, unsigned shift, auto emit) {
+            const std::size_t buckets = std::size_t(1) << bits;
+            const Key mask = Key(buckets - 1);
+            std::vector<std::uint32_t> count(buckets, 0);
+            std::vector<std::size_t> pos(buckets);
+            for (std::size_t i = 0; i < n; ++i)
+                ++count[static_cast<std::size_t>((in[i] >> shift) & mask)];
+            std::size_t run = 0;
+            for (std::size_t d = 0; d < buckets; ++d) { pos[d] = run; run += count[d]; }
+            for (std::size_t i = 0; i < n; ++i) {
+                const Key k = in[i];
+                emit(pos[static_cast<std::size_t>((k >> shift) & mask)]++, k);
+            }
+        };
+        pass_value(11, 0, a);
+        pass_key(a, 11, 11, [&](std::size_t out, Key k) { b[out] = k; });
+        pass_key(b, 10, 22, [&](std::size_t out, Key k) { p[out] = RT::decode(k); });
+        if (descending) std::reverse(p, p + n);
+        return true;
+    }
+}
+
 #endif // FYX_ENABLE_PARALLEL
 
 // ---------------------------------------------------------------------------
@@ -4201,6 +4528,10 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
         (void)prefer_parallel;
 #endif
 
+#if FYX_ENABLE_PARALLEL
+        if (!done && high_entropy)
+            done = try_serial_radix_high_prefix_sort(p, n, descending);
+#endif
         if (!done) {
             done = radix_sort(p, n);
             if (done && descending) std::reverse(p, p + n);
@@ -4254,9 +4585,10 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
 
     const bool high_entropy = prof && prof->is_high_entropy;
     const bool partial_pdq = prof && prof->is_partially_sorted &&
-        n <= kProfilePartialPdqMax && !(radix_order && std::is_floating_point<T>::value);
+        n <= kProfilePartialPdqMax;
     if (partial_pdq && !(prof && prof->is_low_cardinality)) {
-        pdqsort(p, p + n, comp);
+        if (try_nearly_sorted_insertion_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+        pdqsort_for_profile_pattern(p, n, comp);
         record_dispatch(DispatchDecision::PartialPdq);
         return;
     }
@@ -4267,9 +4599,15 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
             if (try_radix_key_sparse_count_sort(p, n, descending)) { record_dispatch(DispatchDecision::LowCardinality); return; }
             if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         }
-        if (partial_pdq) { pdqsort(p, p + n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
+        if (partial_pdq) { if (try_nearly_sorted_insertion_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; } pdqsort_for_profile_pattern(p, n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
         if constexpr (radix_type) {
             if (n >= kRadixThreshold || std::is_floating_point<T>::value) {
+#if FYX_ENABLE_PARALLEL
+                if (high_entropy && try_serial_radix_high_prefix_sort(p, n, descending)) {
+                    record_dispatch(DispatchDecision::Radix);
+                    return;
+                }
+#endif
                 if (radix_sort(p, n)) {             // returns false only on OOM
                     if (descending) std::reverse(p, p + n);
                     record_dispatch(DispatchDecision::Radix);
@@ -4286,7 +4624,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
             if (try_trivial_prefix_key_count_sort(p, n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
             if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         }
-        if (partial_pdq) { pdqsort(p, p + n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
+        if (partial_pdq) { if (try_nearly_sorted_insertion_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; } pdqsort_for_profile_pattern(p, n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
         if (try_guarded_string_order_sort(p, n, comp, false)) { record_dispatch(DispatchDecision::Radix); return; }
         if (try_string_msd_sort(p, n, comp, descending)) { record_dispatch(DispatchDecision::Radix); return; }
         if (try_trivial_prefix_key_radix_sort(p, n, comp)) { record_dispatch(DispatchDecision::Radix); return; }
@@ -4682,17 +5020,20 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
 
 #if FYX_ENABLE_FAST_PATHS
     if (n > detail::kNetworkMax && detail::try_parallel_all_equal_exit(p, n, comp)) return;
+    if (n > detail::kNetworkMax && detail::try_fast_reverse_exit(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::ProfileReverse);
+        return;
+    }
     if (n > detail::kNetworkMax && detail::try_fast_order_exit(p, n, comp, true)) return;
     if (n > detail::kNetworkMax && detail::try_interleaved_runs_sort(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
     }
     if (n <= detail::kProfilePartialPdqMax && detail::pdq_preferred_order_sample(p, n, comp)) {
-        if constexpr (!std::is_arithmetic<T>::value) {
-            if (detail::try_nearly_sorted_repair(p, n, comp)) {
-                detail::record_dispatch(detail::DispatchDecision::PartialPdq);
-                return;
-            }
+        if (detail::try_nearly_sorted_insertion_repair(p, n, comp) ||
+            detail::try_nearly_sorted_repair(p, n, comp)) {
+            detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+            return;
         }
         detail::pdqsort_for_profile_pattern(p, n, comp);
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
@@ -4717,9 +5058,14 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
     if (want_parallel && n > detail::kNetworkMax) {
         const bool high_entropy = prof && prof->is_high_entropy;
         const bool partial_pdq = prof && prof->is_partially_sorted &&
-            n <= detail::kProfilePartialPdqMax && !(radix_ok && std::is_floating_point<T>::value);
+            n <= detail::kProfilePartialPdqMax;
         if (partial_pdq && !(prof && prof->is_low_cardinality)) {
-            detail::pdqsort(p, p + n, comp);
+            if (detail::try_nearly_sorted_insertion_repair(p, n, comp) ||
+                detail::try_nearly_sorted_repair(p, n, comp)) {
+                detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                return;
+            }
+            detail::pdqsort_for_profile_pattern(p, n, comp);
             detail::record_dispatch(detail::DispatchDecision::PartialPdq);
             return;
         }
@@ -4750,7 +5096,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
-            if (partial_pdq) { detail::pdqsort(p, p + n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (partial_pdq) { if (detail::try_nearly_sorted_insertion_repair(p, n, comp) || detail::try_nearly_sorted_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; } detail::pdqsort_for_profile_pattern(p, n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
             if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
@@ -4765,7 +5111,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 if (detail::try_trivial_prefix_key_count_sort(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
-            if (partial_pdq) { detail::pdqsort(p, p + n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (partial_pdq) { if (detail::try_nearly_sorted_insertion_repair(p, n, comp) || detail::try_nearly_sorted_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; } detail::pdqsort_for_profile_pattern(p, n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
             if (detail::try_guarded_string_order_sort(p, n, comp, want_parallel)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_string_msd_sort_parallel(p, n, comp, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_string_msd_sort(p, n, comp, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }

@@ -69,8 +69,8 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 ## 算法与自适应调度
 
 `fyx::sort` 在编译期/运行期自动选择内核。入口处有可用 `FYX_ENABLE_FAST_PATHS` 关闭的快速分布层：
-算术类型全等先用 shifted `memcmp` 证明，字符串大输入全等可并行验证；已排序/逆序用一次线性扫描验证后直接返回或反转；
-交错 zigzag / organ-pipe 形态会被识别为两个已排序的交错 run，并用线性 merge 生成结果。随后统一 profile 层再采样 1024 个元素判断是否值得全量验证；
+算术类型全等先用 shifted `memcmp` 证明，字符串大输入全等可并行验证；已排序用一次线性扫描证明后直接返回，逆序可在验证时同步交换以减少第二趟 reversal 成本；
+交错 zigzag / organ-pipe / adjacent-swap 形态会被识别为偶/奇两个单调 run（四种方向组合），trivial 数值用 scratch 线性重排，非 trivial 对象保持验证后移动。随后统一 profile 层再采样 1024 个元素判断是否值得全量验证；
 当样本显示已排序、逆序、全等或部分有序时，再用一次线性扫描同时验证 monotonicity、等价性、 distinct≤256 上限 与相邻逆序边计数。低基数样本只作为候选信号，
 真正提交前仍由现有计数排序路径完整验证，避免 profile 本身给低基数场景额外增加一趟 O(n) 税。所有提前退出都必须由线性校验证明，
 不会靠猜测返回；明显随机高基数样本会跳过完整 distinct 预检，直接进入 radix / MSD / sample 路径。
@@ -79,15 +79,15 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 |---|---|
 | 数值类型 + 默认 `<`/`>` + `n ≤ 64` | 分支无关 SIMD 双调网络（AVX-512 / AVX2 / SSE4.2 / NEON） |
 | 已排序 / 全等 | 快速分布层或统一 profile 一次验证后直接返回；算术全等优先 shifted `memcmp` |
-| 逆序（非 stable） | 快速分布层或统一 profile 一次验证后反转 |
-| 交错 zigzag / organ-pipe 两 run | 验证偶/奇位置各自单调后线性 merge |
-| 部分有序（相邻逆序边 ≤ n/64，且规模合理） | pdqsort；浮点默认顺序使用 radix-key comparator 以保留 NaN / `-0/+0` 总序 |
+| 逆序（非 stable） | 快速分布层可验证时同步交换；否则统一 profile 一次验证后反转 |
+| 交错 zigzag / organ-pipe / adjacent-swap 两 run | 验证偶/奇位置各自单调后线性 merge；trivial 数值走 scratch 重排 |
+| 部分有序（相邻逆序边 ≤ n/64，且规模合理） | bounded insertion repair；长距离扰动超预算时退到 pdqsort；浮点默认顺序使用 radix-key comparator 以保留 NaN / `-0/+0` 总序 |
 | 整数小值域 | 计数排序（O(n + range)）；大输入先用 sample-gated 并行 dense-range count/fill 加速 256-way lowcard |
 | 数值/浮点默认顺序低基数（≤256 radix keys） | radix-key 稀疏计数排序；大输入可并行计数/填充，浮点/32/64-bit 稀疏键先尝试 rank16 direct-map 计数，dense integer range 与浮点 compact prefix direct-map 仍优先处理小值域（O(n)，保留 `-0/+0`/NaN 总序语义） |
 | 任意类型低基数（≤256 等价类） | 压缩计数排序，保留原始对象 payload；`stable_sort` 保持稳定 |
 | 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，SIMD/scalar 直方图，非临时散射写；大规模高熵 32-bit integer random 先走 11/11/10 三趟 wide-key radix，64-bit random 先走 high-prefix radix：整数排序 encoded top33 key 后只修复极少 tie，`double` 排序 encoded top39 key 并在最后一趟解码；其它 numeric 回退 chunked parallel radix；2-worker/bandwidth-constrained 环境仍保留 MSD-bucket hybrid fallback） |
 | 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀）；低基数字符串在 comparator 模式下也可走 unordered value-count/fill，大输入会并行计数/填充且只对 distinct key 排序 |
-| 自定义比较器但采样等价于自然升/降序的数值或 `std::string` | guarded radix/count/MSD recovery（采样确认 + 最终 `is_sorted(comp)` 校验；失败则继续比较排序） |
+| 自定义比较器但采样等价于自然升/降序的数值或 `std::string` | guarded radix/count/MSD recovery（采样确认 + 最终 `is_sorted(comp)` 校验；高熵 64-bit/`double` comparator 串行路径也可用 high-prefix radix；失败则继续比较排序） |
 | trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
 | 结构体 / 自定义比较器大输入 | 256 路 sample sort（cheap/trivial payload 使用 unrolled Eytzinger 分类；并行 arithmetic comparator fallback 顶层用 64 路 partition + 256 路采样预算以减少 random 数值分类比较；`std::string` fallback 保持 looped classifier + 128K handoff + block scatter；非字符串串行路径单趟 prefix scatter，并行路径分 chunk 计数/散射；低 distinct 算术样本先走 rank16/sparse exact value counting，float/double 256-way comparator 低基数也优先尝试该 exact counter） |
 | `stable_sort` 非低基数通用类型 | 自底向上归并排序（稳定） |
@@ -140,7 +140,7 @@ done
 `test/t_api.cpp` 覆盖：所有重载形态、`std::sort` / `std::stable_sort` 逐元素比对、
 稳定排序的 (key,idx) 稳定性验证、`partial_sort` / `nth_element` 契约验证、
 `-0`/`+0`/NaN 的浮点全序、以及 `extern "C"` ABI。
-`test/t_counting.cpp` 覆盖低基数整数/字符串/结构体、稀疏 256 distinct、MSD 字符串边界、并行 sample sort 显式路径，以及快速/profile 调度（已排序、逆序、全等、低基数、部分有序、interleaved zigzag、高熵 comparator-key）。
+`test/t_counting.cpp` 覆盖低基数整数/字符串/结构体、稀疏 256 distinct、MSD 字符串边界、并行 sample sort 显式路径，以及快速/profile 调度（已排序、逆序、全等、低基数、部分有序、floating repair、interleaved/adjacent-swap zigzag、高熵 comparator-key）。
 
 ---
 
