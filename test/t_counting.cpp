@@ -512,7 +512,7 @@ int main() {
         fd::test_reset_dispatch();
         fyx::sort(v);
         CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
-              "string half-organ zigzag uses bitonic two-run merge");
+              "string half-organ zigzag uses half-buffer reorder");
         CHECK(std::is_sorted(v.begin(), v.end()), "string half-organ zigzag output");
     }
     {

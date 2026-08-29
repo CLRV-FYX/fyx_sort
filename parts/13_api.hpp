@@ -1241,6 +1241,50 @@ inline bool try_radix_permutation_range_sort(T* p, std::size_t n, bool descendin
 }
 
 
+
+template <class T, class Comp>
+inline bool try_string_half_organ_reorder(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if constexpr (!std::is_same<T, std::string>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        if (n < std::size_t(1024) || (n & 1u)) return false;
+        const std::size_t half = n / 2u;
+        if (!comp(p[0], p[1]) || !comp(p[half + 1], p[half]) ||
+            !comp(p[n - 1], p[n - 2])) return false;
+
+        const std::size_t probe = std::min<std::size_t>(half, 64u);
+        for (std::size_t i = 1; i < probe; ++i) {
+            if (comp(p[i], p[i - 1])) return false;
+            if (comp(p[half + i - 1], p[half + i])) return false;
+        }
+        for (std::size_t i = 0; i + 1 < probe; ++i) {
+            const std::string& a = p[i];
+            const std::string& b = p[n - 1u - i];
+            if (comp(b, a) || comp(p[i + 1], b)) return false;
+        }
+
+        std::vector<std::string> tmp;
+        tmp.reserve(half);
+        for (std::size_t i = 0; i < half; ++i)
+            tmp.push_back(std::move(p[n - 1u - i]));
+        for (std::size_t i = half; i-- > 0;) {
+            const std::size_t dst = i * 2u;
+            if (dst != i) p[dst] = std::move(p[i]);
+        }
+        for (std::size_t i = 0; i < half; ++i)
+            p[i * 2u + 1u] = std::move(tmp[i]);
+        if (!std::is_sorted(p, p + n, comp))
+            pdqsort_for_profile_pattern(p, n, comp);
+        return true;
+    }
+#endif
+}
+
 template <class T, class Comp>
 inline bool likely_mid_bitonic_runs(T* p, std::size_t n, Comp comp) {
     if (n < std::size_t(1024)) return false;
@@ -1438,16 +1482,9 @@ inline bool try_bitonic_runs_sort(T* p, std::size_t n, Comp comp) {
             if (out != n) return false;
             std::memcpy(p, tmp, n * sizeof(T));
         } else {
-            std::vector<T> tmp;
-            tmp.reserve(n);
-            while (a.have && b.have) {
-                if (before(p[b.cur], p[a.cur])) { tmp.push_back(std::move(p[b.cur])); advance(b); }
-                else                            { tmp.push_back(std::move(p[a.cur])); advance(a); }
-            }
-            while (a.have) { tmp.push_back(std::move(p[a.cur])); advance(a); }
-            while (b.have) { tmp.push_back(std::move(p[b.cur])); advance(b); }
-            if (tmp.size() != n) return false;
-            for (std::size_t out = 0; out < n; ++out) p[out] = std::move(tmp[out]);
+            if (first_asc) std::reverse(p + split, p + n);
+            else           std::reverse(p, p + split);
+            std::inplace_merge(p, p + split, p + n, before);
         }
         return true;
     }
@@ -5748,6 +5785,10 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
         return;
     }
     if (n > detail::kNetworkMax && detail::try_numeric_half_organ_fill(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+    if (n > detail::kNetworkMax && detail::try_string_half_organ_reorder(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
     }
