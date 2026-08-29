@@ -70,7 +70,7 @@ MSVC：`cl /EHsc /std:c++17 /O2 /arch:AVX2 your_program.cpp`
 
 `fyx::sort` 在编译期/运行期自动选择内核。入口处有可用 `FYX_ENABLE_FAST_PATHS` 关闭的快速分布层：
 算术类型全等先用 shifted `memcmp` 证明，字符串大输入全等可并行验证；已排序用一次线性扫描证明后直接返回，逆序可在验证时同步交换以减少第二趟 reversal 成本；
-adjacent-swap zigzag 先用 in-place pair repair 验证并直接交换相邻逆序对；half-organ/bitonic zigzag 会先识别前后两个单调 run，连续数值域直接算术填充，固定半幅字符串 organ 形态用半缓冲交错重排，其他对象走线性两 run merge；更一般的交错 zigzag 仍会被识别为偶/奇两个单调 run（四种方向组合），当两个 run 只需串接时改用半缓冲 deinterleave，其他情况再线性 merge。随后统一 profile 层再采样 1024 个元素判断是否值得全量验证；
+adjacent-swap zigzag 先用 in-place pair repair 验证并直接交换相邻逆序对；局部 sawtooth/小位移 zigzag 先用样本位移预算保护的 bounded insertion repair；half-organ/bitonic zigzag 会先识别前后两个单调 run，连续数值域直接算术填充，固定半幅字符串 organ 形态用半缓冲交错重排，其他对象走线性两 run merge；更一般的交错 zigzag 仍会被识别为偶/奇两个单调 run（四种方向组合），当两个 run 只需串接时改用半缓冲 deinterleave，其他情况再线性 merge。随后统一 profile 层再采样 1024 个元素判断是否值得全量验证；
 当样本显示已排序、逆序、全等或部分有序时，再用一次线性扫描同时验证 monotonicity、等价性、 distinct≤256 上限 与相邻逆序边计数。低基数样本只作为候选信号，
 真正提交前仍由现有计数排序路径完整验证，避免 profile 本身给低基数场景额外增加一趟 O(n) 税。所有提前退出都必须由线性校验证明，
 不会靠猜测返回；明显随机高基数样本会跳过完整 distinct 预检，直接进入 radix / MSD / sample 路径。
@@ -80,7 +80,7 @@ adjacent-swap zigzag 先用 in-place pair repair 验证并直接交换相邻逆�
 | 数值类型 + 默认 `<`/`>` + `n ≤ 64` | 分支无关 SIMD 双调网络（AVX-512 / AVX2 / SSE4.2 / NEON） |
 | 已排序 / 全等 | 快速分布层或统一 profile 一次验证后直接返回；算术全等优先 shifted `memcmp` |
 | 逆序（非 stable） | 快速分布层可验证时同步交换；否则统一 profile 一次验证后反转 |
-| adjacent-swap zigzag | 先证明仅交换不重叠相邻逆序对即可全局有序，dense pair 形态无额外索引表、直接 in-place swap |
+| adjacent-swap / local sawtooth zigzag | adjacent pair 先证明后原地交换；更小块 sawtooth 用样本保护的 bounded insertion repair，随机/低基数样本会快速拒绝 |
 | half-organ / bitonic zigzag | 数值连续域验证两半 ±2 步长后直接填充；字符串半幅 organ 可半缓冲交错重排；其他类型验证单转折后线性 merge 两个单调 run |
 | 交错 zigzag 两 run | 验证偶/奇位置各自单调；可串接时半缓冲 deinterleave，重叠时线性 merge |
 | 部分有序（相邻逆序边 ≤ n/64，且规模合理） | adjacent/local repair 先处理；数值默认顺序的长距离 nearlysorted 先检测连续整数/整数值浮点 permutation 并直接填充，否则进入 radix，避免 pdq 比较瓶颈；非数值长距离扰动用 dirty-patch merge，失败才退到 pdqsort；浮点默认顺序使用 radix-key comparator 以保留 NaN / `-0/+0` 总序 |
@@ -142,7 +142,7 @@ done
 `test/t_api.cpp` 覆盖：所有重载形态、`std::sort` / `std::stable_sort` 逐元素比对、
 稳定排序的 (key,idx) 稳定性验证、`partial_sort` / `nth_element` 契约验证、
 `-0`/`+0`/NaN 的浮点全序、以及 `extern "C"` ABI。
-`test/t_counting.cpp` 覆盖低基数整数/字符串/结构体、稀疏 256 distinct、MSD 字符串边界、并行 sample sort 显式路径，以及快速/profile 调度（已排序、逆序、全等、低基数、部分有序、floating repair、adjacent-swap/interleaved/half-organ zigzag、长距离 nearlysorted 数值 permutation/radix、高熵 comparator-key）。
+`test/t_counting.cpp` 覆盖低基数整数/字符串/结构体、稀疏 256 distinct、MSD 字符串边界、并行 sample sort 显式路径，以及快速/profile 调度（已排序、逆序、全等、低基数、部分有序、floating repair、adjacent-swap/local-sawtooth/interleaved/half-organ zigzag、长距离 nearlysorted 数值 permutation/radix、高熵 comparator-key）。
 
 ---
 

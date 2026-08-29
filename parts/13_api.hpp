@@ -435,6 +435,156 @@ inline bool try_nearly_sorted_insertion_repair(T* p, std::size_t n, Comp comp) {
 }
 
 
+
+template <class T, class Comp>
+inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < std::size_t(1024)) return false;
+    constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    auto before = [&](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            using Key = typename RT::Key;
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            return comp(a, b);
+        }
+    };
+    if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value ||
+                  !std::is_copy_constructible<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        // Local zigzag/sawtooth generators are not just disjoint adjacent swaps:
+        // examples such as [0,3,1,2, 4,7,5,6, ...] need two tiny insertions per
+        // block.  A full radix/sample pass is much slower, while ordinary random
+        // data would make insertion explode.  Sort a small copied prefix first;
+        // only if its displacement budget is tiny do we repair the real range.
+        const std::size_t sample_n = std::min<std::size_t>(n, std::size_t(4096));
+        std::size_t inv = 0, ordered = 0, turns = 0;
+        int prev_dir = 0;
+        for (std::size_t i = 1; i < sample_n; ++i) {
+            const bool down = before(p[i], p[i - 1]);
+            const bool up = before(p[i - 1], p[i]);
+            if (down) ++inv;
+            if (up || down) ++ordered;
+            const int dir = up ? 1 : (down ? -1 : 0);
+            if (dir != 0) {
+                if (prev_dir != 0 && dir != prev_dir) ++turns;
+                prev_dir = dir;
+            }
+        }
+        if (ordered == 0 || inv == 0) return false;
+        if (inv * 100u < ordered * 8u) return false;
+
+        // Low-cardinality random data can also have many local inversions, but
+        // counting sort owns it; avoid paying a doomed insertion probe there.
+        if constexpr (std::is_arithmetic<T>::value && !std::is_same<T, bool>::value) {
+            constexpr std::size_t Cap = 512;
+            constexpr std::size_t Mask = Cap - 1;
+            std::array<std::uint64_t, Cap> seen{};
+            std::array<unsigned char, Cap> used{};
+            std::size_t distinct = 0;
+            const std::size_t dn = std::min<std::size_t>(sample_n, std::size_t(512));
+            for (std::size_t i = 0; i < dn; ++i) {
+                std::uint64_t key = 0;
+                if constexpr (radix_order) {
+                    key = static_cast<std::uint64_t>(RadixTraits<T>::encode(p[i]));
+                } else {
+                    std::memcpy(&key, &p[i], sizeof(T));
+                }
+                std::uint64_t hbits = key;
+                hbits ^= hbits >> 33;
+                hbits *= 0xff51afd7ed558ccdULL;
+                hbits ^= hbits >> 33;
+                std::size_t h = static_cast<std::size_t>(hbits) & Mask;
+                for (;;) {
+                    if (!used[h]) {
+                        used[h] = 1;
+                        seen[h] = key;
+                        ++distinct;
+                        break;
+                    }
+                    if (seen[h] == key) break;
+                    h = (h + 1u) & Mask;
+                }
+            }
+            if (distinct <= 64u) return false;
+        } else if constexpr (std::is_same<T, std::string>::value) {
+            std::vector<std::string> distinct;
+            distinct.reserve(129);
+            const std::size_t dn = std::min<std::size_t>(sample_n, std::size_t(512));
+            for (std::size_t i = 0; i < dn; ++i) {
+                bool found = false;
+                for (const auto& s : distinct) {
+                    if (s == p[i]) { found = true; break; }
+                }
+                if (!found) {
+                    distinct.push_back(p[i]);
+                    if (distinct.size() > 128u) break;
+                }
+            }
+            if (distinct.size() <= 64u) return false;
+        }
+
+        std::vector<T> probe(p, p + sample_n);
+        const std::size_t sample_cap = sample_n;
+        std::size_t sample_shifts = 0;
+        for (std::size_t i = 1; i < sample_n; ++i) {
+            if (!before(probe[i], probe[i - 1])) continue;
+            T v = std::move(probe[i]);
+            std::size_t j = i;
+            while (j > 0 && before(v, probe[j - 1])) {
+                probe[j] = std::move(probe[j - 1]);
+                --j;
+                if (++sample_shifts > sample_cap) {
+                    probe[j] = std::move(v);
+                    return false;
+                }
+            }
+            probe[j] = std::move(v);
+        }
+        if (!std::is_sorted(probe.begin(), probe.end(), before)) return false;
+
+        const std::size_t scale = (n + sample_n - 1u) / sample_n;
+        const std::size_t scaled = (sample_shifts + 1u > std::numeric_limits<std::size_t>::max() / scale)
+            ? std::numeric_limits<std::size_t>::max()
+            : (sample_shifts + 1u) * scale;
+        const std::size_t shift_cap = n > std::numeric_limits<std::size_t>::max() / 2u
+            ? std::numeric_limits<std::size_t>::max()
+            : n * 2u;
+        const std::size_t budget = scaled > std::numeric_limits<std::size_t>::max() / 6u
+            ? std::numeric_limits<std::size_t>::max()
+            : scaled * 6u;
+        const std::size_t max_shifts = std::max<std::size_t>(std::size_t(4096),
+            std::min<std::size_t>(shift_cap, budget));
+        std::size_t shifts = 0;
+        for (std::size_t i = 1; i < n; ++i) {
+            if (!before(p[i], p[i - 1])) continue;
+            T v = std::move(p[i]);
+            std::size_t j = i;
+            while (j > 0 && before(v, p[j - 1])) {
+                p[j] = std::move(p[j - 1]);
+                --j;
+                if (++shifts > max_shifts) {
+                    p[j] = std::move(v);
+                    return false;
+                }
+            }
+            p[j] = std::move(v);
+        }
+        return true;
+    }
+#endif
+}
+
 template <class T, class Comp>
 inline bool try_adjacent_swap_repair(T* p, std::size_t n, Comp comp) {
 #if !FYX_USE_PDQ_PARTITION
@@ -613,6 +763,7 @@ inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
     return false;
 #else
     if (try_adjacent_swap_repair(p, n, comp)) return true;
+    if (try_bounded_insertion_repair(p, n, comp)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
     return false;
 #endif
@@ -625,6 +776,7 @@ inline bool try_partially_sorted_repair(T* p, std::size_t n, Comp comp) {
     return false;
 #else
     if (try_adjacent_swap_repair(p, n, comp)) return true;
+    if (try_bounded_insertion_repair(p, n, comp)) return true;
     if (try_nearly_sorted_repair(p, n, comp)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
     return false;
@@ -5276,7 +5428,8 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
 
 #if FYX_ENABLE_PARALLEL
         if (!done && high_entropy)
-            done = try_serial_radix_high_prefix_sort(p, n, descending);
+            done = try_serial_radix32_wide_sort(p, n, descending) ||
+                   try_serial_radix_high_prefix_sort(p, n, descending);
 #endif
         if (!done) {
             done = radix_sort(p, n);
@@ -5363,6 +5516,10 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
         if constexpr (radix_type) {
             if (n >= kRadixThreshold || std::is_floating_point<T>::value) {
 #if FYX_ENABLE_PARALLEL
+                if (high_entropy && try_serial_radix32_wide_sort(p, n, descending)) {
+                    record_dispatch(DispatchDecision::Radix);
+                    return;
+                }
                 if (high_entropy && try_serial_radix_high_prefix_sort(p, n, descending)) {
                     record_dispatch(DispatchDecision::Radix);
                     return;
@@ -5800,6 +5957,10 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
     }
     if (n > detail::kNetworkMax && detail::try_fast_order_exit(p, n, comp, true)) return;
     if (n > detail::kNetworkMax && detail::try_adjacent_swap_repair(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+    if (n > detail::kNetworkMax && detail::try_bounded_insertion_repair(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
     }

@@ -517,6 +517,36 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        std::vector<int> v(8192);
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            const std::size_t block = i / 4;
+            const std::size_t r = i & 3u;
+            const std::size_t vals[4] = {block * 4, block * 4 + 3, block * 4 + 1, block * 4 + 2};
+            v[i] = static_cast<int>(vals[r]);
+        }
+        fd::test_reset_dispatch();
+        fyx::sort(v);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "local sawtooth zigzag uses bounded insertion repair");
+        CHECK(std::is_sorted(v.begin(), v.end()), "local sawtooth zigzag output");
+    }
+    {
+        namespace fd = fyx::detail;
+        std::vector<std::string> v(8192);
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            const std::size_t block = i / 4;
+            const std::size_t r = i & 3u;
+            const std::size_t vals[4] = {block * 4, block * 4 + 3, block * 4 + 1, block * 4 + 2};
+            v[i] = std::to_string(1000000000u + static_cast<unsigned>(vals[r]));
+        }
+        fd::test_reset_dispatch();
+        fyx::sort(v);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "string local sawtooth zigzag uses bounded insertion repair");
+        CHECK(std::is_sorted(v.begin(), v.end()), "string local sawtooth zigzag output");
+    }
+    {
+        namespace fd = fyx::detail;
         struct Rec {
             int key;
             int payload;
