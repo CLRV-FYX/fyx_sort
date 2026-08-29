@@ -481,8 +481,15 @@ inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
                 prev_dir = dir;
             }
         }
+        // The density of adjacent inversions says nothing about how much work
+        // the repair is: one percent of the positions moved a few dozen places
+        // apart is cheaper to insert than a zigzag that needs every second
+        // element nudged, yet it looks far less "disordered" by inversion
+        // count.  Only require that something is out of order and let the
+        // sampled shift budget below decide -- it measures displacement, which
+        // is what insertion actually pays for.  Random input still bails there
+        // after a couple of thousand shifts.
         if (ordered == 0 || inv == 0) return false;
-        if (inv * 100u < ordered * 8u) return false;
 
         // Low-cardinality random data can also have many local inversions, but
         // counting sort owns it; avoid paying a doomed insertion probe there.
