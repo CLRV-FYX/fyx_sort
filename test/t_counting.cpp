@@ -380,6 +380,24 @@ int main() {
     }
     {
         namespace fd = fyx::detail;
+        std::vector<std::int32_t> v((std::size_t(1) << 20) + 17);
+        for (auto& x : v) x = static_cast<std::int32_t>(rng());
+        std::sort(v.begin(), v.end());
+        for (std::size_t k = 0; k < v.size() / 100; ++k) {
+            const std::size_t a = static_cast<std::size_t>(rng() % v.size());
+            const std::size_t b = static_cast<std::size_t>(rng() % v.size());
+            std::swap(v[a], v[b]);
+        }
+        fd::test_reset_dispatch();
+        fyx::Options o;
+        o.parallel = fyx::Tri::On;
+        fyx::sort(v, o);
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
+              "long-distance numeric nearly-sorted goes straight to radix");
+        CHECK(std::is_sorted(v.begin(), v.end()), "long-distance numeric nearly-sorted output");
+    }
+    {
+        namespace fd = fyx::detail;
         std::vector<int> v(8192);
         for (std::size_t i = 0; i < v.size(); ++i)
             v[i] = static_cast<int>((i % 2 == 0) ? (i / 2) : (v.size() - i / 2));
@@ -398,7 +416,7 @@ int main() {
         fd::test_reset_dispatch();
         fyx::sort(v);
         CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
-              "adjacent-swap zigzag uses two ascending interleaved runs");
+              "adjacent-swap zigzag uses in-place pair repair");
         CHECK(std::is_sorted(v.begin(), v.end()), "adjacent-swap zigzag output");
     }
     {

@@ -407,12 +407,13 @@ inline bool try_nearly_sorted_insertion_repair(T* p, std::size_t n, Comp comp) {
         (void)p; (void)n; (void)comp;
         return false;
     } else {
-        // Bounded insertion repair is pdqsort's killer case: adjacent or
-        // short-distance perturbations are fixed in one streaming pass.  If a
-        // supposedly-near input actually contains a long-distance swap, the
-        // partially repaired range is still a permutation; finish it with the
-        // normal profile pdq path instead of returning a corrupted fallback.
-        const std::size_t max_shifts = std::max<std::size_t>(4096, n / 32);
+        // Bounded insertion repair is pdqsort's killer case for genuinely
+        // local disorder.  Long-distance random swaps look "nearly sorted" by
+        // adjacent-inversion count, but insertion would slowly bubble a remote
+        // element across a huge clean run.  Stop early and let the patch/merge
+        // repair below handle that shape; callers fall back to pdqsort if the
+        // patch proof rejects the partially repaired permutation.
+        const std::size_t max_shifts = std::max<std::size_t>(4096, n / 1024);
         std::size_t shifts = 0;
         for (std::size_t i = 1; i < n; ++i) {
             if (!before(p[i], p[i - 1])) continue;
@@ -423,11 +424,96 @@ inline bool try_nearly_sorted_insertion_repair(T* p, std::size_t n, Comp comp) {
                 --j;
                 if (++shifts > max_shifts) {
                     p[j] = std::move(v);
-                    pdqsort_for_profile_pattern(p, n, comp);
-                    return true;
+                    return false;
                 }
             }
             p[j] = std::move(v);
+        }
+        return true;
+    }
+#endif
+}
+
+
+template <class T, class Comp>
+inline bool try_adjacent_swap_repair(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < std::size_t(1024)) return false;
+    constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    auto before = [&](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            using Key = typename RT::Key;
+            const Key ka = RT::encode(a);
+            const Key kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            return comp(a, b);
+        }
+    };
+    if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        // Pair-swapped/adjacent-zigzag inputs are common in adversarial suites:
+        // [1,0,3,2,...] or the same shape with strings.  The existing
+        // interleaved-run merge sorted them correctly, but paid for a full
+        // temporary array and (for strings) millions of extra moves.  Prove in
+        // one logical scan that swapping only disjoint inverted neighbours would
+        // make the whole range ordered, then apply exactly those swaps.  Random
+        // long-distance nearly-sorted inputs fail the proof before mutation and
+        // can continue to the patch/merge repair.
+        std::vector<std::size_t> swaps;
+        bool dense_pairs = true;
+        std::size_t first_pair = n;
+        std::size_t expected_pair = n;
+        std::size_t pair_count = 0;
+        auto remember_pair = [&](std::size_t idx) {
+            if (pair_count == 0) {
+                first_pair = idx;
+                expected_pair = idx;
+            } else {
+                expected_pair += 2;
+                if (dense_pairs && idx != expected_pair) {
+                    dense_pairs = false;
+                    swaps.reserve(64);
+                    for (std::size_t j = first_pair; j < expected_pair; j += 2)
+                        swaps.push_back(j);
+                }
+            }
+            if (!dense_pairs) swaps.push_back(idx);
+            ++pair_count;
+        };
+
+        const T* prev = nullptr;
+        std::size_t i = 0;
+        while (i < n) {
+            if (i + 1 < n && before(p[i + 1], p[i])) {
+                const T& first = p[i + 1];
+                const T& second = p[i];
+                if (prev && before(first, *prev)) return false;
+                remember_pair(i);
+                prev = &second;
+                i += 2;
+            } else {
+                if (prev && before(p[i], *prev)) return false;
+                prev = p + i;
+                ++i;
+            }
+        }
+        if (pair_count == 0) return false;
+        if (dense_pairs) {
+            std::size_t idx = first_pair;
+            for (std::size_t c = 0; c < pair_count; ++c, idx += 2)
+                std::iter_swap(p + idx, p + idx + 1);
+        } else {
+            for (std::size_t idx : swaps)
+                std::iter_swap(p + idx, p + idx + 1);
         }
         return true;
     }
@@ -478,12 +564,25 @@ inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
         }
         if (dirty_count == 0) return true;
 
-        const T* last_clean = nullptr;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (dirty[i]) continue;
-            if (last_clean && before(p[i], *last_clean)) return false;
-            last_clean = p + i;
+        bool clean_ordered = false;
+        for (unsigned pass = 0; pass < 4; ++pass) {
+            bool changed = false;
+            std::size_t last_clean = n;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (dirty[i]) continue;
+                if (last_clean != n && before(p[i], p[last_clean])) {
+                    mark_dirty(last_clean);
+                    mark_dirty(i);
+                    if (dirty_count > max_dirty) return false;
+                    changed = true;
+                    last_clean = n;
+                    continue;
+                }
+                last_clean = i;
+            }
+            if (!changed) { clean_ordered = true; break; }
         }
+        if (!clean_ordered) return false;
 
         std::vector<T> clean;
         std::vector<T> patch;
@@ -503,6 +602,32 @@ inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
         while (pi < patch.size())  p[out++] = std::move(patch[pi++]);
         return true;
     }
+#endif
+}
+
+
+template <class T, class Comp>
+inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (try_adjacent_swap_repair(p, n, comp)) return true;
+    if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
+    return false;
+#endif
+}
+
+template <class T, class Comp>
+inline bool try_partially_sorted_repair(T* p, std::size_t n, Comp comp) {
+#if !FYX_USE_PDQ_PARTITION
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (try_adjacent_swap_repair(p, n, comp)) return true;
+    if (try_nearly_sorted_repair(p, n, comp)) return true;
+    if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
+    return false;
 #endif
 }
 
@@ -550,7 +675,7 @@ inline bool try_fast_reverse_exit(T* p, std::size_t n, Comp comp) {
             return comp(a, b);
         }
     };
-    if constexpr ((std::is_arithmetic<T>::value && sizeof(T) <= 4) ||
+    if constexpr ((std::is_arithmetic<T>::value && sizeof(T) < 4) ||
                   !std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
         (void)p; (void)n; (void)comp;
         return false;
@@ -2911,15 +3036,20 @@ inline bool try_parallel_radix_high_prefix_sort(T* p, std::size_t n, bool descen
             return false;
         } else if constexpr (std::is_same<T, double>::value) {
             // IEEE doubles generated by benchmark/random workloads share many
-            // exponent bits.  Sorting the top 39 encoded bits with three 13-bit
-            // digits removes most tie buckets while cutting the full 8-pass radix
-            // to two key-buffer passes plus a final decode scatter.
+            // exponent bits.  1M/5M public matrices are faster with a 36-bit
+            // prefix in three 12-bit digits; very large ranges keep the 39-bit
+            // repair guard to avoid oversized tie buckets.
+            if (n <= (std::size_t(1) << 21))
+                return try_parallel_radix_high_prefix_key_sort_wide<T, 36, 12>(p, n, descending);
             return try_parallel_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
         } else if constexpr (std::is_integral<T>::value && sizeof(T) == 8) {
             // 64-bit integer random data has very few collisions in the top
-            // encoded bits at 10M scale.  Three 11-bit prefix passes avoid the
-            // fourth byte pass and repair only the remaining tiny tie groups.
-            return try_parallel_radix_high_prefix_key_sort_wide<T, 33, 11>(p, n, descending);
+            // encoded bits.  Use a two-pass prefix at 1M scale to cut one full
+            // count/scatter round, and a slightly wider two-pass prefix beyond
+            // that so tie repair remains tiny at 5M/10M.
+            if (n <= (std::size_t(1) << 21))
+                return try_parallel_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending);
+            return try_parallel_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
         } else {
             (void)p; (void)n; (void)descending;
             return false;
@@ -3015,42 +3145,42 @@ inline bool try_parallel_radix32_wide_sort(T* p, std::size_t n, bool descending)
         const std::size_t chunks = adaptive_parallel_radix32_wide_chunks<T>(n);
         if ((n + chunks - 1) / chunks >
             static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
-        const bool can_stream = have_nt_stores();
-
-        parallel_radix_wide_count_scatter<11>(chunks,
-            [&](std::size_t c, std::uint32_t* out) {
-                const std::size_t lo = (c * n) / chunks;
-                const std::size_t hi = ((c + 1) * n) / chunks;
-                radix_count_value_pass_banked_wide<T, 11>(p + lo, hi - lo, 0, out);
-            },
-            [&](std::size_t c, std::size_t* pos) {
-                const std::size_t lo = (c * n) / chunks;
-                const std::size_t hi = ((c + 1) * n) / chunks;
-                radix_scatter_encode_pass_wide<T, Key, 11>(p + lo, hi - lo, a, 0, pos, can_stream);
-            });
-
-        parallel_radix_wide_count_scatter<11>(chunks,
-            [&](std::size_t c, std::uint32_t* out) {
-                const std::size_t lo = (c * n) / chunks;
-                const std::size_t hi = ((c + 1) * n) / chunks;
-                radix_count_key_pass_banked_wide<Key, 11>(a + lo, hi - lo, 11, out);
-            },
-            [&](std::size_t c, std::size_t* pos) {
-                const std::size_t lo = (c * n) / chunks;
-                const std::size_t hi = ((c + 1) * n) / chunks;
-                radix_scatter_key_pass_wide<Key, 11>(a + lo, hi - lo, b, 11, pos, can_stream);
-            });
+        const bool can_stream = have_nt_stores() && n > (std::size_t(1) << 21);
 
         parallel_radix_wide_count_scatter<10>(chunks,
             [&](std::size_t c, std::uint32_t* out) {
                 const std::size_t lo = (c * n) / chunks;
                 const std::size_t hi = ((c + 1) * n) / chunks;
-                radix_count_key_pass_banked_wide<Key, 10>(b + lo, hi - lo, 22, out);
+                radix_count_value_pass_banked_wide<T, 10>(p + lo, hi - lo, 0, out);
             },
             [&](std::size_t c, std::size_t* pos) {
                 const std::size_t lo = (c * n) / chunks;
                 const std::size_t hi = ((c + 1) * n) / chunks;
-                radix_scatter_key_decode_pass_wide<T, Key, 10>(b + lo, hi - lo, p, 22, pos, can_stream);
+                radix_scatter_encode_pass_wide<T, Key, 10>(p + lo, hi - lo, a, 0, pos, can_stream);
+            });
+
+        parallel_radix_wide_count_scatter<11>(chunks,
+            [&](std::size_t c, std::uint32_t* out) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_count_key_pass_banked_wide<Key, 11>(a + lo, hi - lo, 10, out);
+            },
+            [&](std::size_t c, std::size_t* pos) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_scatter_key_pass_wide<Key, 11>(a + lo, hi - lo, b, 10, pos, can_stream);
+            });
+
+        parallel_radix_wide_count_scatter<11>(chunks,
+            [&](std::size_t c, std::uint32_t* out) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_count_key_pass_banked_wide<Key, 11>(b + lo, hi - lo, 21, out);
+            },
+            [&](std::size_t c, std::size_t* pos) {
+                const std::size_t lo = (c * n) / chunks;
+                const std::size_t hi = ((c + 1) * n) / chunks;
+                radix_scatter_key_decode_pass_wide<T, Key, 11>(b + lo, hi - lo, p, 21, pos, can_stream);
             });
 
         if (descending) std::reverse(p, p + n);
@@ -4309,9 +4439,13 @@ inline bool try_serial_radix_high_prefix_sort(T* p, std::size_t n, bool descendi
             (void)p; (void)n; (void)descending;
             return false;
         } else if constexpr (std::is_same<T, double>::value) {
+            if (n <= (std::size_t(1) << 21))
+                return try_serial_radix_high_prefix_key_sort_wide<T, 36, 12>(p, n, descending);
             return try_serial_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
         } else if constexpr (std::is_integral<T>::value && sizeof(T) == 8) {
-            return try_serial_radix_high_prefix_key_sort_wide<T, 33, 11>(p, n, descending);
+            if (n <= (std::size_t(1) << 21))
+                return try_serial_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending);
+            return try_serial_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
         } else {
             (void)p; (void)n; (void)descending;
             return false;
@@ -4588,10 +4722,18 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
     const bool partial_pdq = prof && prof->is_partially_sorted &&
         n <= kProfilePartialPdqMax;
     if (partial_pdq && !(prof && prof->is_low_cardinality)) {
-        if (try_nearly_sorted_insertion_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
-        pdqsort_for_profile_pattern(p, n, comp);
-        record_dispatch(DispatchDecision::PartialPdq);
-        return;
+        if (radix_order) {
+            if (try_partially_sorted_local_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+            // High-entropy nearly-sorted numeric data with long-distance swaps
+            // is usually faster on FYX radix than on comparison pdq/patch.
+            // Continue into the radix block below instead of committing here.
+        } else {
+            if (try_guarded_radix_order_sort(p, n, comp, false, true)) { record_dispatch(DispatchDecision::Radix); return; }
+            if (try_partially_sorted_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+            pdqsort_for_profile_pattern(p, n, comp);
+            record_dispatch(DispatchDecision::PartialPdq);
+            return;
+        }
     }
 
     if (radix_order) {
@@ -4600,7 +4742,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
             if (try_radix_key_sparse_count_sort(p, n, descending)) { record_dispatch(DispatchDecision::LowCardinality); return; }
             if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         }
-        if (partial_pdq) { if (try_nearly_sorted_insertion_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; } pdqsort_for_profile_pattern(p, n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
+        if (partial_pdq && try_partially_sorted_local_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
         if constexpr (radix_type) {
             if (n >= kRadixThreshold || std::is_floating_point<T>::value) {
 #if FYX_ENABLE_PARALLEL
@@ -4625,7 +4767,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
             if (try_trivial_prefix_key_count_sort(p, n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
             if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         }
-        if (partial_pdq) { if (try_nearly_sorted_insertion_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; } pdqsort_for_profile_pattern(p, n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
+        if (partial_pdq) { if (try_partially_sorted_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; } pdqsort_for_profile_pattern(p, n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
         if (try_guarded_string_order_sort(p, n, comp, false)) { record_dispatch(DispatchDecision::Radix); return; }
         if (try_string_msd_sort(p, n, comp, descending)) { record_dispatch(DispatchDecision::Radix); return; }
         if (try_trivial_prefix_key_radix_sort(p, n, comp)) { record_dispatch(DispatchDecision::Radix); return; }
@@ -5026,19 +5168,63 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
         return;
     }
     if (n > detail::kNetworkMax && detail::try_fast_order_exit(p, n, comp, true)) return;
+    if (n > detail::kNetworkMax && detail::try_adjacent_swap_repair(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
     if (n > detail::kNetworkMax && detail::try_interleaved_runs_sort(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
     }
     if (n <= detail::kProfilePartialPdqMax && detail::pdq_preferred_order_sample(p, n, comp)) {
-        if (detail::try_nearly_sorted_insertion_repair(p, n, comp) ||
-            detail::try_nearly_sorted_repair(p, n, comp)) {
+        if (radix_ok) {
+            if (detail::try_partially_sorted_local_repair(p, n, comp)) {
+                detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                return;
+            }
+            // Numeric long-distance nearly-sorted inputs should not pay the
+            // full profile scan plus comparison pdq.  Once adjacent/local
+            // repairs decline, send them straight to the radix family.
+#if FYX_ENABLE_PARALLEL
+            if (detail::dynamic_parallel_allowed<T>(n, o)) {
+                if (detail::try_parallel_radix32_wide_sort(p, n, descending) ||
+                    detail::try_parallel_radix_high_prefix_sort(p, n, descending) ||
+                    detail::try_parallel_radix_sort(p, n, descending, true)) {
+                    detail::record_dispatch(detail::DispatchDecision::Radix);
+                    return;
+                }
+            }
+            if (detail::try_serial_radix_high_prefix_sort(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
+#endif
+            if constexpr (detail::radix_supported_v<T>) {
+                if (detail::radix_sort(p, n)) {
+                    if (descending) std::reverse(p, p + n);
+                    detail::record_dispatch(detail::DispatchDecision::Radix);
+                    return;
+                }
+            }
+        } else {
+            if (detail::try_guarded_radix_order_sort(p, n, comp,
+#if FYX_ENABLE_PARALLEL
+                    detail::dynamic_parallel_allowed<T>(n, o),
+#else
+                    false,
+#endif
+                    true)) {
+                detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
+            if (detail::try_partially_sorted_repair(p, n, comp)) {
+                detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                return;
+            }
+            detail::pdqsort_for_profile_pattern(p, n, comp);
             detail::record_dispatch(detail::DispatchDecision::PartialPdq);
             return;
         }
-        detail::pdqsort_for_profile_pattern(p, n, comp);
-        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
-        return;
     }
 #endif
 
@@ -5061,14 +5247,26 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
         const bool partial_pdq = prof && prof->is_partially_sorted &&
             n <= detail::kProfilePartialPdqMax;
         if (partial_pdq && !(prof && prof->is_low_cardinality)) {
-            if (detail::try_nearly_sorted_insertion_repair(p, n, comp) ||
-                detail::try_nearly_sorted_repair(p, n, comp)) {
+            if (radix_ok) {
+                if (detail::try_partially_sorted_local_repair(p, n, comp)) {
+                    detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                    return;
+                }
+                // Numeric nearly-sorted with remote swaps falls through to
+                // radix; adjacent/local repairs have already had first chance.
+            } else {
+                if (detail::try_guarded_radix_order_sort(p, n, comp, want_parallel, true)) {
+                    detail::record_dispatch(detail::DispatchDecision::Radix);
+                    return;
+                }
+                if (detail::try_partially_sorted_repair(p, n, comp)) {
+                    detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                    return;
+                }
+                detail::pdqsort_for_profile_pattern(p, n, comp);
                 detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                 return;
             }
-            detail::pdqsort_for_profile_pattern(p, n, comp);
-            detail::record_dispatch(detail::DispatchDecision::PartialPdq);
-            return;
         }
         if (radix_ok) {
             if (!high_entropy) {
@@ -5097,7 +5295,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
-            if (partial_pdq) { if (detail::try_nearly_sorted_insertion_repair(p, n, comp) || detail::try_nearly_sorted_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; } detail::pdqsort_for_profile_pattern(p, n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (partial_pdq && detail::try_partially_sorted_local_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
             if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
@@ -5112,7 +5310,7 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 if (detail::try_trivial_prefix_key_count_sort(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
-            if (partial_pdq) { if (detail::try_nearly_sorted_insertion_repair(p, n, comp) || detail::try_nearly_sorted_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; } detail::pdqsort_for_profile_pattern(p, n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (partial_pdq) { if (detail::try_partially_sorted_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; } detail::pdqsort_for_profile_pattern(p, n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
             if (detail::try_guarded_string_order_sort(p, n, comp, want_parallel)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_string_msd_sort_parallel(p, n, comp, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_string_msd_sort(p, n, comp, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
