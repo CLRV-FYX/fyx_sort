@@ -763,6 +763,18 @@ inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
     return false;
 #else
     if (try_adjacent_swap_repair(p, n, comp)) return true;
+    // Sparse disorder is the common shape: a few percent of the positions take
+    // part in an inversion while the clean subsequence is already ordered.
+    // Pulling those positions out and merging them back costs three sequential
+    // passes instead of 4-8 radix passes, and it is width-independent, so
+    // int64/double gain the most.  Densely disordered input is rejected after
+    // touching about an eighth of the range, before anything is moved.
+    if (try_dirty_patch_merge_adaptive(p, n, comp)) return true;
+    // Adjacent inversions cannot see a block that was moved wholesale: every
+    // element inside it is still in order.  The prefix-max / suffix-min
+    // characterisation finds those, so spliced / block-moved inputs also cost
+    // a couple of linear passes instead of a full sort.
+    if (try_displacement_patch_merge_adaptive(p, n, comp)) return true;
     if (try_bounded_insertion_repair(p, n, comp)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
     return false;
@@ -776,6 +788,14 @@ inline bool try_partially_sorted_repair(T* p, std::size_t n, Comp comp) {
     return false;
 #else
     if (try_adjacent_swap_repair(p, n, comp)) return true;
+    // See try_partially_sorted_local_repair: for string/object payloads the
+    // patch merge replaces an O(n log n) comparison recursion with three
+    // sequential move passes plus a sort of the (tiny) dirty patch.  It runs
+    // before the insertion probe because a bounded insertion sort pays a
+    // string comparison per shift.
+    if (try_dirty_patch_merge_adaptive(p, n, comp)) return true;
+    // See above: moved blocks and long-distance splices.
+    if (try_displacement_patch_merge_adaptive(p, n, comp)) return true;
     if (try_bounded_insertion_repair(p, n, comp)) return true;
     if (try_nearly_sorted_repair(p, n, comp)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
@@ -5551,6 +5571,8 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
 
     if (try_zigzag_organ_pipe_sort(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
     if (try_numeric_half_organ_fill(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+    // Adaptive natural-run merge: see sort_pointer_core.
+    if (try_natural_run_merge_adaptive(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
 
     const bool high_entropy = prof && prof->is_high_entropy;
     const bool partial_pdq = prof && prof->is_partially_sorted &&
@@ -6033,6 +6055,15 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
         return;
     }
     if (n > detail::kNetworkMax && detail::try_fast_order_exit(p, n, comp, true)) return;
+    // Inputs made of a handful of monotone runs (rotated sorted arrays,
+    // concatenated sorted blocks, shuffled block permutations, ...) cost
+    // O(n log R) sequential moves here instead of a fixed 4-8 radix passes or
+    // a full comparison recursion.  Random data is rejected inside the scan
+    // after touching a couple of hundred elements.
+    if (n > detail::kNetworkMax && detail::try_natural_run_merge_adaptive(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
     if (n > detail::kNetworkMax && detail::try_adjacent_swap_repair(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
