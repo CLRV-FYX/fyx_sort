@@ -51,11 +51,10 @@ default: vqsort has no string sort at all.  vqsort is also single threaded.
 | **scatter (4 passes)** | **81%** |
 | decode | 3% |
 
-A scatter pass moves 8 MB (4 read + 4 write) in 0.0046 s = **1.45 GB/s**, which
-is 8% of what the machine does, and works out to **11.5 cycles per element**.
-vqsort spends **9 cycles per element on the whole sort**.  fyx pays
-4 x 11.5 = 46 cycles/element for int32 and 8 x 11.5 = 92 for int64/double:
-the cost is *passes x per-pass cost*, and the pass count is what hurts.
+One scatter pass costs **~6 cycles per element** (see the three-way probe
+below).  vqsort spends **~9 cycles per element on the entire sort**.  fyx pays
+4 passes x 6 = 24 cycles/element for int32 and 8 x 6 = 48 for int64/double:
+the cost is *passes x per-pass cost*, and it is the pass count that hurts.
 
 ## Negative results — do not spend time on these again
 
@@ -69,6 +68,24 @@ the cost is *passes x per-pass cost*, and the pass count is what hurts.
   s per pass for int64.  Real, small.
 - **The per-element software prefetch is roughly neutral** (slightly better
   without it for int32, slightly worse for int64).
+- **A vectorised scatter is a dead end.** AVX-512CD's `vpconflictd` gives every
+  lane its rank inside its bucket inside the block, so `vpscatterdd` can write
+  straight to the final position with no write-combining buffer at all -- and it
+  is still slower, because `vpgatherdd`/`vpscatterdd` cost more than the scalar
+  loop they replace (`tools/dev/scatter_probe.cpp`):
+
+  | scatter | cycles/element |
+  |---|---|
+  | naive `dst[off[b]++] = x` | 12.9 |
+  | AVX-512CD conflict + scatter | 14.7 - 17.3 |
+  | **write-combining buffer + NT flush (shipping)** | **5.9** |
+
+  The shipping kernel is 2.2x faster than the naive loop it looks like it should
+  be simplified to.  Do not "simplify" it.
+- **Measure the variants interleaved, in one harness.** Timed back to back, the
+  variant that runs first pays for cold pages and measures 2x slower than it is;
+  two runs of the same code reported 8.9 and 4.6 cycles/element before the
+  harness was fixed.
 - **Cost is not linear in the number of passes.** 8-bit values (counting sort)
   0.0011 s, 11-bit (2 passes) 0.0066 s, 32-bit (4 passes) 0.0081 s: the marginal
   pass costs ~0.0005 s, and there is a ~0.006 s fixed cost to using the LSD
@@ -76,9 +93,13 @@ the cost is *passes x per-pass cost*, and the pass count is what hurts.
 
 ## What follows from the above
 
-Reducing traffic is not the lever; reducing *element-passes* is.  An MSD radix
-that makes one or two partitioning passes and finishes each cache-sized bucket
-with the existing SIMD sorting network (`parts/07_simd_net.hpp`) turns
-46 cycles/element into ~16 for int32 and 92 into ~15 for int64/double, which is
-the structure vqsort uses and the only measured route to closing the random-data
-gap.
+Neither traffic nor the per-element kernel is the lever: the kernel is already
+2.2x better than the obvious simplification, and it does not respond to cache
+tuning.  The lever is **element-passes**.  An MSD radix that makes two
+partitioning passes (8 bits, then 8 bits) and finishes each ~16-element bucket
+with the existing SIMD sorting network (`parts/07_simd_net.hpp`,
+`kNetworkMax = 64`) turns 24 cycles/element into ~12 for int32 and 48 into ~12
+for int64/double.  That is the structure vqsort uses, and it is the only
+measured route to the random-data gap -- note that it would also make every
+numeric type cost the same, where today int64 costs twice int32 purely because
+it needs twice the passes.
