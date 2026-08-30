@@ -352,16 +352,24 @@ inline bool try_dirty_patch_merge(T* p, std::size_t n, Comp comp,
         // range re-marked (a moved block, say) is not a "local disorder" shape,
         // and the displacement merge below handles it in fewer passes than we
         // would spend discovering that here.
+        // The hypothesis under test is that a handful of positions are out of
+        // place.  A pass that has to re-mark a large part of the original
+        // patch refutes it -- that is what a moved block looks like from here,
+        // every element inside it still being in order -- so the scan is
+        // abandoned instead of paying two more of them before giving up.
         const std::size_t grow_cap = std::min<std::size_t>(max_dirty, dirty_count * 4 + 64);
+        const std::size_t dirty0 = dirty_count;
         bool ordered = false;
         for (int pass = 0; pass < 3 && !ordered; ++pass) {
             bool changed = false;
+            std::size_t added = 0;
             std::size_t prev = n;
             for (std::size_t i = 0; i < n; ++i) {
                 if (is_dirty(i)) continue;
                 if (prev != n && before(p[i], p[prev])) {
                     mark(prev);
                     mark(i);
+                    ++added;
                     if (dirty_count > grow_cap) return false;
                     changed = true;
                     prev = n;
@@ -370,6 +378,7 @@ inline bool try_dirty_patch_merge(T* p, std::size_t n, Comp comp,
                 prev = i;
             }
             ordered = !changed;
+            if (!ordered && added * 2u > dirty0) return false;
         }
         if (!ordered) return false;
 

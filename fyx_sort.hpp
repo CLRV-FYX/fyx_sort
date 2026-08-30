@@ -5538,16 +5538,24 @@ inline bool try_dirty_patch_merge(T* p, std::size_t n, Comp comp,
         // range re-marked (a moved block, say) is not a "local disorder" shape,
         // and the displacement merge below handles it in fewer passes than we
         // would spend discovering that here.
+        // The hypothesis under test is that a handful of positions are out of
+        // place.  A pass that has to re-mark a large part of the original
+        // patch refutes it -- that is what a moved block looks like from here,
+        // every element inside it still being in order -- so the scan is
+        // abandoned instead of paying two more of them before giving up.
         const std::size_t grow_cap = std::min<std::size_t>(max_dirty, dirty_count * 4 + 64);
+        const std::size_t dirty0 = dirty_count;
         bool ordered = false;
         for (int pass = 0; pass < 3 && !ordered; ++pass) {
             bool changed = false;
+            std::size_t added = 0;
             std::size_t prev = n;
             for (std::size_t i = 0; i < n; ++i) {
                 if (is_dirty(i)) continue;
                 if (prev != n && before(p[i], p[prev])) {
                     mark(prev);
                     mark(i);
+                    ++added;
                     if (dirty_count > grow_cap) return false;
                     changed = true;
                     prev = n;
@@ -5556,6 +5564,7 @@ inline bool try_dirty_patch_merge(T* p, std::size_t n, Comp comp,
                 prev = i;
             }
             ordered = !changed;
+            if (!ordered && added * 2u > dirty0) return false;
         }
         if (!ordered) return false;
 
@@ -6129,7 +6138,8 @@ inline bool try_nearly_sorted_insertion_repair(T* p, std::size_t n, Comp comp) {
 
 
 template <class T, class Comp>
-inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
+inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp,
+                                          bool thorough = false) {
 #if !FYX_USE_PDQ_PARTITION
     (void)p; (void)n; (void)comp;
     return false;
@@ -6154,37 +6164,32 @@ inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
         (void)p; (void)n; (void)comp;
         return false;
     } else {
-        // Local zigzag/sawtooth generators are not just disjoint adjacent swaps:
-        // examples such as [0,3,1,2, 4,7,5,6, ...] need two tiny insertions per
-        // block.  A full radix/sample pass is much slower, while ordinary random
-        // data would make insertion explode.  Sort a small copied prefix first;
-        // only if its displacement budget is tiny do we repair the real range.
+        // Two very different callers share this probe, and they can afford
+        // different things.  At the top of a sort, before the profile runs, it
+        // only pays for a sample: it is there for the zigzag / sawtooth
+        // family, whose disorder is dense but travels one position, and which
+        // the profile classifies as high entropy and will not repair.  Sparse
+        // disorder is left alone there -- the profile claims it and the repair
+        // chain below serves it better than this probe can.  Called from that
+        // chain the range is already known to be nearly sorted, a scan is
+        // already paid for, and sparse disorder is exactly what to look for:
+        // an array whose blocks were permuted has a few dozen inversions in a
+        // million positions and the first four thousand of them may be
+        // perfectly ordered, which no density test can see.
         const std::size_t sample_n = std::min<std::size_t>(n, std::size_t(4096));
-        std::size_t inv = 0, ordered = 0, turns = 0;
-        int prev_dir = 0;
+        std::size_t inv = 0, ordered = 0;
         for (std::size_t i = 1; i < sample_n; ++i) {
             const bool down = before(p[i], p[i - 1]);
-            const bool up = before(p[i - 1], p[i]);
+            const bool up   = before(p[i - 1], p[i]);
             if (down) ++inv;
             if (up || down) ++ordered;
-            const int dir = up ? 1 : (down ? -1 : 0);
-            if (dir != 0) {
-                if (prev_dir != 0 && dir != prev_dir) ++turns;
-                prev_dir = dir;
-            }
         }
-        // The density of adjacent inversions says nothing about how much work
-        // the repair is: one percent of the positions moved a few dozen places
-        // apart is cheaper to insert than a zigzag that needs every second
-        // element nudged, yet it looks far less "disordered" by inversion
-        // count.  Only require that something is out of order and let the
-        // sampled shift budget below decide -- it measures displacement, which
-        // is what insertion actually pays for.  Random input still bails there
-        // after a couple of thousand shifts.
-        if (ordered == 0 || inv == 0) return false;
+        if (ordered == 0) return false;
+        if (!thorough && inv * 100u < ordered * 8u) return false;
 
-        // Low-cardinality random data can also have many local inversions, but
-        // counting sort owns it; avoid paying a doomed insertion probe there.
+        // Low-cardinality random data has plenty of local inversions but no
+        // local structure to exploit: counting sort owns it, and insertion
+        // would drag values across the whole range.
         if constexpr (std::is_arithmetic<T>::value && !std::is_same<T, bool>::value) {
             constexpr std::size_t Cap = 512;
             constexpr std::size_t Mask = Cap - 1;
@@ -6233,38 +6238,42 @@ inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
             if (distinct.size() <= 64u) return false;
         }
 
-        std::vector<T> probe(p, p + sample_n);
-        const std::size_t sample_cap = sample_n;
-        std::size_t sample_shifts = 0;
-        for (std::size_t i = 1; i < sample_n; ++i) {
-            if (!before(probe[i], probe[i - 1])) continue;
-            T v = std::move(probe[i]);
-            std::size_t j = i;
-            while (j > 0 && before(v, probe[j - 1])) {
-                probe[j] = std::move(probe[j - 1]);
-                --j;
-                if (++sample_shifts > sample_cap) {
-                    probe[j] = std::move(v);
-                    return false;
+        // Insertion sort permutes the range as it goes, so before touching a
+        // single element it rehearses on a copy of the prefix: the same
+        // insertion sort over the first four thousand positions, abandoned as
+        // soon as they cost more shifts than they contain.  Disorder that is
+        // dense but expensive -- interleaved runs, random data -- is refused
+        // here with the range still exactly as it was, which is what leaves
+        // the detectors downstream able to recognise it.  Sparse disorder
+        // costs nothing to rehearse and is let through.
+        {
+            std::vector<T> probe(p, p + sample_n);
+            std::size_t cost = 0;
+            for (std::size_t i = 1; i < sample_n; ++i) {
+                if (!before(probe[i], probe[i - 1])) continue;
+                T v = std::move(probe[i]);
+                std::size_t j = i;
+                while (j > 0 && before(v, probe[j - 1])) {
+                    probe[j] = std::move(probe[j - 1]);
+                    --j;
+                    if (++cost > sample_n) return false;
                 }
+                probe[j] = std::move(v);
             }
-            probe[j] = std::move(v);
         }
-        if (!std::is_sorted(probe.begin(), probe.end(), before)) return false;
 
-        const std::size_t scale = (n + sample_n - 1u) / sample_n;
-        const std::size_t scaled = (sample_shifts + 1u > std::numeric_limits<std::size_t>::max() / scale)
-            ? std::numeric_limits<std::size_t>::max()
-            : (sample_shifts + 1u) * scale;
-        const std::size_t shift_cap = n > std::numeric_limits<std::size_t>::max() / 2u
-            ? std::numeric_limits<std::size_t>::max()
-            : n * 2u;
-        const std::size_t budget = scaled > std::numeric_limits<std::size_t>::max() / 6u
-            ? std::numeric_limits<std::size_t>::max()
-            : scaled * 6u;
-        const std::size_t max_shifts = std::max<std::size_t>(std::size_t(4096),
-            std::min<std::size_t>(shift_cap, budget));
-        std::size_t shifts = 0;
+        // Insertion costs one pass plus the inversion count, so the repair may
+        // spend a small multiple of n shifts and still beat a radix pass.
+        // Three guards keep it honest, and none of them is a sample: a sample
+        // cannot see disorder this sparse.  Long travel is refused outright --
+        // an element crossing an eighth of the range is a block move, and the
+        // run merge and the patch merges own those.  The absolute budget is
+        // two shifts per element.  And the running rate is capped, with a
+        // strike to spare, because the shifts arrive in bursts: one permuted
+        // block is tens of thousands of them at a single position, while
+        // random input breaks the cap at every checkpoint from the first.
+        const std::size_t reach = n / 8u + 1u;
+        std::size_t shifts = 0, strikes = 0, next_check = 64;
         for (std::size_t i = 1; i < n; ++i) {
             if (!before(p[i], p[i - 1])) continue;
             T v = std::move(p[i]);
@@ -6272,12 +6281,19 @@ inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
             while (j > 0 && before(v, p[j - 1])) {
                 p[j] = std::move(p[j - 1]);
                 --j;
-                if (++shifts > max_shifts) {
+                if (((i - j) & 63u) == 0u && i - j > reach) {
                     p[j] = std::move(v);
                     return false;
                 }
             }
             p[j] = std::move(v);
+            shifts += i - j;
+            if (shifts > n * 2u) return false;
+            if (i >= next_check) {
+                strikes = (shifts > i * 8u) ? strikes + 1u : 0u;
+                if (strikes >= 2u) return false;
+                next_check <<= 1;
+            }
         }
         return true;
     }
@@ -6462,6 +6478,15 @@ inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
     return false;
 #else
     if (try_adjacent_swap_repair(p, n, comp)) return true;
+    // Insertion costs one pass plus the distance the displaced elements
+    // actually travel, so it is the cheapest repair that exists for shapes
+    // whose disorder is short-range even when it is spread over the whole
+    // range (permuted blocks, scattered local edits): every position is
+    // looked at once and only the displaced elements move.  It polices its
+    // own budget as it goes, so a shape it cannot finish costs a fraction of a
+    // pass.  The patch merges below move every element at least twice even
+    // when they succeed.
+    if (try_bounded_insertion_repair(p, n, comp, true)) return true;
     // Sparse disorder is the common shape: a few percent of the positions take
     // part in an inversion while the clean subsequence is already ordered.
     // Pulling those positions out and merging them back costs three sequential
@@ -6474,7 +6499,6 @@ inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
     // characterisation finds those, so spliced / block-moved inputs also cost
     // a couple of linear passes instead of a full sort.
     if (try_displacement_patch_merge_adaptive(p, n, comp)) return true;
-    if (try_bounded_insertion_repair(p, n, comp)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
     return false;
 #endif
@@ -6493,9 +6517,12 @@ inline bool try_partially_sorted_repair(T* p, std::size_t n, Comp comp) {
     // before the insertion probe because a bounded insertion sort pays a
     // string comparison per shift.
     if (try_dirty_patch_merge_adaptive(p, n, comp)) return true;
+    // See try_partially_sorted_local_repair: bounded insertion is tried before
+    // the patch merges whenever the payload makes comparisons cheap, and after
+    // them when every comparison is a string compare.
+    if (try_bounded_insertion_repair(p, n, comp, true)) return true;
     // See above: moved blocks and long-distance splices.
     if (try_displacement_patch_merge_adaptive(p, n, comp)) return true;
-    if (try_bounded_insertion_repair(p, n, comp)) return true;
     if (try_nearly_sorted_repair(p, n, comp)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
     return false;
