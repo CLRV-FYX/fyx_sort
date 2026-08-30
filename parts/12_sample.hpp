@@ -294,6 +294,10 @@ inline void sample_sort(It first, It last, Comp comp) {
     const std::size_t sample_threshold = sample_sort_threshold_for<T>();
     if (n <= kInsertionThreshold) { insertion_sort(first, last, comp); return; }
     if (n < sample_threshold)     { pdqsort(first, last, comp);      return; }
+    // Splitter search keeps copies of the elements it sampled, so a payload
+    // that cannot be copied -- std::unique_ptr -- has to be left to the
+    // comparison sort, which only ever moves.
+    if constexpr (!std::is_copy_constructible<T>::value) { pdqsort(first, last, comp); return; }
 
     // ---- 0. structural pre-pass ------------------------------------------
     // Sampling, splitter search and 256-way classification are wasted on a

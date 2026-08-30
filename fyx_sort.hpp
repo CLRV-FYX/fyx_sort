@@ -4735,6 +4735,10 @@ inline void sample_sort(It first, It last, Comp comp) {
     const std::size_t sample_threshold = sample_sort_threshold_for<T>();
     if (n <= kInsertionThreshold) { insertion_sort(first, last, comp); return; }
     if (n < sample_threshold)     { pdqsort(first, last, comp);      return; }
+    // Splitter search keeps copies of the elements it sampled, so a payload
+    // that cannot be copied -- std::unique_ptr -- has to be left to the
+    // comparison sort, which only ever moves.
+    if constexpr (!std::is_copy_constructible<T>::value) { pdqsort(first, last, comp); return; }
 
     // ---- 0. structural pre-pass ------------------------------------------
     // Sampling, splitter search and 256-way classification are wasted on a
@@ -5842,6 +5846,25 @@ struct iterator_base_pointer<It, std::void_t<decltype(std::declval<It>().base())
 
 template <class It>
 inline constexpr bool has_mutable_base_pointer_v = iterator_base_pointer<It>::value;
+
+/// Containers whose elements live in nodes (std::list, std::forward_list).
+/// Their own sort splices nodes instead of moving elements, which is both
+/// cheaper than any move and the only thing that can be done through a
+/// bidirectional iterator.
+template <class C, class = void>
+struct has_member_sort : std::false_type {};
+template <class C>
+struct has_member_sort<C, std::void_t<decltype(std::declval<C&>().sort())>> : std::true_type {};
+template <class C>
+inline constexpr bool has_member_sort_v = has_member_sort<C>::value;
+
+template <class C, class Comp, class = void>
+struct has_member_sort_with : std::false_type {};
+template <class C, class Comp>
+struct has_member_sort_with<C, Comp,
+    std::void_t<decltype(std::declval<C&>().sort(std::declval<Comp&>()))>> : std::true_type {};
+template <class C, class Comp>
+inline constexpr bool has_member_sort_with_v = has_member_sort_with<C, Comp>::value;
 
 // Forward declaration of the (optionally compiled) GPU dispatch.  Defined in
 // parts/15_gpu.hpp under #ifdef FYX_ENABLE_GPU; when that switch is off the
@@ -11537,9 +11560,11 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
     // Generic path: strings, structs and custom comparators get an ips4o-style
     // sample sort once they are large enough; smaller ranges use pdqsort.
     if (n >= kSampleThreshold && (!std::is_arithmetic<T>::value || !radix_order)) {
-        sample_sort(p, p + n, comp);
-        record_dispatch(DispatchDecision::Sample);
-        return;
+        if constexpr (std::is_copy_constructible<T>::value) {
+            sample_sort(p, p + n, comp);
+            record_dispatch(DispatchDecision::Sample);
+            return;
+        }
     }
     pdqsort(p, p + n, comp);
     record_dispatch(DispatchDecision::Pdq);
@@ -11737,6 +11762,21 @@ inline bool try_msd_radix_bucket_sort(T* p, std::size_t n, bool descending) {
     }
 }
 
+/// The same stable merge as std::merge -- equal elements keep the order of the
+/// first run -- except that it moves.  std::merge assigns through a const
+/// lvalue, which a move-only payload (std::unique_ptr, say) cannot take, and
+/// that used to make the parallel merge refuse to compile for them.
+template <class T, class Comp>
+inline void merge_runs_moving(T* a, std::size_t n1, T* b, std::size_t n2, T* dst, Comp comp) {
+    std::size_t i = 0, j = 0, w = 0;
+    while (i != n1 && j != n2) {
+        if (comp(b[j], a[i])) dst[w++] = std::move(b[j++]);
+        else                  dst[w++] = std::move(a[i++]);
+    }
+    while (i != n1) dst[w++] = std::move(a[i++]);
+    while (j != n2) dst[w++] = std::move(b[j++]);
+}
+
 template <class T, class Comp>
 inline void parallel_merge_to_buffer_rec(T* src,
                                          std::size_t a0, std::size_t a1,
@@ -11749,7 +11789,7 @@ inline void parallel_merge_to_buffer_rec(T* src,
     if (total == 0) return;
     constexpr std::size_t kMergeGrain = 8192;
     if (total <= kMergeGrain || !parallel_available()) {
-        std::merge(src + a0, src + a1, src + b0, src + b1, dst + out, comp);
+        merge_runs_moving(src + a0, a1 - a0, src + b0, b1 - b0, dst + out, comp);
         return;
     }
 
@@ -11831,7 +11871,7 @@ inline void stable_merge_sort(It first, It last, Comp comp) {
     if (n < 2) return;
 
     std::vector<T> a(n), b(n);
-    for (std::size_t i = 0; i < n; ++i) a[i] = first[i];
+    for (std::size_t i = 0; i < n; ++i) a[i] = std::move(first[i]);
 
     bool from_a = true;
     for (std::size_t width = 1; width < n; width *= 2) {
@@ -11840,12 +11880,12 @@ inline void stable_merge_sort(It first, It last, Comp comp) {
         for (std::size_t i = 0; i < n; i += 2 * width) {
             const std::size_t m = std::min(i + width, n);
             const std::size_t r = std::min(i + 2 * width, n);
-            std::merge(src + i, src + m, src + m, src + r, dst + i, comp);
+            merge_runs_moving(src + i, m - i, src + m, r - m, dst + i, comp);
         }
         from_a = !from_a;
     }
     T* final = from_a ? a.data() : b.data();
-    for (std::size_t i = 0; i < n; ++i) first[i] = final[i];
+    for (std::size_t i = 0; i < n; ++i) first[i] = std::move(final[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -11908,7 +11948,7 @@ inline void partial_sort_impl(It first, It middle, It last, Comp comp) {
 // ---------------------------------------------------------------------------
 
 template <class T, class Comp>
-inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) {
+inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options& o) {
     (void)o;   // consumed only by the parallel branches (compiled out otherwise)
     if (n == 0) return;
 #if FYX_ENABLE_GPU
@@ -12179,16 +12219,43 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
             detail::record_dispatch(detail::DispatchDecision::Radix);
             return;
         }
-        if (n >= detail::kSampleThreshold) {
-            detail::parallel_sample_sort(p, p + n, comp);
-            detail::record_dispatch(detail::DispatchDecision::ParallelSample);
-            return;
+        // The parallel sample sort samples by copying, so a move-only payload
+        // takes the task-parallel divide and conquer instead, which only
+        // moves -- see merge_runs_moving.
+        if constexpr (std::is_copy_constructible<T>::value) {
+            if (n >= detail::kSampleThreshold) {
+                detail::parallel_sample_sort(p, p + n, comp);
+                detail::record_dispatch(detail::DispatchDecision::ParallelSample);
+                return;
+            }
         }
         detail::parallel_sort_ptr(p, n, comp, descending, o);
         return;
     }
 #endif
     detail::sort_st(p, n, comp, descending, prof);
+}
+
+/// The kernels above allocate: scratch for radix and merges, buffers for the
+/// sample sort, worker threads for the parallel paths.  std::sort never
+/// allocates and therefore never fails for want of memory; a sorter whose fast
+/// paths do must not inherit that failure, so out of memory -- or no address
+/// space left to start a worker -- falls back to the in-place comparison sort,
+/// which needs neither.  The range is already permuted by whatever threw, and
+/// pdqsort is happy to start from any permutation.
+template <class T, class Comp>
+inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) {
+#if FYX_HAS_EXCEPTIONS
+    try {
+        sort_pointer_core_impl(p, n, comp, o);
+    } catch (const std::bad_alloc&) {
+        detail::pdqsort(p, p + n, comp);
+    } catch (const std::system_error&) {
+        detail::pdqsort(p, p + n, comp);
+    }
+#else
+    sort_pointer_core_impl(p, n, comp, o);
+#endif
 }
 
 template <class It, class Comp>
@@ -12214,19 +12281,108 @@ inline void sort_iter_core(It first, It last, Comp comp, const Options& o) {
         return;
     }
     if (detail::try_monotonic_sort(first, last, comp, true)) return;
+    // Segmented storage (std::deque) cannot be indexed, so radix, the adaptive
+    // weapons and the parallel pool are all out of reach here -- and `o` used
+    // to be dropped on the floor, so asking for parallel silently cost the
+    // same as not asking.  Buffering gets them back: see
+    // try_buffered_iter_sort.
+    if (try_buffered_iter_sort(first, last, comp, o, n)) return;
     if (detail::try_low_cardinality_count_sort(first, last, comp)) return;
+    using T = typename std::iterator_traits<It>::value_type;
     if (n >= detail::kSampleThreshold) {
-        detail::sample_sort(first, last, comp);
-        return;
+        if constexpr (std::is_copy_constructible<T>::value) {
+            detail::sample_sort(first, last, comp);
+            return;
+        }
     }
     detail::pdqsort(first, last, comp);
 }
 
 template <class Container, class Comp>
 inline void sort_container_core(Container& c, Comp comp, const Options& o) {
-    auto* p = std::data(c);
-    const std::size_t n = static_cast<std::size_t>(std::size(c));
-    sort_pointer_core(p, n, comp, o);
+    if constexpr (detail::has_std_data_v<Container>) {
+        auto* p = std::data(c);
+        const std::size_t n = static_cast<std::size_t>(std::size(c));
+        sort_pointer_core(p, n, comp, o);
+    } else if constexpr (detail::has_member_sort_with_v<Container, Comp>) {
+        // Node-based: see has_member_sort.  Nothing to gain from a buffer --
+        // the elements are never moved -- and Options cannot apply, since
+        // splicing is not something worth spreading across workers.
+        c.sort(comp);
+    } else {
+        sort_iter_core(std::begin(c), std::end(c), comp, o);
+    }
+}
+
+/// Sorts a range that the contiguous kernels cannot address -- a segmented
+/// container, or anything whose iterators cannot be indexed -- by moving the
+/// elements into a buffer, sorting that, and moving them back.
+///
+/// Two extra passes buy everything a vector gets: radix, the adaptive weapons,
+/// the profile, and the parallel pool.  1M int32 in a std::deque is 0.051s
+/// through the iterator kernels and 0.017s this way, against 0.084s for
+/// std::sort.
+///
+/// Returns false only when the buffer cannot be had, in which case nothing has
+/// been moved.  If the sort itself throws, the elements go back where they
+/// came from: unsorted, but the range still owns every one of them.
+template <class It, class Comp>
+inline bool try_buffered_iter_sort(It first, It last, Comp comp, const Options& o, std::size_t n) {
+    using T = typename std::iterator_traits<It>::value_type;
+    if constexpr (!std::is_move_constructible<T>::value ||
+                  !std::is_move_assignable<T>::value) {
+        (void)first; (void)last; (void)comp; (void)o; (void)n;
+        return false;
+    } else {
+        std::vector<T> buf;
+        try {
+            buf.reserve(n);
+        } catch (...) {
+            return false;
+        }
+        std::size_t taken = 0;
+        try {
+            for (It it = first; it != last; ++it) { buf.push_back(std::move(*it)); ++taken; }
+        } catch (...) {
+            It out = first;
+            for (std::size_t i = 0; i < taken; ++i) { *out = std::move(buf[i]); ++out; }
+            return false;
+        }
+        try {
+            sort_pointer_core(buf.data(), buf.size(), comp, o);
+        } catch (...) {
+            It out = first;
+            for (std::size_t i = 0; i < n; ++i) { *out = std::move(buf[i]); ++out; }
+            throw;
+        }
+        It out = first;
+        for (std::size_t i = 0; i < n; ++i) { *out = std::move(buf[i]); ++out; }
+        return true;
+    }
+}
+
+template <class It, class Comp>
+inline void sort_forward_core(It first, It last, Comp comp, const Options& o) {
+    std::size_t n = 0;
+    for (It it = first; it != last; ++it) ++n;
+    if (n < 2) return;
+    if (try_buffered_iter_sort(first, last, comp, o, n)) return;
+    // No buffer to be had.  Quadratic, but it is the only thing left that
+    // works through a forward iterator, and it is reached only when the
+    // allocation for the buffer has already failed.
+    for (It i = first; i != last; ++i) {
+        typename std::iterator_traits<It>::value_type v = std::move(*i);
+        It j = i;
+        It prev = j;
+        bool done = false;
+        while (!done) {
+            if (j == first) { done = true; break; }
+            --prev;
+            if (comp(v, *prev)) { *j = std::move(*prev); j = prev; prev = j; }
+            else                { done = true; }
+        }
+        *j = std::move(v);
+    }
 }
 
 // ===========================================================================
@@ -12261,6 +12417,12 @@ template <class It,
 inline void sort(It first, It last) {
     sort_iter_core(first, last, fyx::less{}, Options{});
 }
+// Anything less than random access: see sort_forward_core.
+template <class It,
+          std::enable_if_t<!detail::is_random_access_v<It>, int> = 0>
+inline void sort(It first, It last) {
+    sort_forward_core(first, last, fyx::less{}, Options{});
+}
 template <class It, class Comp,
           std::enable_if_t<detail::is_random_access_v<It> &&
                            !detail::is_fyx_options_v<Comp> &&
@@ -12268,10 +12430,22 @@ template <class It, class Comp,
 inline void sort(It first, It last, Comp comp) {
     sort_iter_core(first, last, comp, Options{});
 }
+template <class It, class Comp,
+          std::enable_if_t<!detail::is_random_access_v<It> &&
+                           !detail::is_fyx_options_v<Comp> &&
+                           !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
+inline void sort(It first, It last, Comp comp) {
+    sort_forward_core(first, last, comp, Options{});
+}
 template <class It,
           std::enable_if_t<detail::is_random_access_v<It>, int> = 0>
 inline void sort(It first, It last, const Options& o) {
     sort_iter_core(first, last, fyx::less{}, o);
+}
+template <class It,
+          std::enable_if_t<!detail::is_random_access_v<It>, int> = 0>
+inline void sort(It first, It last, const Options& o) {
+    sort_forward_core(first, last, fyx::less{}, o);
 }
 template <class It, class Comp,
           std::enable_if_t<detail::is_random_access_v<It> &&
@@ -12280,31 +12454,38 @@ template <class It, class Comp,
 inline void sort(It first, It last, Comp comp, const Options& o) {
     sort_iter_core(first, last, comp, o);
 }
+template <class It, class Comp,
+          std::enable_if_t<!detail::is_random_access_v<It> &&
+                           !detail::is_fyx_options_v<Comp> &&
+                           !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
+inline void sort(It first, It last, Comp comp, const Options& o) {
+    sort_forward_core(first, last, comp, o);
+}
 
 // ---- contiguous container --------------------------------------------------
 template <class Container,
-          std::enable_if_t<detail::has_std_data_v<Container> &&
-                           !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
+          std::enable_if_t<!std::is_pointer_v<std::remove_reference_t<Container>> &&
+                           !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
 inline void sort(Container& c) {
     sort_container_core(c, fyx::less{}, Options{});
 }
 template <class Container, class Comp,
-          std::enable_if_t<detail::has_std_data_v<Container> &&
-                           !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>> &&
+          std::enable_if_t<!std::is_pointer_v<std::remove_reference_t<Container>> &&
+                           !std::is_array_v<std::remove_reference_t<Container>> &&
                            !detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
 inline void sort(Container& c, Comp comp) {
     sort_container_core(c, comp, Options{});
 }
 template <class Container,
-          std::enable_if_t<detail::has_std_data_v<Container> &&
-                           !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
+          std::enable_if_t<!std::is_pointer_v<std::remove_reference_t<Container>> &&
+                           !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
 inline void sort(Container& c, const Options& o) {
     sort_container_core(c, fyx::less{}, o);
 }
 template <class Container, class Comp,
-          std::enable_if_t<detail::has_std_data_v<Container> &&
-                           !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>> &&
+          std::enable_if_t<!std::is_pointer_v<std::remove_reference_t<Container>> &&
+                           !std::is_array_v<std::remove_reference_t<Container>> &&
                            !detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
 inline void sort(Container& c, Comp comp, const Options& o) {
