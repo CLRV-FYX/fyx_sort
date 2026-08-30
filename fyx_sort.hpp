@@ -5455,9 +5455,30 @@ inline bool try_natural_run_merge_adaptive(T* p, std::size_t n, Comp comp) {
 // Dirty-patch merge
 // ---------------------------------------------------------------------------
 
+/// Moves `k` elements from `src` to `dst`; the ranges may overlap, and `dst`
+/// may sit before or after `src`.  Trivially copyable payloads go through
+/// memmove, which the vectoriser cannot beat; the rest are walked away from
+/// the end that would otherwise be overwritten first.
+template <class T>
+inline void move_range_bulk(T* dst, T* src, std::size_t k) noexcept {
+    if constexpr (std::is_trivially_copyable<T>::value) {
+        if (k) std::memmove(static_cast<void*>(dst), static_cast<const void*>(src), k * sizeof(T));
+    } else if (dst < src) {
+        for (std::size_t i = 0; i < k; ++i) dst[i] = std::move(src[i]);
+    } else if (dst > src) {
+        for (std::size_t i = k; i-- > 0;) dst[i] = std::move(src[i]);
+    }
+}
+
 /// Sorts a patch and merges it back over the clean run sitting at the front of
 /// `p`.  Writes run backwards so the array can act as its own output: the write
 /// cursor never passes the read cursor of the clean run.
+///
+/// The patch is tiny next to the run, so comparing one element at a time would
+/// spend the whole budget deciding what to do with elements that are simply
+/// copied.  Each step gallops back through the run to find how many of its
+/// elements belong after the next patch element and moves that block in one
+/// go: O(log(n/p)) comparisons per patch element and one bulk move per block.
 template <class T, class Comp>
 inline void merge_patch_back(T* p, std::size_t clean_n, std::vector<T>& patch, Comp comp) {
     const std::size_t patch_n = patch.size();
@@ -5469,11 +5490,26 @@ inline void merge_patch_back(T* p, std::size_t clean_n, std::vector<T>& patch, C
     }
     std::size_t ci = clean_n, pi = patch_n, out = clean_n + patch_n;
     while (pi != 0) {
-        if (ci != 0 && comp(patch[pi - 1], p[ci - 1])) {
-            --ci; --out; p[out] = std::move(p[ci]);
-        } else {
-            --pi; --out; p[out] = std::move(patch[pi]);
+        const T& pv = patch[pi - 1];
+        // Trailing run of the clean side that is >= pv: it belongs after pv.
+        std::size_t t = 0, step = 1;
+        while (t + step <= ci && !comp(p[ci - (t + step)], pv)) {
+            t += step;
+            step <<= 1;
         }
+        std::size_t lo = t, hi = std::min<std::size_t>(t + step, ci);
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo + 1) / 2;
+            if (!comp(p[ci - mid], pv)) lo = mid;
+            else                        hi = mid - 1;
+        }
+        // lo elements of the run, then one patch element.
+        if (lo) move_range_bulk(p + (out - lo), p + (ci - lo), lo);
+        out -= lo;
+        ci  -= lo;
+        --out;
+        p[out] = std::move(patch[pi - 1]);
+        --pi;
     }
 }
 
@@ -5573,10 +5609,25 @@ inline bool try_dirty_patch_merge(T* p, std::size_t n, Comp comp,
         std::vector<T> patch;
         patch.reserve(dirty_count);
         std::size_t w = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (is_dirty(i)) patch.push_back(std::move(p[i]));
-            else if (w != i) p[w] = std::move(p[i]), ++w;
-            else ++w;
+        // Word at a time: a patch is a fraction of a percent of the range, so
+        // nearly every word is entirely clean and slides as one block instead
+        // of sixty-four tested elements.
+        const std::size_t nwords = (n >> 6) + 1;
+        for (std::size_t wi = 0; wi < nwords; ++wi) {
+            const std::size_t base = wi << 6;
+            if (base >= n) break;
+            const std::size_t cnt = std::min<std::size_t>(64, n - base);
+            const std::uint64_t bw = bits[wi];
+            if (bw == 0 && cnt == 64) {
+                if (w != base) move_range_bulk(p + w, p + base, 64);
+                w += 64;
+                continue;
+            }
+            for (std::size_t k = 0; k < cnt; ++k) {
+                if ((bw >> k) & 1u) patch.push_back(std::move(p[base + k]));
+                else if (w != base + k) p[w] = std::move(p[base + k]), ++w;
+                else ++w;
+            }
         }
         if (w + patch.size() != n) return false;       // defensive
         merge_patch_back(p, w, patch, before);
@@ -5672,12 +5723,23 @@ inline bool try_displacement_patch_merge(T* p, std::size_t n, Comp comp,
         std::vector<T> patch;
         patch.reserve(low + high);
         std::size_t w = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            const std::uint64_t mask = std::uint64_t(1) << (i & 63);
-            if (((suf[i >> 6] | pre[i >> 6]) & mask) != 0) patch.push_back(std::move(p[i]));
-            else {
-                if (w != i) p[w] = std::move(p[i]);
-                ++w;
+        const std::size_t nwords = (n >> 6) + 1;
+        for (std::size_t wi = 0; wi < nwords; ++wi) {
+            const std::size_t base = wi << 6;
+            if (base >= n) break;
+            const std::size_t cnt = std::min<std::size_t>(64, n - base);
+            const std::uint64_t bw = suf[wi] | pre[wi];
+            if (bw == 0 && cnt == 64) {
+                if (w != base) move_range_bulk(p + w, p + base, 64);
+                w += 64;
+                continue;
+            }
+            for (std::size_t k = 0; k < cnt; ++k) {
+                if ((bw >> k) & 1u) patch.push_back(std::move(p[base + k]));
+                else {
+                    if (w != base + k) p[w] = std::move(p[base + k]);
+                    ++w;
+                }
             }
         }
         if (w + patch.size() != n) return false;      // defensive
