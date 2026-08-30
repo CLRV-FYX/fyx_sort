@@ -11407,8 +11407,8 @@ inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp) {
         // middle and merging costs about as much as sorting the whole range.
         if (tail <= head || (tail - head) * 2u > n) return false;
 
-        sort_st(p + head, tail - head, comp, false);
-
+        // Everything that can fail fails before anything is moved, so a range
+        // this weapon declines is left exactly as it was.
         const std::size_t need1 = tail < n ? std::min(tail - head, n - tail) : std::size_t(0);
         const std::size_t need2 = std::min(head, n - head);
         std::unique_ptr<ScratchLease<T>> lease;
@@ -11418,6 +11418,7 @@ inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp) {
             if (!lease->valid()) return false;
             buf = lease->get();
         }
+        sort_st(p + head, tail - head, comp, false);
         if (tail < n) merge_adjacent_runs(p, head, tail, n, buf, before);
         merge_adjacent_runs(p, 0, head, n, buf, before);
         return true;

@@ -113,6 +113,12 @@ static std::vector<T> shape(const char* name, std::size_t n) {
         }
         return v;
     }
+    // ordered except for one contiguous stretch: a sorted table with a batch
+    // of new records dropped into the middle of it
+    if (s == "affix") {
+        std::shuffle(v.begin() + n / 2 - n / 10, v.begin() + n / 2 + n / 10, rng);
+        return v;
+    }
     // one long segment spliced to the front
     if (s == "splice") {
         std::rotate(v.begin(), v.begin() + n / 7, v.begin() + n / 7 + n / 9);
@@ -149,7 +155,7 @@ static void check_shapes(const char* tname, std::size_t n,
                          bool (*extra)(const std::vector<T>&, const std::vector<T>&)) {
     const char* shapes[] = {"sorted", "reversed", "allequal", "rotate", "rotate_back",
                             "concat2", "organ", "three_runs", "local_swap", "far_swap",
-                            "block_move", "splice", "random"};
+                            "block_move", "splice", "affix", "random"};
     for (const char* s : shapes) {
         rng.seed(0xABCDEF123456789ULL);
         const std::vector<T> base = shape<T>(s, n);
@@ -173,19 +179,21 @@ static void check_shapes(const char* tname, std::size_t n,
 template <class T, class Gen>
 static void check_weapons_direct(const char* tname, std::size_t n, Gen gen) {
     const char* shapes[] = {"sorted", "reversed", "allequal", "rotate", "concat2", "organ",
-                            "three_runs", "local_swap", "far_swap", "block_move", "splice", "random"};
+                            "three_runs", "local_swap", "far_swap", "block_move", "splice",
+                            "affix", "random"};
     for (const char* s : shapes) {
         rng.seed(0xABCDEF123456789ULL);
         const std::vector<T> base = gen(s, n);
         const std::vector<T> expect = [&] { std::vector<T> e = base; std::sort(e.begin(), e.end()); return e; }();
-        const char* wnames[] = {"natural_run", "dirty_patch", "displacement_patch"};
-        for (int w = 0; w < 3; ++w) {
+        const char* wnames[] = {"natural_run", "dirty_patch", "displacement_patch", "sorted_affix"};
+        for (int w = 0; w < 4; ++w) {
             std::vector<T> v = base;
             bool fired = false;
             switch (w) {
                 case 0: fired = fyx::detail::try_natural_run_merge_adaptive(v.data(), v.size(), fyx::less{}); break;
                 case 1: fired = fyx::detail::try_dirty_patch_merge_adaptive(v.data(), v.size(), fyx::less{}); break;
-                default: fired = fyx::detail::try_displacement_patch_merge_adaptive(v.data(), v.size(), fyx::less{}); break;
+                case 2:  fired = fyx::detail::try_displacement_patch_merge_adaptive(v.data(), v.size(), fyx::less{}); break;
+                default: fired = fyx::detail::try_sorted_affix_sort(v.data(), v.size(), fyx::less{}); break;
             }
             ++checks;
             if (fired && v != expect) {
@@ -213,6 +221,8 @@ static void check_random_declines() {
         auto w = v;
         CHECK(!fyx::detail::try_natural_run_merge_adaptive(w.data(), w.size(), fyx::less{}),
               "natural-run merge declines on random input");
+        CHECK(!fyx::detail::try_sorted_affix_sort(w.data(), w.size(), fyx::less{}),
+              "sorted-affix sort declines on random input");
         CHECK(w == v, "natural-run merge leaves random input untouched");
     }
     {
@@ -226,6 +236,27 @@ static void check_random_declines() {
         CHECK(!fyx::detail::try_displacement_patch_merge_adaptive(w.data(), w.size(), fyx::less{}),
               "displacement-patch merge declines on random input");
         CHECK(w == v, "displacement-patch merge leaves random input untouched");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3b. the shapes each weapon exists for are the ones it fires on
+// ---------------------------------------------------------------------------
+static void check_weapons_fire() {
+    const std::size_t n = 300000;
+    rng.seed(0xABCDEF123456789ULL);
+    {
+        std::vector<std::int32_t> v = shape<std::int32_t>("affix", n);
+        const std::vector<std::int32_t> expect = [&] { auto e = v; std::sort(e.begin(), e.end()); return e; }();
+        CHECK(fyx::detail::try_sorted_affix_sort(v.data(), v.size(), fyx::less{}),
+              "sorted-affix sort fires on a range ordered except for one stretch");
+        CHECK(v == expect, "sorted-affix sort output");
+    }
+    rng.seed(0xABCDEF123456789ULL);
+    {   // the same shape reached through the public entry point
+        std::vector<std::int32_t> v = shape<std::int32_t>("affix", n);
+        fyx::sort(v);
+        CHECK(std::is_sorted(v.begin(), v.end()), "ordered-except-one-stretch input sorts");
     }
 }
 
@@ -344,6 +375,9 @@ int main() {
     check_weapons_direct<std::int32_t>("int32", 300000, shape<std::int32_t>);
     check_weapons_direct<std::int64_t>("int64", 300000, shape<std::int64_t>);
     check_weapons_direct<std::string>("string", 200000, shape<std::string>);
+
+    std::printf("adaptive: weapons fire on the shapes they exist for\n");
+    check_weapons_fire();
 
     std::printf("adaptive: cheap rejection on high-entropy input\n");
     check_random_declines();
