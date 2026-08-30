@@ -5,6 +5,26 @@
 Date: 2026-08-27
 
 ### Added
+- `fyx::sort` accepts containers whose storage is not one block.  `std::deque`
+  and `std::list` used to be refused (`list` would not even compile): a
+  container with a `.data()` keeps taking the contiguous kernels, one with its
+  own `sort()` (the node-based containers) keeps splicing -- faster than moving,
+  and nothing a buffer could beat -- and anything else is moved into a buffer,
+  sorted by the same kernels a vector gets, and moved back.  A segmented range
+  also used to have `Options` silently dropped, so asking for parallel cost
+  exactly what not asking cost.  1M int32 in a `std::deque`: 0.051s before,
+  0.026s now, against 0.086s for `std::sort`.
+- `tools/fyx_test.py` -- one portable file holding the whole test suite.  It
+  writes the C++ out, finds the header and a compiler, builds, and runs:
+  `python3 tools/fyx_test.py [--header P] [--compiler clang++] [--bench]
+  [--rlimit-mb N]`.  743 checks: 17 shapes x 6 types serial and parallel, sizes
+  from 0 to either side of every dispatch threshold, containers, comparators,
+  and stress -- inconsistent and non-transitive comparators, throwing
+  comparators and throwing moves (checked for lost or duplicated elements),
+  reentrant sorts from inside a comparator, eight threads sorting at once,
+  repeated sorts of the same input, move-only payloads, NaN / -0 / +0 /
+  denormals, and a memory-cap probe that runs under `ulimit -v` to prove the
+  degraded paths work when scratch, buffers and worker threads cannot be had.
 
 - Low-cardinality counting paths:
   - dense integer range counting;
@@ -59,6 +79,20 @@ Date: 2026-08-27
 - Custom comparators that sample as natural ascending/descending order now safely recover the radix/counting fast paths for arithmetic types and the high-prefix radix path for high-entropy 64-bit numerics; partially-sorted natural-comparator numerics also probe this guarded radix route before pdq/patch fallback.  Low-cardinality `std::string` comparator inputs now use unordered value-count/fill regardless of comparator type, and large inputs use sampled exact keys plus parallel count/fill while sorting only the distinct strings; guarded MSD remains available for natural-order string random data.
 - Sample-sort classification now uses an unrolled fixed-256 Eytzinger descent for cheap/trivial payloads while keeping the compact looped classifier, previous 128K recursion handoff, and block scatter for `std::string` fallback paths. Non-string serial sample-sort scatter uses a single prefix-position pass. Parallel arithmetic comparator fallback now uses a 64-way top partition with the old 256-way sampling budget, cutting random numeric classification from eight to six comparisons per element while preserving the 256-way low-cardinality signal. Low-distinct arithmetic samples use a tiny exact counter before falling back to pdqsort; the floating-point duplicate gate now also tries a collision-free rank16 exact counter (then the sparse hash counter as fallback) up to the 256-way sample band instead of sending 256-way float/double comparator inputs straight to pdqsort. The comparison recursion threshold remains lower for non-string data to keep high-distinct buckets in sample-sort longer when that is cheaper than large pdqsort leaves.
 - Degenerate sample-sort splitter cases now fall back to pdqsort instead of recursing without progress.
+
+### Fixed
+
+- Move-only payloads (`std::unique_ptr`) now sort.  The parallel merge assigned
+  through a const lvalue, and the sample sorts keep copies of the elements they
+  sample: both refused to compile for a type that cannot be copied.  The merge
+  moves now, and a payload that cannot be copied is routed to the comparison
+  sort or the task-parallel divide, which only move.
+- Running out of memory no longer propagates out of `fyx::sort`.  The fast paths
+  allocate -- scratch, buffers, worker threads -- and `std::sort` never does, so
+  a sorter whose fast paths do inherit that failure is strictly less robust than
+  the sort it replaces.  `bad_alloc` and a worker that cannot be started now fall
+  back to the in-place comparison sort, which needs neither.  Verified by sorting
+  2M int32 under a 60 MB address-space cap.
 
 ### Benchmark snapshot
 
