@@ -9294,6 +9294,54 @@ inline void radix_count_value_pass_banked_wide(const T* FYX_RESTRICT src,
         out[d] = bank[d] + bank[Buckets + d] + bank[2 * Buckets + d] + bank[3 * Buckets + d];
 }
 
+/// One sweep over `src` fills the digit histogram of every radix pass at once.
+///
+/// Counting pass by pass re-reads the whole array once per pass: at 8M int32
+/// that is 0.0134s of the 0.0863s the two passes spend.  The digits of all the
+/// passes are shifts of one and the same encoded key, so a single read of the
+/// array -- and a single encode per element -- can feed all of them.  Four
+/// banks per pass keep consecutive increments off the same cache line, which
+/// is what keeps the read-modify-write chain from stalling.
+///
+/// `out` receives `Passes` consecutive histograms of `1 << Bits` counters.
+template <class T, unsigned Bits, unsigned Passes>
+inline void radix_count_all_value_passes_wide(const T* FYX_RESTRICT src, std::size_t n,
+                                              unsigned first_shift,
+                                              std::uint32_t* FYX_RESTRICT out) noexcept {
+    static_assert(Bits > 8 && Bits <= 13, "wide radix count is tuned for 9..13 bits");
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr std::size_t Buckets = std::size_t(1) << Bits;
+    constexpr std::size_t kBanks  = 4;
+    constexpr Key Mask = Key(Buckets - 1);
+
+    std::array<std::uint32_t, kBanks * Passes * Buckets> bank{};
+    std::size_t i = 0;
+    for (; i + kBanks <= n; i += kBanks) {
+        prefetch_stream(src, i, n);
+        Key k[kBanks];
+        for (std::size_t j = 0; j < kBanks; ++j) k[j] = RT::encode(src[i + j]);
+        for (unsigned pi = 0; pi < Passes; ++pi) {
+            const unsigned shift = first_shift + pi * Bits;
+            std::uint32_t* b = bank.data() + std::size_t(pi) * kBanks * Buckets;
+            for (std::size_t j = 0; j < kBanks; ++j)
+                ++b[j * Buckets + static_cast<std::size_t>((k[j] >> shift) & Mask)];
+        }
+    }
+    for (; i < n; ++i) {
+        const Key k = RT::encode(src[i]);
+        for (unsigned pi = 0; pi < Passes; ++pi)
+            ++bank[std::size_t(pi) * kBanks * Buckets +
+                   static_cast<std::size_t>((k >> (first_shift + pi * Bits)) & Mask)];
+    }
+    for (unsigned pi = 0; pi < Passes; ++pi) {
+        const std::uint32_t* b = bank.data() + std::size_t(pi) * kBanks * Buckets;
+        std::uint32_t* o = out + std::size_t(pi) * Buckets;
+        for (std::size_t d = 0; d < Buckets; ++d)
+            o[d] = b[d] + b[Buckets + d] + b[2 * Buckets + d] + b[3 * Buckets + d];
+    }
+}
+
 template <class Key, unsigned Bits>
 inline void radix_scatter_key_pass_wide(const Key* FYX_RESTRICT src, std::size_t n,
                                         Key* FYX_RESTRICT dst, unsigned shift,
@@ -9559,8 +9607,196 @@ inline void radix_scatter_key_decode_pass_wide(const Key* FYX_RESTRICT src, std:
     if (can_stream) store_fence();
 }
 
+// ---------------------------------------------------------------------------
+// Vectorised tie scan
+// ---------------------------------------------------------------------------
+// After the two radix passes every key is ordered by its top PrefixBits bits
+// and only the groups that share a prefix still need sorting.  Finding those
+// groups means comparing every element's prefix with its predecessor's -- a
+// full pass whose cost has nothing to do with how little work it turns up.
+// On uniform data almost every group holds a single element, so the scan is
+// the most expensive part of the repair and repairs almost nothing.
+//
+// AVX-512 answers for sixteen elements (eight for 64-bit keys) at a time.  One
+// load, one encode, one shift, and one compare against the vector rotated by
+// a single lane with the previous prefix shifted into lane 0: the resulting
+// mask has a bit for every lane whose prefix equals its predecessor's, which
+// is exactly "this vector starts a tie group".  An empty mask -- the common
+// case -- skips the whole vector.  Only a vector that actually holds a tie
+// falls back to the element-at-a-time path, and only for its own lanes.
+//
+// The vector encoder reproduces RadixTraits<T>::encode bit for bit: unsigned
+// keys pass through, signed keys flip the sign bit, and IEC-559 floats flip
+// with (arithmetic-shift(sign) | sign_bit), all ones for a negative.
+// ---------------------------------------------------------------------------
+
+#if FYX_HAS_AVX512_CODE
+FYX_ISA_BEGIN("avx512f")
+namespace isa_avx512_ties {
+
+/// 1 << 63 as a signed long long, spelled once so the intrinsics macro sees a
+/// plain identifier instead of a cast it cannot parse.
+static constexpr long long kSign64 = -9223372036854775807LL - 1;
+
+template <unsigned Size, bool Signed, bool Float>
+struct TieKeyImpl {
+    static constexpr bool     defined = false;
+    static constexpr unsigned lanes   = 1;
+    static inline __m512i enc(__m512i) { return _mm512_setzero_si512(); }
+};
+
+template <> struct TieKeyImpl<4, false, false> {          // uint32
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 16;
+    static inline __m512i enc(__m512i v) { return v; }
+};
+template <> struct TieKeyImpl<4, true, false> {           // int32
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 16;
+    static inline __m512i enc(__m512i v) {
+        return _mm512_xor_si512(v, _mm512_set1_epi32(int(0x80000000u)));
+    }
+};
+template <> struct TieKeyImpl<4, true, true> {            // float
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 16;
+    static inline __m512i enc(__m512i u) {
+        const __m512i m = _mm512_or_si512(_mm512_srai_epi32(u, 31),
+                                          _mm512_set1_epi32(int(0x80000000u)));
+        return _mm512_xor_si512(u, m);
+    }
+};
+template <> struct TieKeyImpl<8, false, false> {          // uint64
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 8;
+    static inline __m512i enc(__m512i v) { return v; }
+};
+template <> struct TieKeyImpl<8, true, false> {           // int64
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 8;
+    static constexpr long long kSign  = kSign64;
+    static inline __m512i enc(__m512i v) {
+        return _mm512_xor_si512(v, _mm512_set1_epi64(kSign));
+    }
+};
+template <> struct TieKeyImpl<8, true, true> {            // double
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 8;
+    static constexpr long long kSign  = kSign64;
+    static inline __m512i enc(__m512i u) {
+        const __m512i m = _mm512_or_si512(_mm512_srai_epi64(u, 63),
+                                          _mm512_set1_epi64(kSign));
+        return _mm512_xor_si512(u, m);
+    }
+};
+
+template <class T>
+using TieKey = TieKeyImpl<sizeof(T),
+                          std::is_signed<T>::value || std::is_floating_point<T>::value,
+                          std::is_floating_point<T>::value>;
+
+/// Sorts every run of equal top-PrefixBits prefixes in `p` in place.
+template <class T, unsigned PrefixBits>
+inline void scan_ties(T* FYX_RESTRICT p, std::size_t n) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    using TK  = TieKey<T>;
+    constexpr unsigned Lanes = TK::lanes;
+    constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
+    if (n < 2) return;
+
+    auto repair = [&](std::size_t lo, std::size_t hi) {
+        for (std::size_t a = lo + 1; a < hi; ++a) {
+            T v = p[a];
+            const Key kv = RT::encode(v);
+            std::size_t b = a;
+            while (b > lo && RT::encode(p[b - 1]) > kv) { p[b] = p[b - 1]; --b; }
+            p[b] = v;
+        }
+    };
+
+    std::size_t i = 1, group_lo = 0;
+    Key prev = RT::encode(p[0]) >> Shift;
+
+    // Element-at-a-time fallback, used for the rare vector that holds a tie
+    // and for the tail that does not fill one.
+    auto step = [&](std::size_t stop) {
+        for (; i < stop; ++i) {
+            const Key cur = RT::encode(p[i]) >> Shift;
+            if (cur != prev) {
+                if (i - group_lo > 1) repair(group_lo, i);
+                group_lo = i;
+                prev = cur;
+            }
+        }
+    };
+
+    while (i + Lanes <= n) {
+        const __m512i pref = Lanes == 16
+            ? _mm512_srli_epi32(TK::enc(_mm512_loadu_si512(
+                  reinterpret_cast<const void*>(p + i))), Shift)
+            : _mm512_srli_epi64(TK::enc(_mm512_loadu_si512(
+                  reinterpret_cast<const void*>(p + i))), Shift);
+        // Rotate by one lane, shifting the previous vector's last prefix in.
+        // The set1/intrinsic macros want plain identifiers, not casts.
+        const int       pv32 = int(std::uint32_t(prev));
+        const long long pv64 = static_cast<long long>(std::uint64_t(prev));
+        __m512i carry;
+        __mmask16 ties;
+        if constexpr (Lanes == 16) {
+            carry = _mm512_mask_set1_epi32(pref, __mmask16(1u << 15), pv32);
+            ties  = _mm512_cmpeq_epi32_mask(pref, _mm512_alignr_epi32(pref, carry, 15));
+        } else {
+            carry = _mm512_mask_set1_epi64(pref, __mmask8(1u << 7), pv64);
+            ties  = __mmask16(_mm512_cmpeq_epi64_mask(pref, _mm512_alignr_epi64(pref, carry, 7)));
+        }
+        if (ties == 0) {
+            // Every element here starts its own group: close the one that was
+            // open and skip the whole vector.
+            if (i - group_lo > 1) repair(group_lo, i);
+            i += Lanes;
+            group_lo = i - 1;
+        } else {
+            // A tie poisons only its own run of lanes.  Walk the set bits --
+            // one iteration per group, not per element -- and repair just
+            // those; every other element here is a group of one.  A run of
+            // set bits [a..b] means elements i+a .. i+b+1 share a prefix, so
+            // the group is [i+a, i+b+2), or [group_lo, i+b+2) when the run
+            // reaches lane 0 and continues the group that was already open.
+            if ((ties & 1u) == 0 && i - group_lo > 1) repair(group_lo, i);
+            std::uint32_t m = static_cast<std::uint32_t>(ties);
+            while (m) {
+                const unsigned a = unsigned(__builtin_ctz(m));
+                unsigned b = a;
+                while (b + 1 < Lanes && (m & (1u << (b + 1)))) ++b;
+                // Bits a..b set means elements i+a-1 .. i+b share a prefix.
+                const std::size_t lo = (a == 0) ? group_lo : i + a - 1;
+                const std::size_t hi = i + b + 1;
+                if (b == Lanes - 1) group_lo = lo;       // runs off the end
+                else if (hi - lo > 1) repair(lo, hi);
+                m &= ~((1u << (b + 1)) - 1);
+            }
+            if ((ties & (1u << (Lanes - 1))) == 0) group_lo = i + Lanes - 1;
+            i += Lanes;
+        }
+        prev = RT::encode(p[i - 1]) >> Shift;   // i has advanced past the vector
+    }
+    step(n);
+    if (n - group_lo > 1) repair(group_lo, n);
+}
+
+}   // namespace isa_avx512_ties
+FYX_ISA_END
+#endif   // FYX_HAS_AVX512_CODE
+
 template <class T, unsigned PrefixBits>
 inline void radix_sort_high_prefix_decoded_ties(T* p, std::size_t n) {
+#if FYX_HAS_AVX512_CODE
+    if constexpr (isa_avx512_ties::TieKey<T>::defined) {
+        if (use_avx512()) { isa_avx512_ties::scan_ties<T, PrefixBits>(p, n); return; }
+    }
+#endif
+
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
     constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
@@ -11116,20 +11352,33 @@ inline bool try_serial_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bool
             Key* b = a + n;
             Key* src = a;
             Key* dst = b;
-            std::vector<std::uint32_t> count(Buckets);
+            std::vector<std::uint32_t> count(std::size_t(Passes) * Buckets);
             std::vector<std::size_t> pos(Buckets);
             const bool can_stream = have_nt_stores();
+            // Only worth fusing from three passes up.  Passes after the first
+            // would otherwise re-read the scratch array, which the previous
+            // scatter wrote and which has already left the cache, so one sweep
+            // over the original keys beats several: double 1M, three passes,
+            // 0.0042s -> 0.0018s.  With two passes the extra banks cost more
+            // than the saved read (int32 8M: 0.0118s -> 0.0124s), so those keep
+            // counting pass by pass.
+            if constexpr (Passes >= 3)
+                radix_count_all_value_passes_wide<T, Bits, Passes>(p, n, FirstShift, count.data());
 
             for (unsigned pi = 0; pi < Passes; ++pi) {
                 const unsigned shift = FirstShift + pi * Bits;
-                if (pi == 0)
-                    radix_count_value_pass_banked_wide<T, Bits>(p, n, shift, count.data());
-                else
-                    radix_count_key_pass_banked_wide<Key, Bits>(src, n, shift, count.data());
+                if constexpr (Passes < 3) {
+                    if (pi == 0)
+                        radix_count_value_pass_banked_wide<T, Bits>(p, n, shift, count.data());
+                    else
+                        radix_count_key_pass_banked_wide<Key, Bits>(
+                            src, n, shift, count.data() + Buckets);
+                }
+                const std::uint32_t* pc = count.data() + std::size_t(pi) * Buckets;
                 std::size_t run = 0;
                 for (std::size_t d = 0; d < Buckets; ++d) {
                     pos[d] = run;
-                    run += count[d];
+                    run += pc[d];
                 }
                 if (pi == 0) {
                     radix_scatter_encode_pass_wide<T, Key, Bits>(p, n, src, shift, pos.data(), can_stream);
