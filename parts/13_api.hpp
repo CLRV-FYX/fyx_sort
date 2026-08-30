@@ -5604,9 +5604,67 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
 // sorted ascending and must reverse to honour a ">" comparator).  For the
 // generic comparison path it is ignored and `comp` is used directly.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Ordered except for one stretch in the middle
+// ---------------------------------------------------------------------------
+
 template <class T, class Comp>
 inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
-                    const InputProfile<T, Comp>* known_profile = nullptr) {
+                    const InputProfile<T, Comp>* known_profile = nullptr);
+
+/// Sorts a range that is ordered except for one contiguous stretch: a table
+/// with a batch of new records appended, a log with an unflushed tail, a file
+/// with one damaged region.  Those cost sort(middle) plus one merge pass, and
+/// paying for the whole range instead is the difference between 0.005s and
+/// 0.031s for a million int32 whose last tenth is shuffled -- which is what
+/// radix spends, because radix cannot see order that stops part way.
+///
+/// Finding the stretch is free.  Both scans walk inwards from an end and stop
+/// at the first inversion, so a range with no ordered head or tail costs two
+/// comparisons, and the cost of a range that has one is the length of it.
+template <class T, class Comp>
+inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp) {
+#if !FYX_ENABLE_ADAPTIVE_WEAPONS
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < 8192) return false;
+    if constexpr (!std::is_move_constructible<T>::value ||
+                  !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        auto before = adaptive_order<T>(comp);
+        std::size_t head = 1;
+        while (head < n && !before(p[head], p[head - 1])) ++head;
+        if (head == n) return true;                  // ordered already
+        std::size_t tail = n - 1;
+        while (tail > head && !before(p[tail], p[tail - 1])) --tail;
+        // No room between the two affixes, or so little order that sorting the
+        // middle and merging costs about as much as sorting the whole range.
+        if (tail <= head || (tail - head) * 2u > n) return false;
+
+        sort_st(p + head, tail - head, comp, false);
+
+        const std::size_t need1 = tail < n ? std::min(tail - head, n - tail) : std::size_t(0);
+        const std::size_t need2 = std::min(head, n - head);
+        std::unique_ptr<ScratchLease<T>> lease;
+        T* buf = nullptr;
+        if constexpr (std::is_trivially_copyable<T>::value) {
+            lease.reset(new ScratchLease<T>(need1 > need2 ? need1 : need2));
+            if (!lease->valid()) return false;
+            buf = lease->get();
+        }
+        if (tail < n) merge_adjacent_runs(p, head, tail, n, buf, before);
+        merge_adjacent_runs(p, 0, head, n, buf, before);
+        return true;
+    }
+#endif
+}
+
+template <class T, class Comp>
+inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
+                    const InputProfile<T, Comp>* known_profile) {
     constexpr bool radix_type = radix_supported_v<T>;
     const bool ascending      = is_ascending_v<Comp, T>;
     const bool radix_order    = radix_type && (ascending || descending);
@@ -5645,6 +5703,8 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
     if (try_numeric_half_organ_fill(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
     // Adaptive natural-run merge: see sort_pointer_core.
     if (try_natural_run_merge_adaptive(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+    // Ordered except for one stretch in the middle: see try_sorted_affix_sort.
+    if (try_sorted_affix_sort(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
 
     const bool high_entropy = prof && prof->is_high_entropy;
     const bool partial_pdq = prof && prof->is_partially_sorted &&
@@ -6133,6 +6193,14 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
     // a full comparison recursion.  Random data is rejected inside the scan
     // after touching a couple of hundred elements.
     if (n > detail::kNetworkMax && detail::try_natural_run_merge_adaptive(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+    // Ordered except for one stretch in the middle: see
+    // try_sorted_affix_sort.  Like the run merge this has to be reachable
+    // before the parallel kernels are chosen, or a range that is three
+    // quarters sorted pays for all of it on every worker.
+    if (n > detail::kNetworkMax && detail::try_sorted_affix_sort(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
     }
