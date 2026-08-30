@@ -9066,11 +9066,11 @@ inline bool radix_high_prefix_probe(const T* p, std::size_t n) noexcept {
     } else {
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n;
             return false;
         } else {
-            constexpr unsigned Shift = 64u - PrefixBits;
+            constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
             constexpr std::size_t Cap = 2048;
             constexpr std::size_t Mask = Cap - 1;
             std::array<Key, Cap> keys{};
@@ -9102,7 +9102,7 @@ template <class T, unsigned PrefixBits>
 inline void radix_sort_high_prefix_value_ties(T* p, std::size_t n) {
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
-    constexpr unsigned Shift = 64u - PrefixBits;
+    constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
     if (n < 2) return;
     std::size_t group_lo = 0;
     Key prev_prefix = RT::encode(p[0]) >> Shift;
@@ -9130,7 +9130,7 @@ inline void radix_sort_high_prefix_value_ties(T* p, std::size_t n) {
 
 template <class Key, unsigned PrefixBits>
 inline void radix_sort_high_prefix_key_ties(Key* p, std::size_t n) {
-    constexpr unsigned Shift = 64u - PrefixBits;
+    constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
     std::size_t i = 0;
     while (i < n) {
         const Key prefix = p[i] >> Shift;
@@ -9158,7 +9158,7 @@ inline bool try_parallel_radix_high_prefix_value_sort(T* p, std::size_t n, bool 
             return false;
         } else {
             constexpr unsigned PrefixBytes = PrefixBits / 8;
-            constexpr unsigned FirstShift = 64u - PrefixBits;
+            constexpr unsigned FirstShift = unsigned(sizeof(Key) * 8) - PrefixBits;
             if (n < (std::size_t(1) << 19) || !parallel_available()) return false;
             if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
 
@@ -9563,7 +9563,7 @@ template <class T, unsigned PrefixBits>
 inline void radix_sort_high_prefix_decoded_ties(T* p, std::size_t n) {
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
-    constexpr unsigned Shift = 64u - PrefixBits;
+    constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
     if (n < 2) return;
     std::size_t group_lo = 0;
     Key prev_prefix = RT::encode(p[0]) >> Shift;
@@ -9599,12 +9599,12 @@ inline bool try_parallel_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bo
     } else {
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n; (void)descending;
             return false;
         } else {
             constexpr unsigned Passes = PrefixBits / Bits;
-            constexpr unsigned FirstShift = 64u - PrefixBits;
+            constexpr unsigned FirstShift = unsigned(sizeof(Key) * 8) - PrefixBits;
             constexpr std::size_t Buckets = std::size_t(1) << Bits;
             if (n < (std::size_t(1) << 19) || !parallel_available()) return false;
             if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
@@ -9713,7 +9713,7 @@ inline unsigned radix_choose_prefix_bits(const T* p, std::size_t n,
     constexpr std::size_t S = 4096;
     if (n < S * 8) return wide;
     std::array<Key, S> sample;
-    const unsigned shift = 64u - narrow;
+    const unsigned shift = unsigned(sizeof(Key) * 8) - narrow;
     for (std::size_t j = 0; j < S; ++j)
         sample[j] = RT::encode(p[(j * (n - 1)) / (S - 1)]) >> shift;
     std::sort(sample.begin(), sample.end());
@@ -9732,7 +9732,7 @@ inline bool try_parallel_radix_high_prefix_sort(T* p, std::size_t n, bool descen
         return false;
     } else {
         using Key = typename RadixTraits<T>::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n; (void)descending;
             return false;
         } else if constexpr (std::is_same<T, double>::value ||
@@ -9751,6 +9751,24 @@ inline bool try_parallel_radix_high_prefix_sort(T* p, std::size_t n, bool descen
             return w == 26
                 ? try_parallel_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending)
                 : try_parallel_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
+        } else if constexpr (sizeof(Key) == 4) {
+            // Two threads make this the faster of the two parallel sorts up to
+            // about three million elements, and the slower one above that:
+            // 2M 0.0125 vs 0.0176, 4M 0.0253 vs 0.0201, 8M 0.0516 vs 0.0397,
+            // 16M 0.1137 vs 0.0787.  Decline past the crossover and let the
+            // dispatcher fall back to try_parallel_radix32_wide_sort.
+            if (n > (std::size_t(3) << 20)) return false;
+            // A 32-bit key gets the same two-pass treatment as a 64-bit one.
+            // Routing it here instead of through try_parallel_radix32_wide_sort
+            // is what makes random int32 scale with the core count: at 1M the
+            // wide sort gained 1.13x from two threads and this one gains 1.7x.
+            if (n <= (std::size_t(1) << 21)) {
+                const unsigned w = radix_choose_prefix_bits<T>(p, n, 24, 26);
+                return w == 24
+                    ? try_parallel_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending)
+                    : try_parallel_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
+            }
+            return try_parallel_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
         } else {
             (void)p; (void)n; (void)descending;
             return false;
@@ -11082,14 +11100,14 @@ inline bool try_serial_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bool
     } else {
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n; (void)descending;
             return false;
         } else {
             if (n < std::size_t(262144)) return false;
             if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
             constexpr unsigned Passes = PrefixBits / Bits;
-            constexpr unsigned FirstShift = 64u - PrefixBits;
+            constexpr unsigned FirstShift = unsigned(sizeof(Key) * 8) - PrefixBits;
             constexpr std::size_t Buckets = std::size_t(1) << Bits;
 
             ScratchLease<Key> lease(n * 2);
@@ -11136,7 +11154,7 @@ inline bool try_serial_radix_high_prefix_sort(T* p, std::size_t n, bool descendi
         return false;
     } else {
         using Key = typename RadixTraits<T>::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n; (void)descending;
             return false;
         } else if constexpr (std::is_same<T, double>::value ||
@@ -11152,6 +11170,19 @@ inline bool try_serial_radix_high_prefix_sort(T* p, std::size_t n, bool descendi
             return w == 26
                 ? try_serial_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending)
                 : try_serial_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
+        } else if constexpr (sizeof(Key) == 4) {
+            // The helpers take their shifts from the key width now, so a 32-bit
+            // key gets the same treatment a 64-bit one does: two passes over
+            // the high bits, then the ties are finished bucket by bucket while
+            // they are still in cache.  1M random int32: 0.0120s through the
+            // 32-wide sort, 0.0090s here.  8M: 0.154s against 0.080s.
+            if (n <= (std::size_t(1) << 21)) {
+                const unsigned w = radix_choose_prefix_bits<T>(p, n, 24, 26);
+                return w == 24
+                    ? try_serial_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending)
+                    : try_serial_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
+            }
+            return try_serial_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
         } else {
             (void)p; (void)n; (void)descending;
             return false;
@@ -11363,8 +11394,8 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
             done = try_radix_permutation_range_sort(p, n, descending);
 #if FYX_ENABLE_PARALLEL
         if (!done && prefer_parallel && high_entropy)
-            done = try_parallel_radix32_wide_sort(p, n, descending) ||
-                   try_parallel_radix_high_prefix_sort(p, n, descending);
+            done = try_parallel_radix_high_prefix_sort(p, n, descending) ||
+                   try_parallel_radix32_wide_sort(p, n, descending);
         if (!done && prefer_parallel)
             done = try_parallel_radix_sort(p, n, descending, high_entropy);
 #else
@@ -11525,11 +11556,15 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
         if constexpr (radix_type) {
             if (n >= kRadixThreshold || std::is_floating_point<T>::value) {
 #if FYX_ENABLE_PARALLEL
-                if (high_entropy && try_serial_radix32_wide_sort(p, n, descending)) {
+                // The high-prefix sort beats the 32-wide one on every size
+                // measured -- 1M int32: 0.0090s against 0.0120s, 8M: 0.080s
+                // against 0.154s -- so it goes first and the wide sort is the
+                // fallback for the shapes whose prefix it declines.
+                if (high_entropy && try_serial_radix_high_prefix_sort(p, n, descending)) {
                     record_dispatch(DispatchDecision::Radix);
                     return;
                 }
-                if (high_entropy && try_serial_radix_high_prefix_sort(p, n, descending)) {
+                if (high_entropy && try_serial_radix32_wide_sort(p, n, descending)) {
                     record_dispatch(DispatchDecision::Radix);
                     return;
                 }
@@ -12039,8 +12074,8 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             // repairs decline, send them straight to the radix family.
 #if FYX_ENABLE_PARALLEL
             if (detail::dynamic_parallel_allowed<T>(n, o)) {
-                if (detail::try_parallel_radix32_wide_sort(p, n, descending) ||
-                    detail::try_parallel_radix_high_prefix_sort(p, n, descending) ||
+                if (detail::try_parallel_radix_high_prefix_sort(p, n, descending) ||
+                    detail::try_parallel_radix32_wide_sort(p, n, descending) ||
                     detail::try_parallel_radix_sort(p, n, descending, true)) {
                     detail::record_dispatch(detail::DispatchDecision::Radix);
                     return;
@@ -12153,8 +12188,8 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             }
             if (partial_pdq && detail::try_partially_sorted_local_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
             if (detail::try_radix_permutation_range_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
-            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
+            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_parallel_radix_sort(p, n, descending, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
         } else {
@@ -12184,11 +12219,11 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
             }
-            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) {
+            if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
             }
-            if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) {
+            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
             }

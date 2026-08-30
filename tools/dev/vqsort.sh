@@ -22,11 +22,21 @@ cmake -S build/highway -B build/highway/build -DCMAKE_BUILD_TYPE=Release \
       -DHWY_ENABLE_TESTS=OFF -DHWY_ENABLE_EXAMPLES=OFF -DHWY_ENABLE_CONTRIB=ON
 cmake --build build/highway/build -j"$(nproc)"
 
-g++ -std=c++17 -O3 -march=native -DNDEBUG -pthread \
-    -DFYX_MATRIX_HAVE_VQSORT -DFYX_MATRIX_HAVE_IPS4O -DFYX_MATRIX_HAVE_PDQ \
-    -I. -Ibuild/highway -Ithird_party/ips4o -Ithird_party/pdqsort \
-    bench/bench_matrix.cpp -o build/bench_matrix \
-    -Lbuild/highway/build -lhwy_contrib -lhwy -lpthread -ldl
+# ips4o keeps its header in include/ nowadays, older checkouts at the root
+IPS4O_INC=third_party/ips4o/include
+[ -f "$IPS4O_INC/ips4o.hpp" ] || IPS4O_INC=third_party/ips4o
+
+build_matrix() {
+    g++ -std=c++17 -O3 -march=native -DNDEBUG -pthread \
+        -DFYX_MATRIX_HAVE_VQSORT $1 -DFYX_MATRIX_HAVE_PDQ \
+        -I. -Ibuild/highway -I"$IPS4O_INC" -Ithird_party/pdqsort \
+        bench/bench_matrix.cpp -o build/bench_matrix \
+        -Lbuild/highway/build -lhwy_contrib -lhwy -lpthread -ldl
+}
+# current ips4o needs oneTBB for its scheduler; fall back to comparing against
+# vqsort, std::sort and pdqsort when TBB is not installed
+build_matrix -DFYX_MATRIX_HAVE_IPS4O ||
+    { echo "  (ips4o needs TBB here -- building without it)"; build_matrix; }
 
 N=${1:-1000000}
 ./build/bench_matrix --size="$N" --reps=3 | tee "build/vqsort_${N}.txt"
