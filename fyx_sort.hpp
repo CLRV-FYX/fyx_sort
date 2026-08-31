@@ -9632,7 +9632,7 @@ inline void radix_scatter_key_decode_pass_wide(const Key* FYX_RESTRICT src, std:
 
 #if FYX_HAS_AVX512_CODE
 FYX_ISA_BEGIN("avx512f")
-namespace isa_avx512_ties {
+namespace isa_avx512_keys {
 
 /// 1 << 63 as a signed long long, spelled once so the intrinsics macro sees a
 /// plain identifier instead of a cast it cannot parse.
@@ -9643,12 +9643,14 @@ struct TieKeyImpl {
     static constexpr bool     defined = false;
     static constexpr unsigned lanes   = 1;
     static inline __m512i enc(__m512i) { return _mm512_setzero_si512(); }
+    static inline __m512i dec(__m512i) { return _mm512_setzero_si512(); }
 };
 
 template <> struct TieKeyImpl<4, false, false> {          // uint32
     static constexpr bool     defined = true;
     static constexpr unsigned lanes   = 16;
     static inline __m512i enc(__m512i v) { return v; }
+    static inline __m512i dec(__m512i k) { return k; }
 };
 template <> struct TieKeyImpl<4, true, false> {           // int32
     static constexpr bool     defined = true;
@@ -9656,6 +9658,7 @@ template <> struct TieKeyImpl<4, true, false> {           // int32
     static inline __m512i enc(__m512i v) {
         return _mm512_xor_si512(v, _mm512_set1_epi32(int(0x80000000u)));
     }
+    static inline __m512i dec(__m512i k) { return enc(k); }
 };
 template <> struct TieKeyImpl<4, true, true> {            // float
     static constexpr bool     defined = true;
@@ -9665,11 +9668,20 @@ template <> struct TieKeyImpl<4, true, true> {            // float
                                           _mm512_set1_epi32(int(0x80000000u)));
         return _mm512_xor_si512(u, m);
     }
+    // Inverse: the encoded top bit is set when the original was positive.
+    static inline __m512i dec(__m512i k) {
+        const __m512i s = _mm512_srai_epi32(k, 31);           // all ones if positive
+        const __m512i m = _mm512_or_si512(
+            _mm512_and_si512(s, _mm512_set1_epi32(int(0x80000000u))),
+            _mm512_andnot_si512(s, _mm512_set1_epi32(-1)));
+        return _mm512_xor_si512(k, m);
+    }
 };
 template <> struct TieKeyImpl<8, false, false> {          // uint64
     static constexpr bool     defined = true;
     static constexpr unsigned lanes   = 8;
     static inline __m512i enc(__m512i v) { return v; }
+    static inline __m512i dec(__m512i k) { return k; }
 };
 template <> struct TieKeyImpl<8, true, false> {           // int64
     static constexpr bool     defined = true;
@@ -9678,6 +9690,7 @@ template <> struct TieKeyImpl<8, true, false> {           // int64
     static inline __m512i enc(__m512i v) {
         return _mm512_xor_si512(v, _mm512_set1_epi64(kSign));
     }
+    static inline __m512i dec(__m512i k) { return enc(k); }
 };
 template <> struct TieKeyImpl<8, true, true> {            // double
     static constexpr bool     defined = true;
@@ -9687,6 +9700,12 @@ template <> struct TieKeyImpl<8, true, true> {            // double
         const __m512i m = _mm512_or_si512(_mm512_srai_epi64(u, 63),
                                           _mm512_set1_epi64(kSign));
         return _mm512_xor_si512(u, m);
+    }
+    static inline __m512i dec(__m512i k) {
+        const __m512i s = _mm512_srai_epi64(k, 63);
+        const __m512i m = _mm512_or_si512(_mm512_and_si512(s, _mm512_set1_epi64(kSign)),
+                                          _mm512_andnot_si512(s, _mm512_set1_epi64(-1)));
+        return _mm512_xor_si512(k, m);
     }
 };
 
@@ -9785,15 +9804,153 @@ inline void scan_ties(T* FYX_RESTRICT p, std::size_t n) noexcept {
     if (n - group_lo > 1) repair(group_lo, n);
 }
 
-}   // namespace isa_avx512_ties
+}   // namespace isa_avx512_keys
 FYX_ISA_END
 #endif   // FYX_HAS_AVX512_CODE
+
+#if FYX_HAS_AVX512_CODE
+FYX_ISA_BEGIN("avx512f,avx512cd,avx512vpopcntdq")
+namespace isa_avx512_scat {
+
+// ---------------------------------------------------------------------------
+// Conflict-detection scatter
+// ---------------------------------------------------------------------------
+// Sixteen keys per step (eight for 64-bit), where the write-combining scatter
+// moves one element at a time:
+//
+//   vpconflictd -> which earlier lanes of this vector want the same bucket
+//   vpopcntd    -> this lane's rank among them
+//   gather      -> the bucket's running destination index
+//   + rank      -> a distinct destination for every lane, in bucket order
+//   scatter     -> the keys land in order inside their bucket
+//   scatter     -> every lane writes index+1 back; where lanes collide the
+//                  highest one wins, and that lane carries the largest index
+//                  of the group -- which is the next free position
+//
+// Needs AVX512CD and AVX512VPOPCNTDQ, hence its own ISA block.
+//
+// It beats the write-combining scatter while the array stays in cache and
+// loses to it once the array leaves: this writes single elements, so every
+// line it touches is read back first, whereas the write-combining scatter
+// flushes whole lines with non-temporal stores that read nothing.
+// Measured with tools/dev/scat.cpp, 12-bit digits, uniformly random keys:
+//
+//       this        write-combining
+//   1M  2.74 ns/elem   3.26
+//   2M  2.83           3.18
+//   4M  4.78           3.38
+//   8M  4.57           3.14
+//
+// so the kernel picks per size, not per type.
+// ---------------------------------------------------------------------------
+
+template <class T, class S, class D, unsigned Bits>
+inline void scatter32(const S* FYX_RESTRICT src, std::size_t n, D* FYX_RESTRICT dst,
+                      unsigned shift, std::uint32_t* FYX_RESTRICT off) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    using KV  = isa_avx512_keys::TieKey<T>;
+    constexpr std::uint32_t Mask = (std::uint32_t(1) << Bits) - 1;
+    const __m512i vmask = _mm512_set1_epi32(int(Mask));
+    const __m512i vone  = _mm512_set1_epi32(1);
+    std::size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512i raw = _mm512_loadu_si512(reinterpret_cast<const void*>(src + i));
+        __m512i k, val;
+        if constexpr (std::is_same<S, Key>::value) k = raw; else k = KV::enc(raw);
+        if constexpr (std::is_same<D, Key>::value) val = k;  else val = KV::dec(k);
+        const __m512i idx  = _mm512_and_si512(_mm512_srli_epi32(k, shift), vmask);
+        const __m512i rank = _mm512_popcnt_epi32(_mm512_conflict_epi32(idx));
+        const __m512i pos  = _mm512_add_epi32(_mm512_i32gather_epi32(idx, off, 4), rank);
+        _mm512_i32scatter_epi32(dst, pos, val, 4);
+        _mm512_i32scatter_epi32(off, idx, _mm512_add_epi32(pos, vone), 4);
+    }
+    for (; i < n; ++i) {
+        Key k;
+        if constexpr (std::is_same<S, Key>::value) k = Key(src[i]); else k = RT::encode(src[i]);
+        const std::size_t b = std::size_t((k >> shift) & Key(Mask));
+        if constexpr (std::is_same<D, Key>::value) dst[off[b]++] = D(k);
+        else                                       dst[off[b]++] = RT::decode(k);
+    }
+}
+
+template <class T, class S, class D, unsigned Bits>
+inline void scatter64(const S* FYX_RESTRICT src, std::size_t n, D* FYX_RESTRICT dst,
+                      unsigned shift, std::size_t* FYX_RESTRICT off) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    using KV  = isa_avx512_keys::TieKey<T>;
+    constexpr std::uint64_t Mask = (std::uint64_t(1) << Bits) - 1;
+    const __m512i vmask = _mm512_set1_epi64(static_cast<long long>(Mask));
+    const __m512i vone  = _mm512_set1_epi64(1);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m512i raw = _mm512_loadu_si512(reinterpret_cast<const void*>(src + i));
+        __m512i k, val;
+        if constexpr (std::is_same<S, Key>::value) k = raw; else k = KV::enc(raw);
+        if constexpr (std::is_same<D, Key>::value) val = k;  else val = KV::dec(k);
+        const __m512i idx64 = _mm512_and_si512(_mm512_srli_epi64(k, shift), vmask);
+        // Truncate to eight 32-bit indices.  A bitcast will not do: the low
+        // half of the register holds four 64-bit lanes, which read as eight
+        // 32-bit ones would be the halves of k0..k3, not k0..k7.
+        const __m256i idx   = _mm512_cvtepi64_epi32(idx64);
+        const __m512i rank  = _mm512_popcnt_epi64(_mm512_conflict_epi64(idx64));
+        const __m512i pos   = _mm512_add_epi64(_mm512_i32gather_epi64(idx, off, 8), rank);
+        _mm512_i64scatter_epi64(dst, pos, val, 8);
+        _mm512_i32scatter_epi64(off, idx, _mm512_add_epi64(pos, vone), 8);
+    }
+    for (; i < n; ++i) {
+        Key k;
+        if constexpr (std::is_same<S, Key>::value) k = Key(src[i]); else k = RT::encode(src[i]);
+        const std::size_t b = std::size_t((k >> shift) & Key(Mask));
+        if constexpr (std::is_same<D, Key>::value) dst[off[b]++] = D(k);
+        else                                       dst[off[b]++] = RT::decode(k);
+    }
+}
+
+}   // namespace isa_avx512_scat
+FYX_ISA_END
+#endif   // FYX_HAS_AVX512_CODE
+
+/// One scatter pass, on whichever of the two engines the size calls for.
+///
+/// `off32` is scratch for the 32-bit AVX-512 path, which counts destinations
+/// in 32 bits and only runs when n fits in them.
+template <class T, class S, class D, unsigned Bits>
+inline void radix_scatter_wide_pass(const S* FYX_RESTRICT src, std::size_t n,
+                                    D* FYX_RESTRICT dst, unsigned shift,
+                                    std::size_t* FYX_RESTRICT pos,
+                                    std::uint32_t* FYX_RESTRICT off32,
+                                    bool avx512_ok, bool can_stream) noexcept {
+    using Key = typename RadixTraits<T>::Key;
+#if FYX_HAS_AVX512_CODE
+    if (avx512_ok) {
+        if constexpr (sizeof(Key) == 4) {
+            constexpr std::size_t B = std::size_t(1) << Bits;
+            for (std::size_t d = 0; d < B; ++d) off32[d] = std::uint32_t(pos[d]);
+            isa_avx512_scat::scatter32<T, S, D, Bits>(src, n, dst, shift, off32);
+        } else {
+            isa_avx512_scat::scatter64<T, S, D, Bits>(src, n, dst, shift, pos);
+        }
+        return;
+    }
+#else
+    (void)off32; (void)avx512_ok;
+#endif
+    if constexpr (std::is_same<S, Key>::value && std::is_same<D, Key>::value)
+        radix_scatter_key_pass_wide<Key, Bits>(src, n, dst, shift, pos, can_stream);
+    else if constexpr (std::is_same<D, Key>::value)
+        radix_scatter_encode_pass_wide<T, Key, Bits>(src, n, dst, shift, pos, can_stream);
+    else
+        radix_scatter_key_decode_pass_wide<T, Key, Bits>(src, n, dst, shift, pos, can_stream);
+}
+
 
 template <class T, unsigned PrefixBits>
 inline void radix_sort_high_prefix_decoded_ties(T* p, std::size_t n) {
 #if FYX_HAS_AVX512_CODE
-    if constexpr (isa_avx512_ties::TieKey<T>::defined) {
-        if (use_avx512()) { isa_avx512_ties::scan_ties<T, PrefixBits>(p, n); return; }
+    if constexpr (isa_avx512_keys::TieKey<T>::defined) {
+        if (use_avx512()) { isa_avx512_keys::scan_ties<T, PrefixBits>(p, n); return; }
     }
 #endif
 
@@ -9882,33 +10039,53 @@ inline bool try_parallel_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bo
                     }
                 }
 
+                // Chunks, not the whole array, decide the scatter engine: a
+                // chunk is what one thread walks, and it is the working set of
+                // one thread that has to stay in cache.  See the table above
+                // isa_avx512_scat::scatter32.
+                const bool avx512_ok =
+                    use_avx512_conflict() && n <= std::size_t(0xffffffffu) &&
+                    ((n + chunks - 1) / chunks) * sizeof(Key) <= (std::size_t(1) << 23);
+
                 if (pi == 0) {
                     auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        std::vector<std::uint32_t> off32(
+                            (avx512_ok && sizeof(Key) == 4) ? Buckets : std::size_t(0));
                         for (std::size_t c = c_lo; c < c_hi; ++c) {
                             const std::size_t lo = (c * n) / chunks;
                             const std::size_t hi = ((c + 1) * n) / chunks;
                             auto pos = base[c];
-                            radix_scatter_encode_pass_wide<T, Key, Bits>(p + lo, hi - lo, src, shift, pos.data(), can_stream);
+                            radix_scatter_wide_pass<T, T, Key, Bits>(
+                                p + lo, hi - lo, src, shift, pos.data(), off32.data(),
+                                avx512_ok, can_stream);
                         }
                     };
                     parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
                 } else if (pi + 1 == Passes) {
                     auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        std::vector<std::uint32_t> off32(
+                            (avx512_ok && sizeof(Key) == 4) ? Buckets : std::size_t(0));
                         for (std::size_t c = c_lo; c < c_hi; ++c) {
                             const std::size_t lo = (c * n) / chunks;
                             const std::size_t hi = ((c + 1) * n) / chunks;
                             auto pos = base[c];
-                            radix_scatter_key_decode_pass_wide<T, Key, Bits>(src + lo, hi - lo, p, shift, pos.data(), can_stream);
+                            radix_scatter_wide_pass<T, Key, T, Bits>(
+                                src + lo, hi - lo, p, shift, pos.data(), off32.data(),
+                                avx512_ok, can_stream);
                         }
                     };
                     parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
                 } else {
                     auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        std::vector<std::uint32_t> off32(
+                            (avx512_ok && sizeof(Key) == 4) ? Buckets : std::size_t(0));
                         for (std::size_t c = c_lo; c < c_hi; ++c) {
                             const std::size_t lo = (c * n) / chunks;
                             const std::size_t hi = ((c + 1) * n) / chunks;
                             auto pos = base[c];
-                            radix_scatter_key_pass_wide<Key, Bits>(src + lo, hi - lo, dst, shift, pos.data(), can_stream);
+                            radix_scatter_wide_pass<T, Key, Key, Bits>(
+                                src + lo, hi - lo, dst, shift, pos.data(), off32.data(),
+                                avx512_ok, can_stream);
                         }
                     };
                     parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
@@ -11355,6 +11532,15 @@ inline bool try_serial_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bool
             std::vector<std::uint32_t> count(std::size_t(Passes) * Buckets);
             std::vector<std::size_t> pos(Buckets);
             const bool can_stream = have_nt_stores();
+            // Conflict/rank scatter while the keys stay in cache, write-
+            // combining scatter once they leave it: see the table above
+            // isa_avx512_scat::scatter32.  The AVX-512 path counts
+            // destinations in 32 bits, so it also needs n to fit in them.
+            const bool avx512_ok = use_avx512_conflict() &&
+                                   n <= std::size_t(0xffffffffu) &&
+                                   n * sizeof(Key) <= (std::size_t(1) << 23);
+            std::vector<std::uint32_t> off32(
+                (avx512_ok && sizeof(Key) == 4) ? Buckets : std::size_t(0));
             // Only worth fusing from three passes up.  Passes after the first
             // would otherwise re-read the scratch array, which the previous
             // scatter wrote and which has already left the cache, so one sweep
@@ -11381,11 +11567,14 @@ inline bool try_serial_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bool
                     run += pc[d];
                 }
                 if (pi == 0) {
-                    radix_scatter_encode_pass_wide<T, Key, Bits>(p, n, src, shift, pos.data(), can_stream);
+                    radix_scatter_wide_pass<T, T, Key, Bits>(
+                        p, n, src, shift, pos.data(), off32.data(), avx512_ok, can_stream);
                 } else if (pi + 1 == Passes) {
-                    radix_scatter_key_decode_pass_wide<T, Key, Bits>(src, n, p, shift, pos.data(), can_stream);
+                    radix_scatter_wide_pass<T, Key, T, Bits>(
+                        src, n, p, shift, pos.data(), off32.data(), avx512_ok, can_stream);
                 } else {
-                    radix_scatter_key_pass_wide<Key, Bits>(src, n, dst, shift, pos.data(), can_stream);
+                    radix_scatter_wide_pass<T, Key, Key, Bits>(
+                        src, n, dst, shift, pos.data(), off32.data(), avx512_ok, can_stream);
                     Key* t = src; src = dst; dst = t;
                 }
             }
