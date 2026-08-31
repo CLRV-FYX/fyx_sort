@@ -138,24 +138,34 @@ Date: 2026-08-27
 
 ### Benchmark snapshot
 
-Google Highway 1.4.0 is in the tree now, so the matrix has a third competitor
-next to `std::sort` and `pdqsort`: `vqsort`.  `bash tools/dev/vqsort.sh 1000000`
-(or `8000000`) clones Highway, builds the matrix and writes
-`build/vqsort_<n>.txt`; every cell is scored against the best of the three
-(`vqsort` is arithmetic-only, so `std::string` rows degrade to a two-way race).
+Google Highway 1.4.0 is in the tree, so the matrix has a third competitor next
+to `std::sort` and `pdqsort`: `vqsort`.  `bash tools/dev/vqsort.sh 1000000` (or
+`8000000`) clones Highway, builds the matrix and writes `build/vqsort_<n>.txt`;
+`python3 tools/dev/mkbench_md.py` turns those files into `BENCHMARKS.md`, which
+therefore contains no hand-typed numbers, including the cells we lose.
 
-    random, parallel, 1M / 8M          fyx      vqsort
-      int32     0.00459 / 0.04943   0.00371 / 0.03919   0.81x / 0.79x
-      int64     0.00552 / 0.06703   0.00771 / 0.08547   1.40x / 1.28x
-      double    0.00632 / 0.08242   0.00683 / 0.08159   1.08x / 0.99x
+    arithmetic cells, parallel fyx::sort against the best of the three
+                                    1M            8M
+      wins / losses              32 / 10       38 / 4
 
-    whole matrix, arithmetic cells     1M: 35 wins / 7 losses
-                                       8M: 37 wins / 5 losses
+    random, parallel             fyx      vqsort
+      1M  int32  0.00520      0.00371      0.71x
+      1M  int64  0.01282      0.00781      0.61x
+      1M  double 0.01723      0.00819      0.48x
+      8M  int32  0.05433      0.03711      0.68x
+      8M  int64  0.06322      0.08140      1.29x
+      8M  double 0.07984      0.08783      1.10x
 
-Structured input is where the lead is: at 8M, reverse 3.1-4.0x, nearly sorted
-5.6-7.3x, concatenated sorted halves 1.9-2.4x, rotated 1.7-2.6x, 256 distinct
-values 2.0-2.7x.  The losses are concentrated in two families -- uniform random
-`int32` (0.79-0.81x, the scatter pass is dominated by random writes) and inputs
-with a handful of distinct values (0.50-0.83x, the counting pass) -- plus
-all-equal `int32`/`int64` at 8M, where detection is already within 25% of the
-`memcpy` roof.  `BENCHMARKS.md` lists every losing cell with its number.
+Structured input is where the lead is: at 8M, reverse 3.0-3.5x, nearly sorted
+5.0-7.0x, concatenated halves 1.9-2.4x, rotated 1.7-2.6x, zigzag 2.1-2.8x, 256
+distinct values 2.0-2.7x.  Uniform random is the one family that loses, and it
+loses at every size for every key width except 8M int64/double, where the
+second core pays for the extra passes.
+
+**Read these as ranges, not as two decimal places.**  The same cell moves 20-60%
+between runs on this box, so a single run cannot tell two builds apart.  Compare
+builds by running both binaries back to back, several passes, and taking the
+median of each column -- which is how the parallel narrow-range counting sort
+was checked before it was committed (three paired passes; the random medians
+differed by +11%, -14% and +4%, i.e. nothing, while lowcard16 and mod8 improved
+1.2-2.3x).
