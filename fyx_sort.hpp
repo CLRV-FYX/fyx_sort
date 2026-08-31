@@ -11190,7 +11190,7 @@ inline bool try_integer_sparse_count_sort_parallel(T* p, std::size_t n, bool des
 }
 
 template <class T>
-inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool descending) {
+FYX_NOINLINE inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool descending) {
     if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
         (void)p; (void)n; (void)descending;
         return false;
@@ -11212,42 +11212,21 @@ inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool desc
         const Key sample_span = static_cast<Key>(smx - smn);
         if (sample_span == std::numeric_limits<Key>::max()) return false;
         const unsigned long long sample_range64 = static_cast<unsigned long long>(sample_span) + 1ull;
-        if (sample_range64 < 64ull ||
+        if (sample_range64 < 2ull ||
             sample_range64 > static_cast<unsigned long long>(MaxParallelRange)) return false;
 
         const std::size_t chunks = adaptive_parallel_chunks(n);
         if ((n + chunks - 1) / chunks >
             static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
 
-        std::vector<Key> local_min(chunks), local_max(chunks);
-        auto minmax_job = [&](std::size_t c_lo, std::size_t c_hi) {
-            for (std::size_t c = c_lo; c < c_hi; ++c) {
-                const std::size_t lo = (c * n) / chunks;
-                const std::size_t hi = ((c + 1) * n) / chunks;
-                Key mn = RT::encode(p[lo]);
-                Key mx = mn;
-                for (std::size_t i = lo + 1; i < hi; ++i) {
-                    const Key k = RT::encode(p[i]);
-                    if (k < mn) mn = k;
-                    if (mx < k) mx = k;
-                }
-                local_min[c] = mn;
-                local_max[c] = mx;
-            }
-        };
-        parallel_for_index(std::size_t(0), chunks, std::size_t(1), minmax_job);
-
-        Key mn = local_min[0];
-        Key mx = local_max[0];
-        for (std::size_t c = 1; c < chunks; ++c) {
-            if (local_min[c] < mn) mn = local_min[c];
-            if (mx < local_max[c]) mx = local_max[c];
-        }
-        const Key span = static_cast<Key>(mx - mn);
-        if (span == std::numeric_limits<Key>::max()) return false;
-        const unsigned long long range64 = static_cast<unsigned long long>(span) + 1ull;
-        if (range64 == 0 || range64 > static_cast<unsigned long long>(MaxParallelRange)) return false;
-        const std::size_t range = static_cast<std::size_t>(range64);
+        // The sample's range is a guess, not a measurement.  Spending a whole
+        // sweep on the exact minimum and maximum costs one more read of the
+        // array than the sort itself needs, so the count pass below checks
+        // every key against the guess instead and abandons the sort if the
+        // sample missed an extreme -- the serial range sort then takes it.
+        const Key mn    = smn;
+        const std::size_t range = static_cast<std::size_t>(sample_range64);
+        std::atomic<unsigned> bail(0);
 
         std::vector<std::uint32_t> local(chunks * range, 0);
         auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
@@ -11255,11 +11234,15 @@ inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool desc
                 const std::size_t lo = (c * n) / chunks;
                 const std::size_t hi = ((c + 1) * n) / chunks;
                 std::uint32_t* lc = local.data() + c * range;
-                for (std::size_t i = lo; i < hi; ++i)
-                    ++lc[static_cast<std::size_t>(RT::encode(p[i]) - mn)];
+                for (std::size_t i = lo; i < hi; ++i) {
+                    const std::size_t d = static_cast<std::size_t>(RT::encode(p[i]) - mn);
+                    if (d >= range) { bail.store(1, std::memory_order_relaxed); return; }
+                    ++lc[d];
+                }
             }
         };
         parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+        if (bail.load(std::memory_order_relaxed)) return false;
 
         std::vector<std::size_t> offset(range + 1, 0);
         if (!descending) {
@@ -11287,7 +11270,10 @@ inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool desc
                 std::fill(p + offset[out_rank], p + offset[out_rank + 1], v);
             }
         };
-        parallel_for_index(std::size_t(0), range, std::size_t(64), fill_job);
+        // Eight tasks per worker: with a range of sixteen the old grain of 64
+        // made the whole fill one task, i.e. one core writing the array.
+        const std::size_t fill_grain = std::max<std::size_t>(1, range / (chunks * 4));
+        parallel_for_index(std::size_t(0), range, fill_grain, fill_job);
         return true;
     }
 }
