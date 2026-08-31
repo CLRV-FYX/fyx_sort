@@ -80,6 +80,48 @@ Date: 2026-08-27
 - Sample-sort classification now uses an unrolled fixed-256 Eytzinger descent for cheap/trivial payloads while keeping the compact looped classifier, previous 128K recursion handoff, and block scatter for `std::string` fallback paths. Non-string serial sample-sort scatter uses a single prefix-position pass. Parallel arithmetic comparator fallback now uses a 64-way top partition with the old 256-way sampling budget, cutting random numeric classification from eight to six comparisons per element while preserving the 256-way low-cardinality signal. Low-distinct arithmetic samples use a tiny exact counter before falling back to pdqsort; the floating-point duplicate gate now also tries a collision-free rank16 exact counter (then the sparse hash counter as fallback) up to the 256-way sample band instead of sending 256-way float/double comparator inputs straight to pdqsort. The comparison recursion threshold remains lower for non-string data to keep high-distinct buckets in sample-sort longer when that is cheaper than large pdqsort leaves.
 - Degenerate sample-sort splitter cases now fall back to pdqsort instead of recursing without progress.
 
+### Changed
+
+- The high-prefix partition — two passes over the top bits, ties finished while
+  the buckets are still in cache — used to be reachable only for 8-byte keys,
+  so random `int32` fell through to the 32-wide sort, which was 1.6x slower than
+  even the plain LSD sort it was meant to replace.  The helpers now take their
+  shifts from `sizeof(Key)`, 4-byte keys get their own `radix_choose_prefix_bits`
+  branch ((24,12) up to 2^21 elements, (26,13) above), and both dispatchers try
+  the high-prefix sort first.  Parallel `int32` routes through the parallel
+  high-prefix kernel as well; the two parallel kernels cross over between 2M and
+  4M, so the 4-byte branch declines past 3M.  Random data, 2 vCPU: int32 1M
+  parallel 0.0098 -> 0.0061, int32 8M serial 0.154 -> 0.083, 16M parallel 0.080.
+- Tie repair no longer pays a full sweep to find the groups it is about to
+  repair.  AVX-512 compares sixteen elements (eight for 64-bit keys) against the
+  vector rotated by one lane and produces a mask with a bit wherever an element
+  continues its predecessor's group, so a vector with no ties is skipped whole
+  and one with ties is walked a group at a time.  Tie scan on 1M int32 without
+  ties: 2.23 -> 0.21 ns/elem; on 8M: 1.36 -> 0.53.
+- Scatters are now chosen per size instead of per kernel.  The write-combining
+  scatter — one cache line per bucket, flushed with a non-temporal store —
+  keeps a large sort out of the read-for-ownership business, but its bookkeeping
+  costs about 3.3 ns/element, and an array that fits in cache has nothing to
+  save.  Below roughly 8 MB of keys the wide high-prefix kernel uses a
+  conflict-detection scatter instead: `vpconflictd` for the lanes that want the
+  same bucket, `vpopcntd` for each lane's rank among them, a gather for the
+  bucket's running position, and two scatters to write the keys and the advanced
+  positions back.  `tools/dev/scat.cpp`, 12-bit digits, 1M: 2.74 ns/elem against
+  3.26 for write-combining; at 8M the two switch places (4.57 against 3.14),
+  which is where the threshold sits.  End to end, 1M random: int32 parallel
+  0.0061 -> 0.0049, double parallel 0.0118 -> 0.0077; 8M unchanged.
+
+### Added
+
+- `tools/dev/{scat,hist,correct,timer}.cpp` — the measurements the last two
+  changes rest on, so the next round does not have to rebuild them: scatter
+  kernels against each other across sizes, histogram variants, a radix
+  correctness harness that straddles every crossover (sortedness and equality
+  with `std::sort`, serial and parallel, 6 int32 shapes, every key width), and a
+  serial-vs-parallel timer.  `hist.cpp` is why the AVX-512 conflict histogram in
+  `09_radix` stays unwired: 0.72 ns/elem against 0.57 for the shipping four-bank
+  scalar one.
+
 ### Fixed
 
 - Move-only payloads (`std::unique_ptr`) now sort.  The parallel merge assigned
@@ -96,6 +138,24 @@ Date: 2026-08-27
 
 ### Benchmark snapshot
 
-On the local 2-vCPU Xeon sandbox, GCC 12.2, `-O3 -march=native`, FYX is faster than IPS4o on the tracked sequential and real oneTBB parallel matrices: i32 random, i32 low distinct, i64 sparse 256 distinct, random strings, low-distinct strings, low-distinct struct-key payloads, and high-distinct struct-key payloads. Latest snapshot after weapon seven: high-distinct struct-key 1M is 0.0138s vs IPS4o sequential 0.0278s, and 0.0127s vs real IPS4o parallel 0.0142s.
+Google Highway 1.4.0 is in the tree now, so the matrix has a third competitor
+next to `std::sort` and `pdqsort`: `vqsort`.  `bash tools/dev/vqsort.sh 1000000`
+(or `8000000`) clones Highway, builds the matrix and writes
+`build/vqsort_<n>.txt`; every cell is scored against the best of the three
+(`vqsort` is arithmetic-only, so `std::string` rows degrade to a two-way race).
 
-The parallel matrix was verified against real oneTBB and linked with `-ltbb -latomic`.
+    random, parallel, 1M / 8M          fyx      vqsort
+      int32     0.00459 / 0.04943   0.00371 / 0.03919   0.81x / 0.79x
+      int64     0.00552 / 0.06703   0.00771 / 0.08547   1.40x / 1.28x
+      double    0.00632 / 0.08242   0.00683 / 0.08159   1.08x / 0.99x
+
+    whole matrix, arithmetic cells     1M: 35 wins / 7 losses
+                                       8M: 37 wins / 5 losses
+
+Structured input is where the lead is: at 8M, reverse 3.1-4.0x, nearly sorted
+5.6-7.3x, concatenated sorted halves 1.9-2.4x, rotated 1.7-2.6x, 256 distinct
+values 2.0-2.7x.  The losses are concentrated in two families -- uniform random
+`int32` (0.79-0.81x, the scatter pass is dominated by random writes) and inputs
+with a handful of distinct values (0.50-0.83x, the counting pass) -- plus
+all-equal `int32`/`int64` at 8M, where detection is already within 25% of the
+`memcpy` roof.  `BENCHMARKS.md` lists every losing cell with its number.
