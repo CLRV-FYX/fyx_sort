@@ -103,3 +103,58 @@ for int64/double.  That is the structure vqsort uses, and it is the only
 measured route to the random-data gap -- note that it would also make every
 numeric type cost the same, where today int64 costs twice int32 purely because
 it needs twice the passes.
+
+## Random data: what is left, and what to build
+
+The only family where fyx loses to vqsort is uniform random, and the size of
+the loss is decided by one number: **the scatter costs 3.14 ns/elem and the
+histogram 0.57, so three passes are ~11.1 ns/elem and the scatter is 85% of
+the sort.**  Every pass moves the whole array twice (read + write) plus one
+read for the histogram.  vqsort's partitions write sequentially, which is why
+it gets more bytes per second out of the same machine.
+
+### Three ways to cut the number of passes, all measured, all lost
+
+`tools/dev/kernel.cpp` times `fyx::sort` next to each kernel in one process.
+int32 random, parallel:
+
+| variant                                  | 8M      | 16M     |
+|------------------------------------------|---------|---------|
+| wide sort, 10/11/11 (what runs today)    | 0.03726 | 0.08379 |
+| high prefix 26/13, two passes + repair   | 0.05073 | -       |
+| high prefix 24/12, two passes + repair   | 0.04419 | 0.11413 |
+| high prefix, decline past 3M lifted      | 0.05073 | 0.11045 |
+
+- Lifting the four-byte high-prefix decline (`n > 3<<20`): worse at 4M (2.2x),
+  8M (1.2x) and 16M (1.3x).  The decline is correct.
+- Split 10/11/11 -> 12/12/8: **does not compile.**  `radix_count_key_pass_
+  banked_wide` refuses `Bits = 8`; the constraint is `static_assert(kPerLine *
+  sizeof(Key) == kCacheLine)` in `09_radix.hpp:264`.  Deal with that first if
+  an eight-bit last pass is wanted again.
+- 24/12 is 13% better than 26/13 at 8M (fewer streams per pass) but still 19%
+  behind the three-pass wide sort, and 36% behind at 16M.
+
+The lesson is that a two-pass design does not pay above ~4M: the tie repair
+eats what the missing pass saved.  Repair is only cheap while the groups are
+tiny, and at 8M a 24-bit prefix already puts a fifth of the elements in a
+group with someone else.
+
+### What should work: cache-blocked radix
+
+Passes after the first do not have to touch DRAM at all.
+
+1. Pass 1 on **8 bits**: 256 coarse buckets, destination working set 256 x 64 B
+   = 16 KB, so the scatter is L1-resident instead of spreading over
+   1024-2048 streams.  One histogram + one scatter over the array.
+2. Then walk the coarse buckets.  At 8M each holds ~32K elements = 128 KB,
+   which is L2-resident, and gets finished with 8-bit digits **in cache**:
+   three more histogram+scatter pairs, but on data that is already in L2.
+
+Cost estimate: 1 x 3.7 ns/elem (DRAM) + 3 x ~1.0 ns/elem (L2) = ~6.7 ns/elem
+against today's 11.1, i.e. about 1.7x, which turns 8M int32 random from 0.68x
+into a win and does the same for the 1M cells that lose 0.48-0.71x.
+
+Two things to be careful about.  The 8-bit histogram must compile (see the
+static_assert above).  And this is a new kernel -- budget a full session for
+it, verify with `tools/dev/correct.cpp` and `test/t_radix.cpp`, and measure
+with paired binaries (this box moves a single cell by +-20% between runs).
