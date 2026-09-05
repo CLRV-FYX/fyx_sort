@@ -158,3 +158,41 @@ Two things to be careful about.  The 8-bit histogram must compile (see the
 static_assert above).  And this is a new kernel -- budget a full session for
 it, verify with `tools/dev/correct.cpp` and `test/t_radix.cpp`, and measure
 with paired binaries (this box moves a single cell by +-20% between runs).
+
+### First blocking attempt: measured, and it is a lesson not a patch
+
+`tools/dev/blocked.cpp` builds the blocked kernel against `fyx::detail::` and
+races it with `fyx::sort` in one process (8M and 16M, random int32, best of 3):
+
+```
+8M    fyx::sort 0.04349   blocked(2 threads) 0.07231   blocked(1 thread) 0.11104
+16M   fyx::sort 0.07969   blocked             0.14138   blocked1          0.19974
+```
+
+So the naive version is ~1.7x slower, and it is also not currently correct
+(the tiny-bucket branch casts a radix key straight to a value, which ignores
+the encode/decode transform).
+
+**The reason it is slow is the interesting part, and it is not about locality
+at all.** Blocking has a fixed cost per block per pass: the histogram has to
+be cleared and the write-combining buffer has to be flushed, and that buffer
+holds one line per bucket. With 11-bit digits that is 2048 lines = 128 KB of
+flushing for a block that only holds 32 KB of data -- four times more traffic
+than the data it is sorting. With 8-bit digits the same fixed cost is 256
+lines = 16 KB, so blocks of about 128 KB put the ratio at 8:1 and the idea
+works.
+
+The corrected design is therefore narrower than the sketch above:
+
+- pass 1 on **8 bits**, giving 256 coarse buckets (~32K elements, ~128 KB each
+  at 8M), one histogram and one scatter over the array;
+- each coarse bucket finished with **8-bit** digits, three passes, all inside
+  its own 128 KB block plus one equally sized scratch block;
+- per block per pass: 16 KB of WCB flush against 128 KB of data, so ~1.1 MB of
+  L2 traffic per block instead of today's 96 MB of traffic per pass over the
+  whole array.
+
+Eight-bit passes now compile (see the commit before this one). Before porting
+anything into `parts/`, fix the key/value handling in the experiment and
+confirm it sorts correctly at 8M and 16M -- a wrong kernel that looks 1.7x
+slower tells you nothing about the corrected one.
