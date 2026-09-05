@@ -226,3 +226,39 @@ its writes fan out over 1024-2048 streams, and that hurts even in L3: every
 stream is a separate write-combining buffer line and a separate TLB entry.
 Which means the next thing to attack is the number of live write streams per
 pass, not the distance the writes travel.
+
+### The scatter does not care how many streams it has
+
+`tools/dev/fanout.cpp` times one histogram + one WCB scatter over the same
+random keys, changing nothing but the digit width. 8M and 16M agree to within
+2%, so these are solid:
+
+```
+Bits  8     256 streams   3.056 ns/elem      Bits 12   4096 streams  3.500
+Bits  9     512 streams   2.821              Bits 13   8192 streams  4.016
+Bits 10    1024 streams   2.961
+Bits 11    2048 streams   3.214
+```
+
+**Flat from 256 to 2048 streams, and 256 is worse than 512.** The hypothesis
+set down after the blocking attempt -- that the scatter is slow because its
+writes fan out -- is wrong. The cost is intrinsic to moving one element
+through a buffered scatter: roughly 2.3 ns/elem of scatter plus 0.6 of
+histogram, and it does not come down until the digit width goes past 4096,
+where it gets *worse*, not better.
+
+Two things follow, and both close doors rather than open them:
+
+- four passes of 8 bits would cost 4 x 3.06 = 12.2 ns/elem against the current
+  three passes at 10/11/11 = 2.96 + 3.21 + 3.21 = 9.4. More passes with fewer
+  streams is strictly worse, which is also why the byte-wise LSD loses.
+- the current 10/11/11 split is already within 3% of the best three-pass split
+  available (the flat region is wide and the minimum is shallow).
+
+Reconciling with the timings: 9.4 ns/elem of CPU work over two threads is
+4.7 ns/elem wall, and `fyx::sort` measures 5.4 at 8M, so overhead is ~0.7.
+vqsort is at ~3.6 ns/elem wall there, i.e. ~7.2 ns/elem of CPU work. **The
+whole remaining gap is that 9.4 against 7.2**, and since the per-pass cost
+will not move, the only way to close it is to do less than three passes of
+work -- which every two-pass design tried so far has failed to deliver, or to
+find a per-element scatter that is cheaper than 2.3 ns.
