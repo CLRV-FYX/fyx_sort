@@ -3475,7 +3475,7 @@ template <class Key, unsigned Bits>
 inline void radix_count_key_pass_banked_wide(const Key* FYX_RESTRICT src,
                                              std::size_t n, unsigned shift,
                                              std::uint32_t* FYX_RESTRICT out) noexcept {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix count is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix count is tuned for 8..13 bits");
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
     constexpr Key Mask = Key(Buckets - 1);
     std::array<std::uint32_t, 4 * Buckets> bank{};
@@ -3501,7 +3501,7 @@ template <class T, unsigned Bits>
 inline void radix_count_value_pass_banked_wide(const T* FYX_RESTRICT src,
                                                std::size_t n, unsigned shift,
                                                std::uint32_t* FYX_RESTRICT out) noexcept {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix count is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix count is tuned for 8..13 bits");
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
@@ -3541,7 +3541,7 @@ template <class T, unsigned Bits, unsigned Passes>
 inline void radix_count_all_value_passes_wide(const T* FYX_RESTRICT src, std::size_t n,
                                               unsigned first_shift,
                                               std::uint32_t* FYX_RESTRICT out) noexcept {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix count is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix count is tuned for 8..13 bits");
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
@@ -3580,7 +3580,7 @@ inline void radix_scatter_key_pass_wide(const Key* FYX_RESTRICT src, std::size_t
                                         Key* FYX_RESTRICT dst, unsigned shift,
                                         std::size_t* FYX_RESTRICT offset,
                                         bool can_stream) {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix scatter is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix scatter is tuned for 8..13 bits");
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
     constexpr std::size_t kPerLine = WcbTraits<Key>::kPerLine;
     constexpr Key Mask = Key(Buckets - 1);
@@ -3667,7 +3667,7 @@ inline void radix_scatter_encode_pass_wide(const T* FYX_RESTRICT src, std::size_
                                            Key* FYX_RESTRICT dst, unsigned shift,
                                            std::size_t* FYX_RESTRICT offset,
                                            bool can_stream) {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix scatter is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix scatter is tuned for 8..13 bits");
     using RT = RadixTraits<T>;
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
     constexpr std::size_t kPerLine = WcbTraits<Key>::kPerLine;
@@ -3755,7 +3755,7 @@ inline void radix_scatter_key_decode_pass_wide(const Key* FYX_RESTRICT src, std:
                                                T* FYX_RESTRICT dst, unsigned shift,
                                                std::size_t* FYX_RESTRICT offset,
                                                bool can_stream) {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix scatter is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix scatter is tuned for 8..13 bits");
     static_assert(sizeof(T) == sizeof(Key), "decoded scatter expects word-sized values");
     using RT = RadixTraits<T>;
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
