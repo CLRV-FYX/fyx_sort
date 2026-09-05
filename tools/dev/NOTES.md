@@ -196,3 +196,33 @@ Eight-bit passes now compile (see the commit before this one). Before porting
 anything into `parts/`, fix the key/value handling in the experiment and
 confirm it sorts correctly at 8M and 16M -- a wrong kernel that looks 1.7x
 slower tells you nothing about the corrected one.
+
+### Second blocking attempt: 8-bit digits, and the whole idea looks wrong here
+
+Same experiment rebuilt with the corrected design -- one 8-bit pass over the
+array (256 coarse buckets of ~128 KB at 8M), then three 8-bit passes inside
+each block, all key/value handling through the library's encode/decode passes:
+
+```
+8M    fyx::sort 0.04362   blocked/2thr 0.06940   blocked/1thr 0.10872
+16M   fyx::sort 0.07966   blocked/2thr 0.15117   blocked/1thr 0.22530
+```
+
+Still wrong (at one thread too, so not a race -- the per-bucket pass wiring
+has a bug) and still far slower. But the timing is the useful part, because
+the flush arithmetic said this version should have worked: 16 KB of WCB flush
+per pass against a 128 KB block is only ~13% overhead, not 59%.
+
+**The explanation is that blocking pays for memory traffic, and at these sizes
+there is no memory traffic to save.** At 8M an int32 array is 32 MB and L3 is
+54 MB, so today's three global passes already hit L3; moving them to L2 can
+only help by maybe 1.5x on the memory component, which is a minority of the
+cost. Meanwhile blocking costs one extra pass -- four passes over the data
+against three -- which is +33% of the work before anything else. It is a bad
+trade at 1M and 8M and might only turn positive well past L3, around 64M.
+
+So the scatter is not slow because of distance to memory. It is slow because
+its writes fan out over 1024-2048 streams, and that hurts even in L3: every
+stream is a separate write-combining buffer line and a separate TLB entry.
+Which means the next thing to attack is the number of live write streams per
+pass, not the distance the writes travel.

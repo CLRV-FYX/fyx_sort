@@ -1,10 +1,10 @@
-// STATUS: FAILED, KEPT AS EVIDENCE. 11-bit digits inside 32 KB blocks: the per-block cost of zeroing+flushing a 2048-entry counter/WCB set (128 KB) dwarfs the block itself. Blocking needs 8-bit digits (16 KB WCB) and ~128 KB blocks. Output is currently WRONG (key/value transform mishandled in the tiny-bucket branch); do not use.
-// Experiment: cache-blocked radix for 4-byte keys.
-//   pass 1  : 10-bit LSD over the whole array (as today) -> 1024 coarse buckets
-//   finish  : per coarse bucket, two 11-bit passes confined to that bucket, so
-//             every read and write stays inside one ~32 KB block + one scratch
-//             block, i.e. L1/L2 instead of fanning out over 2048 streams.
-// Compared in-process against fyx::sort on the same input.
+// STATUS: FAILED, KEPT AS EVIDENCE (8-bit variant). Output is WRONG at every thread count, so it is not a race -- the bug is in the per-bucket pass wiring, and nobody has found it yet. It is also ~59% slower than fyx::sort, which is the part that matters. Do not use.
+// Experiment: cache-blocked radix for 4-byte keys, corrected design.
+//   pass 1  : 8-bit LSD over the whole array -> 256 coarse buckets (~128 KB each)
+//   finish  : per coarse bucket, three 8-bit passes (shifts 8/16/24) confined to
+//             that block + one scratch block, so the per-block fixed cost is a
+//             16 KB WCB flush against 128 KB of data.
+// All key<->value handling goes through the library's encode/decode passes.
 #include "../../fyx_sort.hpp"
 #include <algorithm>
 #include <chrono>
@@ -22,42 +22,42 @@ using fyx::detail::radix_scatter_key_decode_pass_wide;
 using fyx::detail::radix_scatter_key_pass_wide;
 
 using Key = std::uint32_t;
-static const unsigned CB = 10, B2 = 11, B3 = 11;
+static const unsigned CB = 8, PB = 8;
 static const std::size_t NCOARSE = std::size_t(1) << CB;
-static const std::size_t NB2     = std::size_t(1) << B2;
+static const std::size_t NPB     = std::size_t(1) << PB;
 
 static void finish_range(const Key* keys, const std::size_t* starts,
                          std::size_t b0, std::size_t b1,
                          std::int32_t* out, Key* scratch) {
-    std::vector<std::uint32_t> cnt(NB2);
-    std::vector<std::size_t>   off(NB2);
+    std::vector<std::uint32_t> cnt(NPB);
+    std::vector<std::size_t>   off(NPB);
     for (std::size_t b = b0; b < b1; ++b) {
         const std::size_t lo = starts[b], hi = starts[b + 1], nb = hi - lo;
         if (nb == 0) continue;
-        if (nb <= 24) {                       // tiny: sort keys in place, decode
-            std::vector<std::int32_t> tmp(nb);
-            for (std::size_t i = 0; i < nb; ++i) tmp[i] = std::int32_t(keys[lo + i]);
-            std::sort(tmp.begin(), tmp.end());
-            std::memcpy(out + lo, tmp.data(), nb * sizeof(std::int32_t));
-            continue;
-        }
-        radix_count_key_pass_banked_wide<Key, B2>(keys + lo, nb, CB, cnt.data());
+        const Key* src = keys + lo;
+        radix_count_key_pass_banked_wide<Key, PB>(src, nb, CB, cnt.data());
         std::size_t s = 0;
-        for (std::size_t d = 0; d < NB2; ++d) { off[d] = s; s += cnt[d]; }
-        radix_scatter_key_pass_wide<Key, B2>(keys + lo, nb, scratch, CB, off.data(), false);
+        for (std::size_t d = 0; d < NPB; ++d) { off[d] = s; s += cnt[d]; }
+        radix_scatter_key_pass_wide<Key, PB>(src, nb, scratch, CB, off.data(), false);
 
-        radix_count_key_pass_banked_wide<Key, B3>(scratch, nb, CB + B2, cnt.data());
+        radix_count_key_pass_banked_wide<Key, PB>(scratch, nb, CB + PB, cnt.data());
         s = 0;
-        for (std::size_t d = 0; d < NB2; ++d) { off[d] = s; s += cnt[d]; }
-        radix_scatter_key_decode_pass_wide<std::int32_t, Key, B3>(
-            scratch, nb, out + lo, CB + B2, off.data(), false);
+        for (std::size_t d = 0; d < NPB; ++d) { off[d] = s; s += cnt[d]; }
+        radix_scatter_key_pass_wide<Key, PB>(scratch, nb, const_cast<Key*>(src),
+                                             CB + PB, off.data(), false);
+
+        radix_count_key_pass_banked_wide<Key, PB>(src, nb, CB + 2 * PB, cnt.data());
+        s = 0;
+        for (std::size_t d = 0; d < NPB; ++d) { off[d] = s; s += cnt[d]; }
+        radix_scatter_key_decode_pass_wide<std::int32_t, Key, PB>(
+            src, nb, out + lo, CB + 2 * PB, off.data(), false);
     }
 }
 
 static void blocked_sort(std::int32_t* p, std::size_t n, int nthreads) {
-    std::vector<Key>               keys(n);
-    std::vector<std::size_t>       starts(NCOARSE + 1), off(NCOARSE);
-    std::vector<std::uint32_t>     cnt(NCOARSE);
+    std::vector<Key>           keys(n);
+    std::vector<std::size_t>   starts(NCOARSE + 1), off(NCOARSE);
+    std::vector<std::uint32_t> cnt(NCOARSE);
 
     radix_count_value_pass_banked_wide<std::int32_t, CB>(p, n, 0, cnt.data());
     std::size_t s = 0;
@@ -70,7 +70,7 @@ static void blocked_sort(std::int32_t* p, std::size_t n, int nthreads) {
     std::size_t maxb = 0;
     for (std::size_t b = 0; b < NCOARSE; ++b)
         maxb = std::max(maxb, starts[b + 1] - starts[b]);
-    std::vector<Key> scratch(nthreads * (maxb + 64));
+    std::vector<Key> scratch(std::size_t(nthreads) * (maxb + 64));
 
     std::vector<std::thread> th;
     for (int t = 0; t < nthreads; ++t) {
@@ -88,11 +88,12 @@ int main(int argc, char** argv) {
     std::vector<std::int32_t> base(n), w1(n), w2(n), ref(n);
     std::mt19937 rng(12345);
     for (std::size_t i = 0; i < n; ++i) base[i] = std::int32_t(rng());
-    ref = base;
-    std::sort(ref.begin(), ref.end());
+    ref = base; std::sort(ref.begin(), ref.end());
 
     w1 = base; blocked_sort(w1.data(), n, 2);
-    std::printf("blocked correct: %s\n", w1 == ref ? "yes" : "NO");
+    std::printf("blocked(2thr) correct: %s\n", w1 == ref ? "yes" : "NO");
+    w1 = base; blocked_sort(w1.data(), n, 1);
+    std::printf("blocked(1thr) correct: %s\n", w1 == ref ? "yes" : "NO");
 
     auto bench = [&](const char* name, auto&& fn) {
         double best = 1e30;
