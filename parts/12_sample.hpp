@@ -294,6 +294,38 @@ inline void sample_sort(It first, It last, Comp comp) {
     const std::size_t sample_threshold = sample_sort_threshold_for<T>();
     if (n <= kInsertionThreshold) { insertion_sort(first, last, comp); return; }
     if (n < sample_threshold)     { pdqsort(first, last, comp);      return; }
+    // Splitter search keeps copies of the elements it sampled, so a payload
+    // that cannot be copied -- std::unique_ptr -- has to be left to the
+    // comparison sort, which only ever moves.
+    if constexpr (!std::is_copy_constructible<T>::value) { pdqsort(first, last, comp); return; }
+
+    // ---- 0. structural pre-pass ------------------------------------------
+    // Sampling, splitter search and 256-way classification are wasted on a
+    // range that is already in order, in reverse order, or all equivalent --
+    // and those are the shapes a comparison sort gets handed in practice
+    // (appending to an ordered table, re-sorting after a merge, a column that
+    // turned out to have one value).  One comparison per element finds them,
+    // and the pass abandons itself as soon as the range is proven to be none
+    // of the three: random input leaves after two or three elements, so this
+    // costs nothing where it does not pay off.  Only the second comparison is
+    // conditional, so an ascending range is confirmed with one per element.
+    if (n >= 64) {
+        bool asc = true, desc = true, same = true;
+        for (std::size_t i = 1; i < n; ++i) {
+            It a = first + (i - 1), b = first + i;
+            if (comp(*b, *a)) {                 // b < a: descent
+                asc = false; same = false;
+                if (!desc) break;
+            } else if (desc || same) {          // b >= a: ascent or tie
+                if (comp(*a, *b)) {             // a < b: ascent
+                    desc = false; same = false;
+                    if (!asc) break;
+                }
+            }
+        }
+        if (asc || same) return;                // ordered, or all equivalent
+        if (desc) { std::reverse(first, last); return; }
+    }
 
     const unsigned k = static_cast<unsigned>(kSampleBuckets);   // 256
     const unsigned m = k - 1u;                                  // 255 splitters
