@@ -5,3 +5,9 @@
 
 # local generated-header safety backups
 fyx_sort.hpp.backup.*
+
+# scratch experiments (binaries, instrumented headers)
+/_work/
+
+# third-party sources cloned by tools/dev/vqsort.sh
+/third_party/

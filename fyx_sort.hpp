@@ -4735,6 +4735,38 @@ inline void sample_sort(It first, It last, Comp comp) {
     const std::size_t sample_threshold = sample_sort_threshold_for<T>();
     if (n <= kInsertionThreshold) { insertion_sort(first, last, comp); return; }
     if (n < sample_threshold)     { pdqsort(first, last, comp);      return; }
+    // Splitter search keeps copies of the elements it sampled, so a payload
+    // that cannot be copied -- std::unique_ptr -- has to be left to the
+    // comparison sort, which only ever moves.
+    if constexpr (!std::is_copy_constructible<T>::value) { pdqsort(first, last, comp); return; }
+
+    // ---- 0. structural pre-pass ------------------------------------------
+    // Sampling, splitter search and 256-way classification are wasted on a
+    // range that is already in order, in reverse order, or all equivalent --
+    // and those are the shapes a comparison sort gets handed in practice
+    // (appending to an ordered table, re-sorting after a merge, a column that
+    // turned out to have one value).  One comparison per element finds them,
+    // and the pass abandons itself as soon as the range is proven to be none
+    // of the three: random input leaves after two or three elements, so this
+    // costs nothing where it does not pay off.  Only the second comparison is
+    // conditional, so an ascending range is confirmed with one per element.
+    if (n >= 64) {
+        bool asc = true, desc = true, same = true;
+        for (std::size_t i = 1; i < n; ++i) {
+            It a = first + (i - 1), b = first + i;
+            if (comp(*b, *a)) {                 // b < a: descent
+                asc = false; same = false;
+                if (!desc) break;
+            } else if (desc || same) {          // b >= a: ascent or tie
+                if (comp(*a, *b)) {             // a < b: ascent
+                    desc = false; same = false;
+                    if (!asc) break;
+                }
+            }
+        }
+        if (asc || same) return;                // ordered, or all equivalent
+        if (desc) { std::reverse(first, last); return; }
+    }
 
     const unsigned k = static_cast<unsigned>(kSampleBuckets);   // 256
     const unsigned m = k - 1u;                                  // 255 splitters
@@ -5156,6 +5188,583 @@ inline void parallel_sample_sort(It first, It last, Comp comp) {
 } // namespace detail
 } // namespace fyx
 
+// ============================================================================
+//  Section 12b -- Adaptive-order weapons (natural-run merge / dirty-patch merge)
+//
+//  Comparison sort costs O(n log n) comparisons no matter how much order the
+//  input already has; radix sort costs a fixed number of passes no matter how
+//  few keys actually differ.  Real inputs are usually neither random nor
+//  perfectly sorted, and both extremes waste work there.  This section adds
+//  two structure detectors that turn "almost sorted" into O(n) sequential
+//  work:
+//
+//  * natural-run merge (`try_natural_run_merge`)
+//      One scan finds the maximal monotone runs of the input.  Descending runs
+//      are reversed in place (fyx::sort is not stable, so reversing equal keys
+//      is allowed) and the runs are then merged bottom-up with a buffer no
+//      larger than the smallest side of any merge.  Cost is O(n log R) moves
+//      with strictly sequential access, so organ pipes, rotated sorted arrays,
+//      concatenated sorted blocks and "sorted with a few blocks moved" inputs
+//      cost one or two passes instead of 4-8 radix passes (or 20 partitioning
+//      passes for a comparison sort).
+//
+//  * dirty-patch merge (`try_dirty_patch_merge`)
+//      When only a small fraction of the positions take part in an inversion,
+//      the clean subsequence is already sorted.  Pull the dirty positions out
+//      into a tiny buffer, sort that buffer, and merge it back over the
+//      compacted clean run.  Three sequential passes total, independent of the
+//      key width, so 64-bit keys cost the same as 32-bit ones.
+//
+//  Both detectors are structure-driven, not benchmark-driven:
+//    - they are read-only until the structure has been proven (the run scan and
+//      the inversion scan never mutate), so a rejection costs a few hundred
+//      touched elements on random data;
+//    - they never change the multiset (reversal, compaction and merge are all
+//      permutations), so a wrong guess cannot corrupt the caller's data;
+//    - they cover whole *classes* of input (any arrangement of R monotone runs,
+//      any pattern of local disorder), not one generator's output shape.
+// ============================================================================
+
+namespace fyx {
+namespace detail {
+
+#ifndef FYX_ENABLE_ADAPTIVE_WEAPONS
+#  define FYX_ENABLE_ADAPTIVE_WEAPONS 1
+#endif
+
+// ---------------------------------------------------------------------------
+// Natural runs
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Ordering used by every adaptive weapon.
+//
+// Default-order floating point is compared through its radix key, exactly like
+// the radix and pdq pattern kernels: std::less<double> treats NaN as
+// equivalent to everything and cannot tell -0 from +0, while the library
+// documents the IEEE totalOrder relation (-NaN < ... < -0 < +0 < ... < +NaN).
+// Sorting by the key produces a sequence that is still ordered under the
+// caller's comparator, so this is always safe.
+// ---------------------------------------------------------------------------
+template <class T, class Comp>
+inline auto adaptive_order(Comp comp) noexcept {
+    constexpr bool radix_order = radix_supported_v<T> &&
+        std::is_floating_point<T>::value &&
+        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
+    return [comp](const T& a, const T& b) -> bool {
+        if constexpr (radix_order) {
+            using RT = RadixTraits<T>;
+            const auto ka = RT::encode(a);
+            const auto kb = RT::encode(b);
+            if constexpr (is_descending_v<Comp, T>) return kb < ka;
+            else return ka < kb;
+        } else {
+            (void)comp;
+            return comp(a, b);
+        }
+    };
+}
+
+/// One maximal monotone run: elements [begin, end) are non-decreasing (once
+/// descending runs have been reversed) under the sort's ordering.
+struct MonotoneRun {
+    std::size_t begin;
+    std::size_t end;
+};
+
+/// Scans [p, p + n) and records up to `cap` maximal monotone runs.
+///
+/// Returns the number of runs, or `cap + 1` as soon as more than `cap` runs
+/// exist (the scan then stops early -- random data is rejected after touching
+/// about 2 * cap elements).  The scan is read-only.
+template <class T, class Comp>
+inline std::size_t scan_monotone_runs(const T* p, std::size_t n, Comp comp,
+                                      std::size_t cap, MonotoneRun* out) {
+    std::size_t count = 0;
+    std::size_t start = 0;
+    int dir = 0;                       // +1 ascending, -1 descending, 0 unknown
+    for (std::size_t i = 1; i < n; ++i) {
+        const bool down = comp(p[i], p[i - 1]);
+        if (!down) {
+            if (!comp(p[i - 1], p[i])) continue;   // equivalent: no information
+        }
+        const int d = down ? -1 : 1;
+        if (dir == 0) { dir = d; continue; }
+        if (d != dir) {
+            // The extremum at i-1 keeps the closed run; the new run starts at i.
+            if (count < cap) { out[count].begin = start; out[count].end = i; }
+            ++count;
+            if (count > cap) return cap + 1;
+            start = i;
+            dir = d;
+        }
+    }
+    if (count < cap) { out[count].begin = start; out[count].end = n; }
+    ++count;
+    return count > cap ? cap + 1 : count;
+}
+
+/// Merges the adjacent runs [l, m) and [m, r) in place, using `buf` as scratch
+/// space for the smaller of the two runs (at most min(r - m, m - l) elements).
+/// `buf` may be null, in which case the merge falls back to std::inplace_merge
+/// (the only correct option for types whose objects have to be constructed).
+template <class T, class Comp>
+inline void merge_adjacent_runs(T* p, std::size_t l, std::size_t m, std::size_t r,
+                                T* buf, Comp comp) {
+    const std::size_t a = m - l;
+    const std::size_t b = r - m;
+    if (a == 0 || b == 0) return;
+    if (buf == nullptr) {
+        std::inplace_merge(p + l, p + m, p + r, comp);
+        return;
+    }
+    if (a >= b) {
+        // Buffer the right run and merge backwards.  Writes always land at
+        // indices >= the next unread element of the left run, so the left run
+        // is never clobbered.
+        for (std::size_t i = 0; i < b; ++i) buf[i] = std::move(p[m + i]);
+        std::size_t ia = m, ib = b, w = r;
+        while (ib != 0 && ia != l) {
+            if (comp(buf[ib - 1], p[ia - 1])) {
+                --ia; --w; p[w] = std::move(p[ia]);
+            } else {
+                --ib; --w; p[w] = std::move(buf[ib]);
+            }
+        }
+        while (ib != 0) { --ib; --w; p[w] = std::move(buf[ib]); }
+    } else {
+        // Buffer the left run and merge forwards.
+        for (std::size_t i = 0; i < a; ++i) buf[i] = std::move(p[l + i]);
+        std::size_t ia = 0, rb = m, w = l;
+        while (ia != a && rb != r) {
+            if (comp(p[rb], buf[ia])) { p[w] = std::move(p[rb]); ++rb; }
+            else                      { p[w] = std::move(buf[ia]); ++ia; }
+            ++w;
+        }
+        while (ia != a) { p[w] = std::move(buf[ia]); ++ia; ++w; }
+    }
+}
+
+/// Adaptive natural-merge sort.
+///
+/// Returns true when the range was sorted by merging its monotone runs.
+/// `max_runs` bounds the run count (and therefore the scan cost on inputs that
+/// have no runs at all); `max_levels` bounds the number of merge passes so the
+/// O(n log R) traffic stays below what the radix/sample kernels would spend.
+template <class T, class Comp>
+inline bool try_natural_run_merge(T* p, std::size_t n, Comp comp,
+                                  std::size_t max_runs, std::size_t max_levels) {
+    if (n < 1024 || max_runs < 2) return false;
+    if constexpr (!std::is_move_constructible<T>::value ||
+                  !std::is_move_assignable<T>::value) {
+        return false;
+    } else {
+        auto before = adaptive_order<T>(comp);
+        std::vector<MonotoneRun> runbuf(max_runs + 1);
+        const std::size_t count = scan_monotone_runs(p, n, before, max_runs, runbuf.data());
+        if (count == 0 || count > max_runs) return false;
+
+        if (count == 1) {
+            // A single run: already ordered, or ordered the wrong way round.
+            if (before(p[n - 1], p[0])) std::reverse(p, p + n);
+            return true;
+        }
+
+        // Simulate the bottom-up schedule: count the passes and the largest
+        // scratch buffer any single merge needs.  Both must stay inside budget
+        // before we touch a single element.
+        std::vector<std::size_t> bounds(count + 1);
+        std::vector<std::size_t> next(count + 1);
+        bounds[0] = 0;
+        for (std::size_t i = 0; i < count; ++i) bounds[i + 1] = runbuf[i].end;
+        std::size_t nruns = count;
+        std::size_t levels = 0;
+        std::size_t maxbuf = 1;
+        {
+            std::vector<std::size_t> sim = bounds;
+            std::size_t m = count;
+            while (m > 1) {
+                std::size_t w = 1;
+                std::size_t i = 0;
+                next[0] = sim[0];
+                for (; i + 2 <= m; i += 2) {
+                    const std::size_t left  = sim[i + 1] - sim[i];
+                    const std::size_t right = sim[i + 2] - sim[i + 1];
+                    const std::size_t small = left < right ? left : right;
+                    if (small > maxbuf) maxbuf = small;
+                    next[w++] = sim[i + 2];
+                }
+                if (i < m) next[w++] = sim[i + 1];
+                ++levels;
+                if (levels > max_levels) return false;
+                for (std::size_t k = 0; k < w; ++k) sim[k] = next[k];
+                m = w - 1;
+            }
+        }
+
+        std::unique_ptr<ScratchLease<T>> lease;
+        // Descending runs become ascending; fyx::sort is unstable so reversing
+        // equal keys is allowed.
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::size_t b = runbuf[i].begin;
+            const std::size_t e = runbuf[i].end;
+            if (e - b > 1 && before(p[e - 1], p[b])) std::reverse(p + b, p + e);
+        }
+
+        // Raw scratch storage only holds objects that need no construction;
+        // everything else uses the standard in-place merge, which manages its
+        // own (properly constructed) temporary.
+        T* buf = nullptr;
+        if constexpr (std::is_trivially_copyable<T>::value) {
+            lease.reset(new ScratchLease<T>(maxbuf));
+            if (!lease->valid()) return false;  // no scratch: leave it to radix/pdq
+            buf = lease->get();
+        }
+
+        std::size_t m = count;
+        while (m > 1) {
+            std::size_t w = 1;
+            std::size_t i = 0;
+            next[0] = bounds[0];
+            for (; i + 2 <= m; i += 2) {
+                merge_adjacent_runs(p, bounds[i], bounds[i + 1], bounds[i + 2], buf, before);
+                next[w++] = bounds[i + 2];
+            }
+            if (i < m) next[w++] = bounds[i + 1];
+            for (std::size_t k = 0; k < w; ++k) bounds[k] = next[k];
+            m = w - 1;
+        }
+        return true;
+    }
+}
+
+/// Convenience wrapper: budget the merge against the kernels it replaces.
+/// Radix on 32-bit keys spends 4 passes, on 64-bit keys 8 passes (each one a
+/// read + a scattered write), so 64-bit types tolerate more merge levels than
+/// 32-bit ones.  Non-radix types pay comparisons, which merge saves most.
+template <class T, class Comp>
+inline bool try_natural_run_merge_adaptive(T* p, std::size_t n, Comp comp) {
+#if !FYX_ENABLE_ADAPTIVE_WEAPONS
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    constexpr std::size_t max_runs   = 64;
+    constexpr std::size_t max_levels =
+        radix_supported_v<T> ? (sizeof(T) <= 4 ? 4u : 6u) : 8u;
+    return try_natural_run_merge(p, n, comp, max_runs, max_levels);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Dirty-patch merge
+// ---------------------------------------------------------------------------
+
+/// Moves `k` elements from `src` to `dst`; the ranges may overlap, and `dst`
+/// may sit before or after `src`.  Trivially copyable payloads go through
+/// memmove, which the vectoriser cannot beat; the rest are walked away from
+/// the end that would otherwise be overwritten first.
+template <class T>
+inline void move_range_bulk(T* dst, T* src, std::size_t k) noexcept {
+    if constexpr (std::is_trivially_copyable<T>::value) {
+        if (k) std::memmove(static_cast<void*>(dst), static_cast<const void*>(src), k * sizeof(T));
+    } else if (dst < src) {
+        for (std::size_t i = 0; i < k; ++i) dst[i] = std::move(src[i]);
+    } else if (dst > src) {
+        for (std::size_t i = k; i-- > 0;) dst[i] = std::move(src[i]);
+    }
+}
+
+/// Sorts a patch and merges it back over the clean run sitting at the front of
+/// `p`.  Writes run backwards so the array can act as its own output: the write
+/// cursor never passes the read cursor of the clean run.
+///
+/// The patch is tiny next to the run, so comparing one element at a time would
+/// spend the whole budget deciding what to do with elements that are simply
+/// copied.  Each step gallops back through the run to find how many of its
+/// elements belong after the next patch element and moves that block in one
+/// go: O(log(n/p)) comparisons per patch element and one bulk move per block.
+template <class T, class Comp>
+inline void merge_patch_back(T* p, std::size_t clean_n, std::vector<T>& patch, Comp comp) {
+    const std::size_t patch_n = patch.size();
+    if (patch_n == 0) return;
+    pdqsort(patch.data(), patch.data() + patch_n, comp);
+    if (clean_n == 0) {
+        for (std::size_t i = 0; i < patch_n; ++i) p[i] = std::move(patch[i]);
+        return;
+    }
+    std::size_t ci = clean_n, pi = patch_n, out = clean_n + patch_n;
+    while (pi != 0) {
+        const T& pv = patch[pi - 1];
+        // Trailing run of the clean side that is >= pv: it belongs after pv.
+        std::size_t t = 0, step = 1;
+        while (t + step <= ci && !comp(p[ci - (t + step)], pv)) {
+            t += step;
+            step <<= 1;
+        }
+        std::size_t lo = t, hi = std::min<std::size_t>(t + step, ci);
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo + 1) / 2;
+            if (!comp(p[ci - mid], pv)) lo = mid;
+            else                        hi = mid - 1;
+        }
+        // lo elements of the run, then one patch element.
+        if (lo) move_range_bulk(p + (out - lo), p + (ci - lo), lo);
+        out -= lo;
+        ci  -= lo;
+        --out;
+        p[out] = std::move(patch[pi - 1]);
+        --pi;
+    }
+}
+
+/// Sorts inputs whose disorder is concentrated in a small set of positions.
+///
+/// A position is "dirty" when it takes part in an adjacent inversion.  If the
+/// dirty set is small, the clean subsequence is almost certainly already
+/// ordered; we verify that in one more scan (repairing it by dirtying the few
+/// positions that break it), then compact the clean elements to the front,
+/// sort the tiny dirty patch, and merge the two sorted sequences back -- the
+/// merge runs backwards so it can use the array itself as the output.
+///
+/// Total cost: three or four sequential passes plus a sort of the patch,
+/// independent of the key width.  Returns false (without having moved
+/// anything) as soon as the dirty set grows past `max_dirty`.
+template <class T, class Comp>
+inline bool try_dirty_patch_merge(T* p, std::size_t n, Comp comp,
+                                  std::size_t max_dirty) {
+    if (n < 1024 || max_dirty == 0) return false;
+    if constexpr (!std::is_move_constructible<T>::value ||
+                  !std::is_move_assignable<T>::value ||
+                  !std::is_copy_constructible<T>::value) {
+        return false;
+    } else {
+        ScratchLease<std::uint64_t> words((n >> 6) + 2);
+        if (!words.valid()) return false;
+        std::uint64_t* bits = words.get();
+        std::memset(bits, 0, ((n >> 6) + 2) * sizeof(std::uint64_t));
+        auto before = adaptive_order<T>(comp);
+
+        std::size_t dirty_count = 0;
+        auto mark = [&](std::size_t idx) {
+            const std::size_t w = idx >> 6;
+            const std::uint64_t m = std::uint64_t(1) << (idx & 63);
+            if ((bits[w] & m) == 0) {
+                bits[w] |= m;
+                ++dirty_count;
+            }
+        };
+        auto is_dirty = [&](std::size_t idx) {
+            return (bits[idx >> 6] >> (idx & 63)) & 1u;
+        };
+
+        // Pass 1: every adjacent inversion pins down two dirty positions.
+        for (std::size_t i = 1; i < n; ++i) {
+            if (before(p[i], p[i - 1])) {
+                mark(i - 1);
+                mark(i);
+                if (dirty_count > max_dirty) return false;
+            }
+        }
+        if (dirty_count == 0) return true;      // already ordered
+
+        // Pass 2+: prove the clean subsequence is ordered.  Two overlapping
+        // swaps can hide an inversion behind a position that the marking pass
+        // dirtied, so a couple of scans are allowed -- but the whole repair has
+        // to stay inside `grow_cap`, which a block-level displacement (where
+        // the patch would have to swallow entire moved runs) cannot do.  Those
+        // shapes fall through to the displacement merge, which characterises
+        // them exactly in two scans instead of growing a patch pair by pair.
+        // The repair budget is deliberately tight: a shape that needs the whole
+        // range re-marked (a moved block, say) is not a "local disorder" shape,
+        // and the displacement merge below handles it in fewer passes than we
+        // would spend discovering that here.
+        // The hypothesis under test is that a handful of positions are out of
+        // place.  A pass that has to re-mark a large part of the original
+        // patch refutes it -- that is what a moved block looks like from here,
+        // every element inside it still being in order -- so the scan is
+        // abandoned instead of paying two more of them before giving up.
+        const std::size_t grow_cap = std::min<std::size_t>(max_dirty, dirty_count * 4 + 64);
+        const std::size_t dirty0 = dirty_count;
+        bool ordered = false;
+        for (int pass = 0; pass < 3 && !ordered; ++pass) {
+            bool changed = false;
+            std::size_t added = 0;
+            std::size_t prev = n;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (is_dirty(i)) continue;
+                if (prev != n && before(p[i], p[prev])) {
+                    mark(prev);
+                    mark(i);
+                    ++added;
+                    if (dirty_count > grow_cap) return false;
+                    changed = true;
+                    prev = n;
+                    continue;
+                }
+                prev = i;
+            }
+            ordered = !changed;
+            if (!ordered && added * 2u > dirty0) return false;
+        }
+        if (!ordered) return false;
+
+        // Compact: clean elements slide to the front in order, dirty elements
+        // move into the patch buffer.
+        std::vector<T> patch;
+        patch.reserve(dirty_count);
+        std::size_t w = 0;
+        // Word at a time: a patch is a fraction of a percent of the range, so
+        // nearly every word is entirely clean and slides as one block instead
+        // of sixty-four tested elements.
+        const std::size_t nwords = (n >> 6) + 1;
+        for (std::size_t wi = 0; wi < nwords; ++wi) {
+            const std::size_t base = wi << 6;
+            if (base >= n) break;
+            const std::size_t cnt = std::min<std::size_t>(64, n - base);
+            const std::uint64_t bw = bits[wi];
+            if (bw == 0 && cnt == 64) {
+                if (w != base) move_range_bulk(p + w, p + base, 64);
+                w += 64;
+                continue;
+            }
+            for (std::size_t k = 0; k < cnt; ++k) {
+                if ((bw >> k) & 1u) patch.push_back(std::move(p[base + k]));
+                else if (w != base + k) p[w] = std::move(p[base + k]), ++w;
+                else ++w;
+            }
+        }
+        if (w + patch.size() != n) return false;       // defensive
+        merge_patch_back(p, w, patch, before);
+        return true;
+    }
+}
+
+/// Budget wrapper: disorder beyond an eighth of the range is no longer "local",
+/// and the patch sort stops being cheaper than the kernels it replaces.
+template <class T, class Comp>
+inline bool try_dirty_patch_merge_adaptive(T* p, std::size_t n, Comp comp) {
+#if !FYX_ENABLE_ADAPTIVE_WEAPONS
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    return try_dirty_patch_merge(p, n, comp, n / 8);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Displacement patch merge
+// ---------------------------------------------------------------------------
+
+/// Sorts inputs whose disorder is a set of *displaced* elements, wherever they
+/// were moved from and however far they travelled.
+///
+/// Characterisation (exact, two linear scans):
+///   element i may stay  <=>  it is >= every element before it  and
+///                            it is <= every element after it.
+/// Two elements that both satisfy the test are automatically in order (each one
+/// is bounded by everything on the other side), so what remains after removing
+/// the failures is already sorted -- no iteration, no guessing, and no
+/// assumption about how far the failures travelled.  That covers whole classes
+/// of input the adjacent-inversion test cannot see: swapped blocks, moved
+/// segments, elements dragged across a long clean run, splices.
+///
+/// Cost: two scans plus one compaction and one merge, and a sort of the patch.
+/// The only scratch memory is two bits per element, so the probe never fights
+/// the radix kernels for the thread arena -- it stays affordable even when it
+/// declines.
+template <class T, class Comp>
+inline bool try_displacement_patch_merge(T* p, std::size_t n, Comp comp,
+                                         std::size_t max_dirty) {
+    if (n < 1024 || max_dirty == 0) return false;
+    if constexpr (!std::is_move_constructible<T>::value ||
+                  !std::is_move_assignable<T>::value ||
+                  !std::is_copy_constructible<T>::value) {
+        return false;
+    } else {
+        auto before = adaptive_order<T>(comp);
+        const std::size_t words = (n >> 6) + 2;
+        ScratchLease<std::uint64_t> bits_lease(words * 2);
+        if (!bits_lease.valid()) return false;
+        std::uint64_t* suf = bits_lease.get();
+        std::uint64_t* pre = suf + words;
+        std::memset(suf, 0, words * 2 * sizeof(std::uint64_t));
+
+        const std::size_t n_sentinel = n;
+        std::size_t low = 0;
+
+        // Pass 1 (backward): an element greater than the minimum of its own
+        // suffix cannot stay.  One running index, one bit per element.
+        {
+            std::size_t smin = n_sentinel;
+            for (std::size_t i = n - 1;; --i) {
+                if (smin != n_sentinel && before(p[smin], p[i])) {
+                    suf[i >> 6] |= std::uint64_t(1) << (i & 63);
+                    if (++low > max_dirty) return false;
+                }
+                if (smin == n_sentinel || before(p[i], p[smin])) smin = i;
+                if (i == 0) break;
+            }
+        }
+
+        // Pass 2 (forward): same test against the maximum of the prefix.  The
+        // union of the two bit sets is the patch; its size is known before a
+        // single element moves.
+        std::size_t high = 0;
+        {
+            std::size_t cmax = n_sentinel;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (cmax != n_sentinel && before(p[i], p[cmax])) {
+                    pre[i >> 6] |= std::uint64_t(1) << (i & 63);
+                    if (++high > max_dirty) return false;
+                }
+                if (cmax == n_sentinel || before(p[cmax], p[i])) cmax = i;
+            }
+        }
+        if (low + high == 0) return true;
+        if (low + high > max_dirty) return false;
+
+        // Pass 3: compact around the patch, then merge the patch back.
+        std::vector<T> patch;
+        patch.reserve(low + high);
+        std::size_t w = 0;
+        const std::size_t nwords = (n >> 6) + 1;
+        for (std::size_t wi = 0; wi < nwords; ++wi) {
+            const std::size_t base = wi << 6;
+            if (base >= n) break;
+            const std::size_t cnt = std::min<std::size_t>(64, n - base);
+            const std::uint64_t bw = suf[wi] | pre[wi];
+            if (bw == 0 && cnt == 64) {
+                if (w != base) move_range_bulk(p + w, p + base, 64);
+                w += 64;
+                continue;
+            }
+            for (std::size_t k = 0; k < cnt; ++k) {
+                if ((bw >> k) & 1u) patch.push_back(std::move(p[base + k]));
+                else {
+                    if (w != base + k) p[w] = std::move(p[base + k]);
+                    ++w;
+                }
+            }
+        }
+        if (w + patch.size() != n) return false;      // defensive
+        merge_patch_back(p, w, patch, before);
+        return true;
+    }
+}
+
+template <class T, class Comp>
+inline bool try_displacement_patch_merge_adaptive(T* p, std::size_t n, Comp comp) {
+#if !FYX_ENABLE_ADAPTIVE_WEAPONS
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    return try_displacement_patch_merge(p, n, comp, n / 8);
+#endif
+}
+
+} // namespace detail
+} // namespace fyx
+
 // ===========================================================================
 //  Section 12/13 -- Public API + adaptive dispatcher
 //
@@ -5237,6 +5846,25 @@ struct iterator_base_pointer<It, std::void_t<decltype(std::declval<It>().base())
 
 template <class It>
 inline constexpr bool has_mutable_base_pointer_v = iterator_base_pointer<It>::value;
+
+/// Containers whose elements live in nodes (std::list, std::forward_list).
+/// Their own sort splices nodes instead of moving elements, which is both
+/// cheaper than any move and the only thing that can be done through a
+/// bidirectional iterator.
+template <class C, class = void>
+struct has_member_sort : std::false_type {};
+template <class C>
+struct has_member_sort<C, std::void_t<decltype(std::declval<C&>().sort())>> : std::true_type {};
+template <class C>
+inline constexpr bool has_member_sort_v = has_member_sort<C>::value;
+
+template <class C, class Comp, class = void>
+struct has_member_sort_with : std::false_type {};
+template <class C, class Comp>
+struct has_member_sort_with<C, Comp,
+    std::void_t<decltype(std::declval<C&>().sort(std::declval<Comp&>()))>> : std::true_type {};
+template <class C, class Comp>
+inline constexpr bool has_member_sort_with_v = has_member_sort_with<C, Comp>::value;
 
 // Forward declaration of the (optionally compiled) GPU dispatch.  Defined in
 // parts/15_gpu.hpp under #ifdef FYX_ENABLE_GPU; when that switch is off the
@@ -5595,7 +6223,8 @@ inline bool try_nearly_sorted_insertion_repair(T* p, std::size_t n, Comp comp) {
 
 
 template <class T, class Comp>
-inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
+inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp,
+                                          bool thorough = false) {
 #if !FYX_USE_PDQ_PARTITION
     (void)p; (void)n; (void)comp;
     return false;
@@ -5620,30 +6249,32 @@ inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
         (void)p; (void)n; (void)comp;
         return false;
     } else {
-        // Local zigzag/sawtooth generators are not just disjoint adjacent swaps:
-        // examples such as [0,3,1,2, 4,7,5,6, ...] need two tiny insertions per
-        // block.  A full radix/sample pass is much slower, while ordinary random
-        // data would make insertion explode.  Sort a small copied prefix first;
-        // only if its displacement budget is tiny do we repair the real range.
+        // Two very different callers share this probe, and they can afford
+        // different things.  At the top of a sort, before the profile runs, it
+        // only pays for a sample: it is there for the zigzag / sawtooth
+        // family, whose disorder is dense but travels one position, and which
+        // the profile classifies as high entropy and will not repair.  Sparse
+        // disorder is left alone there -- the profile claims it and the repair
+        // chain below serves it better than this probe can.  Called from that
+        // chain the range is already known to be nearly sorted, a scan is
+        // already paid for, and sparse disorder is exactly what to look for:
+        // an array whose blocks were permuted has a few dozen inversions in a
+        // million positions and the first four thousand of them may be
+        // perfectly ordered, which no density test can see.
         const std::size_t sample_n = std::min<std::size_t>(n, std::size_t(4096));
-        std::size_t inv = 0, ordered = 0, turns = 0;
-        int prev_dir = 0;
+        std::size_t inv = 0, ordered = 0;
         for (std::size_t i = 1; i < sample_n; ++i) {
             const bool down = before(p[i], p[i - 1]);
-            const bool up = before(p[i - 1], p[i]);
+            const bool up   = before(p[i - 1], p[i]);
             if (down) ++inv;
             if (up || down) ++ordered;
-            const int dir = up ? 1 : (down ? -1 : 0);
-            if (dir != 0) {
-                if (prev_dir != 0 && dir != prev_dir) ++turns;
-                prev_dir = dir;
-            }
         }
-        if (ordered == 0 || inv == 0) return false;
-        if (inv * 100u < ordered * 8u) return false;
+        if (ordered == 0) return false;
+        if (!thorough && inv * 100u < ordered * 8u) return false;
 
-        // Low-cardinality random data can also have many local inversions, but
-        // counting sort owns it; avoid paying a doomed insertion probe there.
+        // Low-cardinality random data has plenty of local inversions but no
+        // local structure to exploit: counting sort owns it, and insertion
+        // would drag values across the whole range.
         if constexpr (std::is_arithmetic<T>::value && !std::is_same<T, bool>::value) {
             constexpr std::size_t Cap = 512;
             constexpr std::size_t Mask = Cap - 1;
@@ -5692,38 +6323,42 @@ inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
             if (distinct.size() <= 64u) return false;
         }
 
-        std::vector<T> probe(p, p + sample_n);
-        const std::size_t sample_cap = sample_n;
-        std::size_t sample_shifts = 0;
-        for (std::size_t i = 1; i < sample_n; ++i) {
-            if (!before(probe[i], probe[i - 1])) continue;
-            T v = std::move(probe[i]);
-            std::size_t j = i;
-            while (j > 0 && before(v, probe[j - 1])) {
-                probe[j] = std::move(probe[j - 1]);
-                --j;
-                if (++sample_shifts > sample_cap) {
-                    probe[j] = std::move(v);
-                    return false;
+        // Insertion sort permutes the range as it goes, so before touching a
+        // single element it rehearses on a copy of the prefix: the same
+        // insertion sort over the first four thousand positions, abandoned as
+        // soon as they cost more shifts than they contain.  Disorder that is
+        // dense but expensive -- interleaved runs, random data -- is refused
+        // here with the range still exactly as it was, which is what leaves
+        // the detectors downstream able to recognise it.  Sparse disorder
+        // costs nothing to rehearse and is let through.
+        {
+            std::vector<T> probe(p, p + sample_n);
+            std::size_t cost = 0;
+            for (std::size_t i = 1; i < sample_n; ++i) {
+                if (!before(probe[i], probe[i - 1])) continue;
+                T v = std::move(probe[i]);
+                std::size_t j = i;
+                while (j > 0 && before(v, probe[j - 1])) {
+                    probe[j] = std::move(probe[j - 1]);
+                    --j;
+                    if (++cost > sample_n) return false;
                 }
+                probe[j] = std::move(v);
             }
-            probe[j] = std::move(v);
         }
-        if (!std::is_sorted(probe.begin(), probe.end(), before)) return false;
 
-        const std::size_t scale = (n + sample_n - 1u) / sample_n;
-        const std::size_t scaled = (sample_shifts + 1u > std::numeric_limits<std::size_t>::max() / scale)
-            ? std::numeric_limits<std::size_t>::max()
-            : (sample_shifts + 1u) * scale;
-        const std::size_t shift_cap = n > std::numeric_limits<std::size_t>::max() / 2u
-            ? std::numeric_limits<std::size_t>::max()
-            : n * 2u;
-        const std::size_t budget = scaled > std::numeric_limits<std::size_t>::max() / 6u
-            ? std::numeric_limits<std::size_t>::max()
-            : scaled * 6u;
-        const std::size_t max_shifts = std::max<std::size_t>(std::size_t(4096),
-            std::min<std::size_t>(shift_cap, budget));
-        std::size_t shifts = 0;
+        // Insertion costs one pass plus the inversion count, so the repair may
+        // spend a small multiple of n shifts and still beat a radix pass.
+        // Three guards keep it honest, and none of them is a sample: a sample
+        // cannot see disorder this sparse.  Long travel is refused outright --
+        // an element crossing an eighth of the range is a block move, and the
+        // run merge and the patch merges own those.  The absolute budget is
+        // two shifts per element.  And the running rate is capped, with a
+        // strike to spare, because the shifts arrive in bursts: one permuted
+        // block is tens of thousands of them at a single position, while
+        // random input breaks the cap at every checkpoint from the first.
+        const std::size_t reach = n / 8u + 1u;
+        std::size_t shifts = 0, strikes = 0, next_check = 64;
         for (std::size_t i = 1; i < n; ++i) {
             if (!before(p[i], p[i - 1])) continue;
             T v = std::move(p[i]);
@@ -5731,12 +6366,19 @@ inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp) {
             while (j > 0 && before(v, p[j - 1])) {
                 p[j] = std::move(p[j - 1]);
                 --j;
-                if (++shifts > max_shifts) {
+                if (((i - j) & 63u) == 0u && i - j > reach) {
                     p[j] = std::move(v);
                     return false;
                 }
             }
             p[j] = std::move(v);
+            shifts += i - j;
+            if (shifts > n * 2u) return false;
+            if (i >= next_check) {
+                strikes = (shifts > i * 8u) ? strikes + 1u : 0u;
+                if (strikes >= 2u) return false;
+                next_check <<= 1;
+            }
         }
         return true;
     }
@@ -5921,7 +6563,27 @@ inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
     return false;
 #else
     if (try_adjacent_swap_repair(p, n, comp)) return true;
-    if (try_bounded_insertion_repair(p, n, comp)) return true;
+    // Insertion costs one pass plus the distance the displaced elements
+    // actually travel, so it is the cheapest repair that exists for shapes
+    // whose disorder is short-range even when it is spread over the whole
+    // range (permuted blocks, scattered local edits): every position is
+    // looked at once and only the displaced elements move.  It polices its
+    // own budget as it goes, so a shape it cannot finish costs a fraction of a
+    // pass.  The patch merges below move every element at least twice even
+    // when they succeed.
+    if (try_bounded_insertion_repair(p, n, comp, true)) return true;
+    // Sparse disorder is the common shape: a few percent of the positions take
+    // part in an inversion while the clean subsequence is already ordered.
+    // Pulling those positions out and merging them back costs three sequential
+    // passes instead of 4-8 radix passes, and it is width-independent, so
+    // int64/double gain the most.  Densely disordered input is rejected after
+    // touching about an eighth of the range, before anything is moved.
+    if (try_dirty_patch_merge_adaptive(p, n, comp)) return true;
+    // Adjacent inversions cannot see a block that was moved wholesale: every
+    // element inside it is still in order.  The prefix-max / suffix-min
+    // characterisation finds those, so spliced / block-moved inputs also cost
+    // a couple of linear passes instead of a full sort.
+    if (try_displacement_patch_merge_adaptive(p, n, comp)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
     return false;
 #endif
@@ -5934,7 +6596,22 @@ inline bool try_partially_sorted_repair(T* p, std::size_t n, Comp comp) {
     return false;
 #else
     if (try_adjacent_swap_repair(p, n, comp)) return true;
-    if (try_bounded_insertion_repair(p, n, comp)) return true;
+    // Bounded insertion comes first here too, for the same reason as in
+    // try_partially_sorted_local_repair and not despite the expensive
+    // comparisons: it is the cheapest repair when it fires and the cheapest
+    // one to decline.  1M 16-character strings whose 128-element blocks were
+    // permuted twenty times sort in 0.012s this way, against 0.037s through
+    // the patch merge that used to run first -- and on shapes it refuses it
+    // costs 0.0003s, where refusing a patch merge costs two full passes of
+    // comparisons, 0.021s.  A comparison per shift is not the expensive part;
+    // two passes over the whole range are.
+    if (try_bounded_insertion_repair(p, n, comp, true)) return true;
+    // For string/object payloads the patch merge replaces an O(n log n)
+    // comparison recursion with three sequential move passes plus a sort of
+    // the (tiny) dirty patch.
+    if (try_dirty_patch_merge_adaptive(p, n, comp)) return true;
+    // See above: moved blocks and long-distance splices.
+    if (try_displacement_patch_merge_adaptive(p, n, comp)) return true;
     if (try_nearly_sorted_repair(p, n, comp)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
     return false;
@@ -8389,11 +9066,11 @@ inline bool radix_high_prefix_probe(const T* p, std::size_t n) noexcept {
     } else {
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n;
             return false;
         } else {
-            constexpr unsigned Shift = 64u - PrefixBits;
+            constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
             constexpr std::size_t Cap = 2048;
             constexpr std::size_t Mask = Cap - 1;
             std::array<Key, Cap> keys{};
@@ -8425,7 +9102,7 @@ template <class T, unsigned PrefixBits>
 inline void radix_sort_high_prefix_value_ties(T* p, std::size_t n) {
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
-    constexpr unsigned Shift = 64u - PrefixBits;
+    constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
     if (n < 2) return;
     std::size_t group_lo = 0;
     Key prev_prefix = RT::encode(p[0]) >> Shift;
@@ -8453,7 +9130,7 @@ inline void radix_sort_high_prefix_value_ties(T* p, std::size_t n) {
 
 template <class Key, unsigned PrefixBits>
 inline void radix_sort_high_prefix_key_ties(Key* p, std::size_t n) {
-    constexpr unsigned Shift = 64u - PrefixBits;
+    constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
     std::size_t i = 0;
     while (i < n) {
         const Key prefix = p[i] >> Shift;
@@ -8481,7 +9158,7 @@ inline bool try_parallel_radix_high_prefix_value_sort(T* p, std::size_t n, bool 
             return false;
         } else {
             constexpr unsigned PrefixBytes = PrefixBits / 8;
-            constexpr unsigned FirstShift = 64u - PrefixBits;
+            constexpr unsigned FirstShift = unsigned(sizeof(Key) * 8) - PrefixBits;
             if (n < (std::size_t(1) << 19) || !parallel_available()) return false;
             if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
 
@@ -8565,7 +9242,7 @@ template <class Key, unsigned Bits>
 inline void radix_count_key_pass_banked_wide(const Key* FYX_RESTRICT src,
                                              std::size_t n, unsigned shift,
                                              std::uint32_t* FYX_RESTRICT out) noexcept {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix count is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix count is tuned for 8..13 bits");
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
     constexpr Key Mask = Key(Buckets - 1);
     std::array<std::uint32_t, 4 * Buckets> bank{};
@@ -8591,7 +9268,7 @@ template <class T, unsigned Bits>
 inline void radix_count_value_pass_banked_wide(const T* FYX_RESTRICT src,
                                                std::size_t n, unsigned shift,
                                                std::uint32_t* FYX_RESTRICT out) noexcept {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix count is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix count is tuned for 8..13 bits");
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
@@ -8617,12 +9294,60 @@ inline void radix_count_value_pass_banked_wide(const T* FYX_RESTRICT src,
         out[d] = bank[d] + bank[Buckets + d] + bank[2 * Buckets + d] + bank[3 * Buckets + d];
 }
 
+/// One sweep over `src` fills the digit histogram of every radix pass at once.
+///
+/// Counting pass by pass re-reads the whole array once per pass: at 8M int32
+/// that is 0.0134s of the 0.0863s the two passes spend.  The digits of all the
+/// passes are shifts of one and the same encoded key, so a single read of the
+/// array -- and a single encode per element -- can feed all of them.  Four
+/// banks per pass keep consecutive increments off the same cache line, which
+/// is what keeps the read-modify-write chain from stalling.
+///
+/// `out` receives `Passes` consecutive histograms of `1 << Bits` counters.
+template <class T, unsigned Bits, unsigned Passes>
+inline void radix_count_all_value_passes_wide(const T* FYX_RESTRICT src, std::size_t n,
+                                              unsigned first_shift,
+                                              std::uint32_t* FYX_RESTRICT out) noexcept {
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix count is tuned for 8..13 bits");
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr std::size_t Buckets = std::size_t(1) << Bits;
+    constexpr std::size_t kBanks  = 4;
+    constexpr Key Mask = Key(Buckets - 1);
+
+    std::array<std::uint32_t, kBanks * Passes * Buckets> bank{};
+    std::size_t i = 0;
+    for (; i + kBanks <= n; i += kBanks) {
+        prefetch_stream(src, i, n);
+        Key k[kBanks];
+        for (std::size_t j = 0; j < kBanks; ++j) k[j] = RT::encode(src[i + j]);
+        for (unsigned pi = 0; pi < Passes; ++pi) {
+            const unsigned shift = first_shift + pi * Bits;
+            std::uint32_t* b = bank.data() + std::size_t(pi) * kBanks * Buckets;
+            for (std::size_t j = 0; j < kBanks; ++j)
+                ++b[j * Buckets + static_cast<std::size_t>((k[j] >> shift) & Mask)];
+        }
+    }
+    for (; i < n; ++i) {
+        const Key k = RT::encode(src[i]);
+        for (unsigned pi = 0; pi < Passes; ++pi)
+            ++bank[std::size_t(pi) * kBanks * Buckets +
+                   static_cast<std::size_t>((k >> (first_shift + pi * Bits)) & Mask)];
+    }
+    for (unsigned pi = 0; pi < Passes; ++pi) {
+        const std::uint32_t* b = bank.data() + std::size_t(pi) * kBanks * Buckets;
+        std::uint32_t* o = out + std::size_t(pi) * Buckets;
+        for (std::size_t d = 0; d < Buckets; ++d)
+            o[d] = b[d] + b[Buckets + d] + b[2 * Buckets + d] + b[3 * Buckets + d];
+    }
+}
+
 template <class Key, unsigned Bits>
 inline void radix_scatter_key_pass_wide(const Key* FYX_RESTRICT src, std::size_t n,
                                         Key* FYX_RESTRICT dst, unsigned shift,
                                         std::size_t* FYX_RESTRICT offset,
                                         bool can_stream) {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix scatter is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix scatter is tuned for 8..13 bits");
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
     constexpr std::size_t kPerLine = WcbTraits<Key>::kPerLine;
     constexpr Key Mask = Key(Buckets - 1);
@@ -8709,7 +9434,7 @@ inline void radix_scatter_encode_pass_wide(const T* FYX_RESTRICT src, std::size_
                                            Key* FYX_RESTRICT dst, unsigned shift,
                                            std::size_t* FYX_RESTRICT offset,
                                            bool can_stream) {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix scatter is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix scatter is tuned for 8..13 bits");
     using RT = RadixTraits<T>;
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
     constexpr std::size_t kPerLine = WcbTraits<Key>::kPerLine;
@@ -8797,7 +9522,7 @@ inline void radix_scatter_key_decode_pass_wide(const Key* FYX_RESTRICT src, std:
                                                T* FYX_RESTRICT dst, unsigned shift,
                                                std::size_t* FYX_RESTRICT offset,
                                                bool can_stream) {
-    static_assert(Bits > 8 && Bits <= 13, "wide radix scatter is tuned for 9..13 bits");
+    static_assert(Bits >= 8 && Bits <= 13, "wide radix scatter is tuned for 8..13 bits");
     static_assert(sizeof(T) == sizeof(Key), "decoded scatter expects word-sized values");
     using RT = RadixTraits<T>;
     constexpr std::size_t Buckets = std::size_t(1) << Bits;
@@ -8882,11 +9607,356 @@ inline void radix_scatter_key_decode_pass_wide(const Key* FYX_RESTRICT src, std:
     if (can_stream) store_fence();
 }
 
+// ---------------------------------------------------------------------------
+// Vectorised tie scan
+// ---------------------------------------------------------------------------
+// After the two radix passes every key is ordered by its top PrefixBits bits
+// and only the groups that share a prefix still need sorting.  Finding those
+// groups means comparing every element's prefix with its predecessor's -- a
+// full pass whose cost has nothing to do with how little work it turns up.
+// On uniform data almost every group holds a single element, so the scan is
+// the most expensive part of the repair and repairs almost nothing.
+//
+// AVX-512 answers for sixteen elements (eight for 64-bit keys) at a time.  One
+// load, one encode, one shift, and one compare against the vector rotated by
+// a single lane with the previous prefix shifted into lane 0: the resulting
+// mask has a bit for every lane whose prefix equals its predecessor's, which
+// is exactly "this vector starts a tie group".  An empty mask -- the common
+// case -- skips the whole vector.  Only a vector that actually holds a tie
+// falls back to the element-at-a-time path, and only for its own lanes.
+//
+// The vector encoder reproduces RadixTraits<T>::encode bit for bit: unsigned
+// keys pass through, signed keys flip the sign bit, and IEC-559 floats flip
+// with (arithmetic-shift(sign) | sign_bit), all ones for a negative.
+// ---------------------------------------------------------------------------
+
+#if FYX_HAS_AVX512_CODE
+FYX_ISA_BEGIN("avx512f")
+namespace isa_avx512_keys {
+
+/// 1 << 63 as a signed long long, spelled once so the intrinsics macro sees a
+/// plain identifier instead of a cast it cannot parse.
+static constexpr long long kSign64 = -9223372036854775807LL - 1;
+
+template <unsigned Size, bool Signed, bool Float>
+struct TieKeyImpl {
+    static constexpr bool     defined = false;
+    static constexpr unsigned lanes   = 1;
+    static inline __m512i enc(__m512i) { return _mm512_setzero_si512(); }
+    static inline __m512i dec(__m512i) { return _mm512_setzero_si512(); }
+};
+
+template <> struct TieKeyImpl<4, false, false> {          // uint32
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 16;
+    static inline __m512i enc(__m512i v) { return v; }
+    static inline __m512i dec(__m512i k) { return k; }
+};
+template <> struct TieKeyImpl<4, true, false> {           // int32
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 16;
+    static inline __m512i enc(__m512i v) {
+        return _mm512_xor_si512(v, _mm512_set1_epi32(int(0x80000000u)));
+    }
+    static inline __m512i dec(__m512i k) { return enc(k); }
+};
+template <> struct TieKeyImpl<4, true, true> {            // float
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 16;
+    static inline __m512i enc(__m512i u) {
+        const __m512i m = _mm512_or_si512(_mm512_srai_epi32(u, 31),
+                                          _mm512_set1_epi32(int(0x80000000u)));
+        return _mm512_xor_si512(u, m);
+    }
+    // Inverse: the encoded top bit is set when the original was positive.
+    static inline __m512i dec(__m512i k) {
+        const __m512i s = _mm512_srai_epi32(k, 31);           // all ones if positive
+        const __m512i m = _mm512_or_si512(
+            _mm512_and_si512(s, _mm512_set1_epi32(int(0x80000000u))),
+            _mm512_andnot_si512(s, _mm512_set1_epi32(-1)));
+        return _mm512_xor_si512(k, m);
+    }
+};
+template <> struct TieKeyImpl<8, false, false> {          // uint64
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 8;
+    static inline __m512i enc(__m512i v) { return v; }
+    static inline __m512i dec(__m512i k) { return k; }
+};
+template <> struct TieKeyImpl<8, true, false> {           // int64
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 8;
+    static constexpr long long kSign  = kSign64;
+    static inline __m512i enc(__m512i v) {
+        return _mm512_xor_si512(v, _mm512_set1_epi64(kSign));
+    }
+    static inline __m512i dec(__m512i k) { return enc(k); }
+};
+template <> struct TieKeyImpl<8, true, true> {            // double
+    static constexpr bool     defined = true;
+    static constexpr unsigned lanes   = 8;
+    static constexpr long long kSign  = kSign64;
+    static inline __m512i enc(__m512i u) {
+        const __m512i m = _mm512_or_si512(_mm512_srai_epi64(u, 63),
+                                          _mm512_set1_epi64(kSign));
+        return _mm512_xor_si512(u, m);
+    }
+    static inline __m512i dec(__m512i k) {
+        const __m512i s = _mm512_srai_epi64(k, 63);
+        const __m512i m = _mm512_or_si512(_mm512_and_si512(s, _mm512_set1_epi64(kSign)),
+                                          _mm512_andnot_si512(s, _mm512_set1_epi64(-1)));
+        return _mm512_xor_si512(k, m);
+    }
+};
+
+template <class T>
+using TieKey = TieKeyImpl<sizeof(T),
+                          std::is_signed<T>::value || std::is_floating_point<T>::value,
+                          std::is_floating_point<T>::value>;
+
+/// Sorts every run of equal top-PrefixBits prefixes in `p` in place.
 template <class T, unsigned PrefixBits>
-inline void radix_sort_high_prefix_decoded_ties(T* p, std::size_t n) {
+inline void scan_ties(T* FYX_RESTRICT p, std::size_t n) noexcept {
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
-    constexpr unsigned Shift = 64u - PrefixBits;
+    using TK  = TieKey<T>;
+    constexpr unsigned Lanes = TK::lanes;
+    constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
+    if (n < 2) return;
+
+    auto repair = [&](std::size_t lo, std::size_t hi) {
+        for (std::size_t a = lo + 1; a < hi; ++a) {
+            T v = p[a];
+            const Key kv = RT::encode(v);
+            std::size_t b = a;
+            while (b > lo && RT::encode(p[b - 1]) > kv) { p[b] = p[b - 1]; --b; }
+            p[b] = v;
+        }
+    };
+
+    std::size_t i = 1, group_lo = 0;
+    Key prev = RT::encode(p[0]) >> Shift;
+
+    // Element-at-a-time fallback, used for the rare vector that holds a tie
+    // and for the tail that does not fill one.
+    auto step = [&](std::size_t stop) {
+        for (; i < stop; ++i) {
+            const Key cur = RT::encode(p[i]) >> Shift;
+            if (cur != prev) {
+                if (i - group_lo > 1) repair(group_lo, i);
+                group_lo = i;
+                prev = cur;
+            }
+        }
+    };
+
+    while (i + Lanes <= n) {
+        const __m512i pref = Lanes == 16
+            ? _mm512_srli_epi32(TK::enc(_mm512_loadu_si512(
+                  reinterpret_cast<const void*>(p + i))), Shift)
+            : _mm512_srli_epi64(TK::enc(_mm512_loadu_si512(
+                  reinterpret_cast<const void*>(p + i))), Shift);
+        // Rotate by one lane, shifting the previous vector's last prefix in.
+        // The set1/intrinsic macros want plain identifiers, not casts.
+        const int       pv32 = int(std::uint32_t(prev));
+        const long long pv64 = static_cast<long long>(std::uint64_t(prev));
+        __m512i carry;
+        __mmask16 ties;
+        if constexpr (Lanes == 16) {
+            carry = _mm512_mask_set1_epi32(pref, __mmask16(1u << 15), pv32);
+            ties  = _mm512_cmpeq_epi32_mask(pref, _mm512_alignr_epi32(pref, carry, 15));
+        } else {
+            carry = _mm512_mask_set1_epi64(pref, __mmask8(1u << 7), pv64);
+            ties  = __mmask16(_mm512_cmpeq_epi64_mask(pref, _mm512_alignr_epi64(pref, carry, 7)));
+        }
+        if (ties == 0) {
+            // Every element here starts its own group: close the one that was
+            // open and skip the whole vector.
+            if (i - group_lo > 1) repair(group_lo, i);
+            i += Lanes;
+            group_lo = i - 1;
+        } else {
+            // A tie poisons only its own run of lanes.  Walk the set bits --
+            // one iteration per group, not per element -- and repair just
+            // those; every other element here is a group of one.  A run of
+            // set bits [a..b] means elements i+a .. i+b+1 share a prefix, so
+            // the group is [i+a, i+b+2), or [group_lo, i+b+2) when the run
+            // reaches lane 0 and continues the group that was already open.
+            if ((ties & 1u) == 0 && i - group_lo > 1) repair(group_lo, i);
+            std::uint32_t m = static_cast<std::uint32_t>(ties);
+            while (m) {
+                const unsigned a = unsigned(__builtin_ctz(m));
+                unsigned b = a;
+                while (b + 1 < Lanes && (m & (1u << (b + 1)))) ++b;
+                // Bits a..b set means elements i+a-1 .. i+b share a prefix.
+                const std::size_t lo = (a == 0) ? group_lo : i + a - 1;
+                const std::size_t hi = i + b + 1;
+                if (b == Lanes - 1) group_lo = lo;       // runs off the end
+                else if (hi - lo > 1) repair(lo, hi);
+                m &= ~((1u << (b + 1)) - 1);
+            }
+            if ((ties & (1u << (Lanes - 1))) == 0) group_lo = i + Lanes - 1;
+            i += Lanes;
+        }
+        prev = RT::encode(p[i - 1]) >> Shift;   // i has advanced past the vector
+    }
+    step(n);
+    if (n - group_lo > 1) repair(group_lo, n);
+}
+
+}   // namespace isa_avx512_keys
+FYX_ISA_END
+#endif   // FYX_HAS_AVX512_CODE
+
+#if FYX_HAS_AVX512_CODE
+FYX_ISA_BEGIN("avx512f,avx512cd,avx512vpopcntdq")
+namespace isa_avx512_scat {
+
+// ---------------------------------------------------------------------------
+// Conflict-detection scatter
+// ---------------------------------------------------------------------------
+// Sixteen keys per step (eight for 64-bit), where the write-combining scatter
+// moves one element at a time:
+//
+//   vpconflictd -> which earlier lanes of this vector want the same bucket
+//   vpopcntd    -> this lane's rank among them
+//   gather      -> the bucket's running destination index
+//   + rank      -> a distinct destination for every lane, in bucket order
+//   scatter     -> the keys land in order inside their bucket
+//   scatter     -> every lane writes index+1 back; where lanes collide the
+//                  highest one wins, and that lane carries the largest index
+//                  of the group -- which is the next free position
+//
+// Needs AVX512CD and AVX512VPOPCNTDQ, hence its own ISA block.
+//
+// It beats the write-combining scatter while the array stays in cache and
+// loses to it once the array leaves: this writes single elements, so every
+// line it touches is read back first, whereas the write-combining scatter
+// flushes whole lines with non-temporal stores that read nothing.
+// Measured with tools/dev/scat.cpp, 12-bit digits, uniformly random keys:
+//
+//       this        write-combining
+//   1M  2.74 ns/elem   3.26
+//   2M  2.83           3.18
+//   4M  4.78           3.38
+//   8M  4.57           3.14
+//
+// so the kernel picks per size, not per type.
+// ---------------------------------------------------------------------------
+
+template <class T, class S, class D, unsigned Bits>
+inline void scatter32(const S* FYX_RESTRICT src, std::size_t n, D* FYX_RESTRICT dst,
+                      unsigned shift, std::uint32_t* FYX_RESTRICT off) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    using KV  = isa_avx512_keys::TieKey<T>;
+    constexpr std::uint32_t Mask = (std::uint32_t(1) << Bits) - 1;
+    const __m512i vmask = _mm512_set1_epi32(int(Mask));
+    const __m512i vone  = _mm512_set1_epi32(1);
+    std::size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512i raw = _mm512_loadu_si512(reinterpret_cast<const void*>(src + i));
+        __m512i k, val;
+        if constexpr (std::is_same<S, Key>::value) k = raw; else k = KV::enc(raw);
+        if constexpr (std::is_same<D, Key>::value) val = k;  else val = KV::dec(k);
+        const __m512i idx  = _mm512_and_si512(_mm512_srli_epi32(k, shift), vmask);
+        const __m512i rank = _mm512_popcnt_epi32(_mm512_conflict_epi32(idx));
+        const __m512i pos  = _mm512_add_epi32(_mm512_i32gather_epi32(idx, off, 4), rank);
+        _mm512_i32scatter_epi32(dst, pos, val, 4);
+        _mm512_i32scatter_epi32(off, idx, _mm512_add_epi32(pos, vone), 4);
+    }
+    for (; i < n; ++i) {
+        Key k;
+        if constexpr (std::is_same<S, Key>::value) k = Key(src[i]); else k = RT::encode(src[i]);
+        const std::size_t b = std::size_t((k >> shift) & Key(Mask));
+        if constexpr (std::is_same<D, Key>::value) dst[off[b]++] = D(k);
+        else                                       dst[off[b]++] = RT::decode(k);
+    }
+}
+
+template <class T, class S, class D, unsigned Bits>
+inline void scatter64(const S* FYX_RESTRICT src, std::size_t n, D* FYX_RESTRICT dst,
+                      unsigned shift, std::size_t* FYX_RESTRICT off) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    using KV  = isa_avx512_keys::TieKey<T>;
+    constexpr std::uint64_t Mask = (std::uint64_t(1) << Bits) - 1;
+    const __m512i vmask = _mm512_set1_epi64(static_cast<long long>(Mask));
+    const __m512i vone  = _mm512_set1_epi64(1);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m512i raw = _mm512_loadu_si512(reinterpret_cast<const void*>(src + i));
+        __m512i k, val;
+        if constexpr (std::is_same<S, Key>::value) k = raw; else k = KV::enc(raw);
+        if constexpr (std::is_same<D, Key>::value) val = k;  else val = KV::dec(k);
+        const __m512i idx64 = _mm512_and_si512(_mm512_srli_epi64(k, shift), vmask);
+        // Truncate to eight 32-bit indices.  A bitcast will not do: the low
+        // half of the register holds four 64-bit lanes, which read as eight
+        // 32-bit ones would be the halves of k0..k3, not k0..k7.
+        const __m256i idx   = _mm512_cvtepi64_epi32(idx64);
+        const __m512i rank  = _mm512_popcnt_epi64(_mm512_conflict_epi64(idx64));
+        const __m512i pos   = _mm512_add_epi64(_mm512_i32gather_epi64(idx, off, 8), rank);
+        _mm512_i64scatter_epi64(dst, pos, val, 8);
+        _mm512_i32scatter_epi64(off, idx, _mm512_add_epi64(pos, vone), 8);
+    }
+    for (; i < n; ++i) {
+        Key k;
+        if constexpr (std::is_same<S, Key>::value) k = Key(src[i]); else k = RT::encode(src[i]);
+        const std::size_t b = std::size_t((k >> shift) & Key(Mask));
+        if constexpr (std::is_same<D, Key>::value) dst[off[b]++] = D(k);
+        else                                       dst[off[b]++] = RT::decode(k);
+    }
+}
+
+}   // namespace isa_avx512_scat
+FYX_ISA_END
+#endif   // FYX_HAS_AVX512_CODE
+
+/// One scatter pass, on whichever of the two engines the size calls for.
+///
+/// `off32` is scratch for the 32-bit AVX-512 path, which counts destinations
+/// in 32 bits and only runs when n fits in them.
+template <class T, class S, class D, unsigned Bits>
+inline void radix_scatter_wide_pass(const S* FYX_RESTRICT src, std::size_t n,
+                                    D* FYX_RESTRICT dst, unsigned shift,
+                                    std::size_t* FYX_RESTRICT pos,
+                                    std::uint32_t* FYX_RESTRICT off32,
+                                    bool avx512_ok, bool can_stream) noexcept {
+    using Key = typename RadixTraits<T>::Key;
+#if FYX_HAS_AVX512_CODE
+    if (avx512_ok) {
+        if constexpr (sizeof(Key) == 4) {
+            constexpr std::size_t B = std::size_t(1) << Bits;
+            for (std::size_t d = 0; d < B; ++d) off32[d] = std::uint32_t(pos[d]);
+            isa_avx512_scat::scatter32<T, S, D, Bits>(src, n, dst, shift, off32);
+        } else {
+            isa_avx512_scat::scatter64<T, S, D, Bits>(src, n, dst, shift, pos);
+        }
+        return;
+    }
+#else
+    (void)off32; (void)avx512_ok;
+#endif
+    if constexpr (std::is_same<S, Key>::value && std::is_same<D, Key>::value)
+        radix_scatter_key_pass_wide<Key, Bits>(src, n, dst, shift, pos, can_stream);
+    else if constexpr (std::is_same<D, Key>::value)
+        radix_scatter_encode_pass_wide<T, Key, Bits>(src, n, dst, shift, pos, can_stream);
+    else
+        radix_scatter_key_decode_pass_wide<T, Key, Bits>(src, n, dst, shift, pos, can_stream);
+}
+
+
+template <class T, unsigned PrefixBits>
+inline void radix_sort_high_prefix_decoded_ties(T* p, std::size_t n) {
+#if FYX_HAS_AVX512_CODE
+    if constexpr (isa_avx512_keys::TieKey<T>::defined) {
+        if (use_avx512()) { isa_avx512_keys::scan_ties<T, PrefixBits>(p, n); return; }
+    }
+#endif
+
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr unsigned Shift = unsigned(sizeof(Key) * 8) - PrefixBits;
     if (n < 2) return;
     std::size_t group_lo = 0;
     Key prev_prefix = RT::encode(p[0]) >> Shift;
@@ -8922,12 +9992,12 @@ inline bool try_parallel_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bo
     } else {
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n; (void)descending;
             return false;
         } else {
             constexpr unsigned Passes = PrefixBits / Bits;
-            constexpr unsigned FirstShift = 64u - PrefixBits;
+            constexpr unsigned FirstShift = unsigned(sizeof(Key) * 8) - PrefixBits;
             constexpr std::size_t Buckets = std::size_t(1) << Bits;
             if (n < (std::size_t(1) << 19) || !parallel_available()) return false;
             if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
@@ -8969,33 +10039,53 @@ inline bool try_parallel_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bo
                     }
                 }
 
+                // Chunks, not the whole array, decide the scatter engine: a
+                // chunk is what one thread walks, and it is the working set of
+                // one thread that has to stay in cache.  See the table above
+                // isa_avx512_scat::scatter32.
+                const bool avx512_ok =
+                    use_avx512_conflict() && n <= std::size_t(0xffffffffu) &&
+                    ((n + chunks - 1) / chunks) * sizeof(Key) <= (std::size_t(1) << 23);
+
                 if (pi == 0) {
                     auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        std::vector<std::uint32_t> off32(
+                            (avx512_ok && sizeof(Key) == 4) ? Buckets : std::size_t(0));
                         for (std::size_t c = c_lo; c < c_hi; ++c) {
                             const std::size_t lo = (c * n) / chunks;
                             const std::size_t hi = ((c + 1) * n) / chunks;
                             auto pos = base[c];
-                            radix_scatter_encode_pass_wide<T, Key, Bits>(p + lo, hi - lo, src, shift, pos.data(), can_stream);
+                            radix_scatter_wide_pass<T, T, Key, Bits>(
+                                p + lo, hi - lo, src, shift, pos.data(), off32.data(),
+                                avx512_ok, can_stream);
                         }
                     };
                     parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
                 } else if (pi + 1 == Passes) {
                     auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        std::vector<std::uint32_t> off32(
+                            (avx512_ok && sizeof(Key) == 4) ? Buckets : std::size_t(0));
                         for (std::size_t c = c_lo; c < c_hi; ++c) {
                             const std::size_t lo = (c * n) / chunks;
                             const std::size_t hi = ((c + 1) * n) / chunks;
                             auto pos = base[c];
-                            radix_scatter_key_decode_pass_wide<T, Key, Bits>(src + lo, hi - lo, p, shift, pos.data(), can_stream);
+                            radix_scatter_wide_pass<T, Key, T, Bits>(
+                                src + lo, hi - lo, p, shift, pos.data(), off32.data(),
+                                avx512_ok, can_stream);
                         }
                     };
                     parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
                 } else {
                     auto scatter_job = [&](std::size_t c_lo, std::size_t c_hi) {
+                        std::vector<std::uint32_t> off32(
+                            (avx512_ok && sizeof(Key) == 4) ? Buckets : std::size_t(0));
                         for (std::size_t c = c_lo; c < c_hi; ++c) {
                             const std::size_t lo = (c * n) / chunks;
                             const std::size_t hi = ((c + 1) * n) / chunks;
                             auto pos = base[c];
-                            radix_scatter_key_pass_wide<Key, Bits>(src + lo, hi - lo, dst, shift, pos.data(), can_stream);
+                            radix_scatter_wide_pass<T, Key, Key, Bits>(
+                                src + lo, hi - lo, dst, shift, pos.data(), off32.data(),
+                                avx512_ok, can_stream);
                         }
                     };
                     parallel_for_index(std::size_t(0), chunks, std::size_t(1), scatter_job);
@@ -9010,6 +10100,44 @@ inline bool try_parallel_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bo
     }
 }
 
+// ---------------------------------------------------------------------------
+// How wide the high prefix should be
+//
+// A high-prefix radix pass costs two traversals of the range per digit plus a
+// tie repair inside every prefix group, so the width that pays depends on how
+// many groups the data falls into -- which is a property of the data, not of
+// the type it happens to be stored in.  Values in [0, 2^30) share their high
+// bits and collapse into tens of thousands of groups at 24 bits, where the tie
+// repair costs more than the extra pass a 36-bit prefix would have spent
+// (0.046s against 0.026s for 1M doubles); uniform 64-bit data splinters into
+// millions of groups at 24 bits already, and there the wider prefix buys
+// nothing but two more traversals (0.011s against 0.015s).
+//
+// Sampling counts the groups: S samples landing in G groups collide about
+// S*S/(2G) times, so the collisions the sample sees estimate G, and the only
+// question left is whether the average group is small enough for the tie
+// repair to be free (two elements or fewer).
+// ---------------------------------------------------------------------------
+template <class T>
+inline unsigned radix_choose_prefix_bits(const T* p, std::size_t n,
+                                         unsigned narrow, unsigned wide) noexcept {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr std::size_t S = 4096;
+    if (n < S * 8) return wide;
+    std::array<Key, S> sample;
+    const unsigned shift = unsigned(sizeof(Key) * 8) - narrow;
+    for (std::size_t j = 0; j < S; ++j)
+        sample[j] = RT::encode(p[(j * (n - 1)) / (S - 1)]) >> shift;
+    std::sort(sample.begin(), sample.end());
+    std::size_t collisions = 0;
+    for (std::size_t j = 1; j < S; ++j)
+        if (sample[j] == sample[j - 1]) ++collisions;
+    // groups ~ S*S/(2*collisions), so the average group holds about
+    // 2*n*collisions/(S*S) elements.
+    return (n * collisions <= S * S) ? narrow : wide;
+}
+
 template <class T>
 inline bool try_parallel_radix_high_prefix_sort(T* p, std::size_t n, bool descending) {
     if constexpr (!radix_supported_v<T> || std::is_same<T, bool>::value) {
@@ -9017,24 +10145,42 @@ inline bool try_parallel_radix_high_prefix_sort(T* p, std::size_t n, bool descen
         return false;
     } else {
         using Key = typename RadixTraits<T>::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n; (void)descending;
             return false;
-        } else if constexpr (std::is_same<T, double>::value) {
-            // IEEE doubles generated by benchmark/random workloads share many
-            // exponent bits.  1M/5M public matrices are faster with a 36-bit
-            // prefix in three 12-bit digits; very large ranges keep the 39-bit
-            // repair guard to avoid oversized tie buckets.
-            if (n <= (std::size_t(1) << 21))
-                return try_parallel_radix_high_prefix_key_sort_wide<T, 36, 12>(p, n, descending);
-            return try_parallel_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
-        } else if constexpr (std::is_integral<T>::value && sizeof(T) == 8) {
-            // 64-bit integer random data has very few collisions in the top
-            // encoded bits.  Use a two-pass prefix at 1M scale to cut one full
-            // count/scatter round, and a slightly wider two-pass prefix beyond
-            // that so tie repair remains tiny at 5M/10M.
-            if (n <= (std::size_t(1) << 21))
-                return try_parallel_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending);
+        } else if constexpr (std::is_same<T, double>::value ||
+                             (std::is_integral<T>::value && sizeof(T) == 8)) {
+            // Narrow when the data splinters, wide when it clumps: see
+            // radix_choose_prefix_bits.  The width used to be picked by type,
+            // which is right for whichever kind of data it was tuned on and
+            // wrong for the other.
+            if (n <= (std::size_t(1) << 21)) {
+                const unsigned w = radix_choose_prefix_bits<T>(p, n, 24, 36);
+                return w == 24
+                    ? try_parallel_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending)
+                    : try_parallel_radix_high_prefix_key_sort_wide<T, 36, 12>(p, n, descending);
+            }
+            const unsigned w = radix_choose_prefix_bits<T>(p, n, 26, 39);
+            return w == 26
+                ? try_parallel_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending)
+                : try_parallel_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
+        } else if constexpr (sizeof(Key) == 4) {
+            // Two threads make this the faster of the two parallel sorts up to
+            // about three million elements, and the slower one above that:
+            // 2M 0.0125 vs 0.0176, 4M 0.0253 vs 0.0201, 8M 0.0516 vs 0.0397,
+            // 16M 0.1137 vs 0.0787.  Decline past the crossover and let the
+            // dispatcher fall back to try_parallel_radix32_wide_sort.
+            if (n > (std::size_t(3) << 20)) return false;
+            // A 32-bit key gets the same two-pass treatment as a 64-bit one.
+            // Routing it here instead of through try_parallel_radix32_wide_sort
+            // is what makes random int32 scale with the core count: at 1M the
+            // wide sort gained 1.13x from two threads and this one gains 1.7x.
+            if (n <= (std::size_t(1) << 21)) {
+                const unsigned w = radix_choose_prefix_bits<T>(p, n, 24, 26);
+                return w == 24
+                    ? try_parallel_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending)
+                    : try_parallel_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
+            }
             return try_parallel_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
         } else {
             (void)p; (void)n; (void)descending;
@@ -10044,7 +11190,7 @@ inline bool try_integer_sparse_count_sort_parallel(T* p, std::size_t n, bool des
 }
 
 template <class T>
-inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool descending) {
+FYX_NOINLINE inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool descending) {
     if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
         (void)p; (void)n; (void)descending;
         return false;
@@ -10066,42 +11212,21 @@ inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool desc
         const Key sample_span = static_cast<Key>(smx - smn);
         if (sample_span == std::numeric_limits<Key>::max()) return false;
         const unsigned long long sample_range64 = static_cast<unsigned long long>(sample_span) + 1ull;
-        if (sample_range64 < 64ull ||
+        if (sample_range64 < 2ull ||
             sample_range64 > static_cast<unsigned long long>(MaxParallelRange)) return false;
 
         const std::size_t chunks = adaptive_parallel_chunks(n);
         if ((n + chunks - 1) / chunks >
             static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) return false;
 
-        std::vector<Key> local_min(chunks), local_max(chunks);
-        auto minmax_job = [&](std::size_t c_lo, std::size_t c_hi) {
-            for (std::size_t c = c_lo; c < c_hi; ++c) {
-                const std::size_t lo = (c * n) / chunks;
-                const std::size_t hi = ((c + 1) * n) / chunks;
-                Key mn = RT::encode(p[lo]);
-                Key mx = mn;
-                for (std::size_t i = lo + 1; i < hi; ++i) {
-                    const Key k = RT::encode(p[i]);
-                    if (k < mn) mn = k;
-                    if (mx < k) mx = k;
-                }
-                local_min[c] = mn;
-                local_max[c] = mx;
-            }
-        };
-        parallel_for_index(std::size_t(0), chunks, std::size_t(1), minmax_job);
-
-        Key mn = local_min[0];
-        Key mx = local_max[0];
-        for (std::size_t c = 1; c < chunks; ++c) {
-            if (local_min[c] < mn) mn = local_min[c];
-            if (mx < local_max[c]) mx = local_max[c];
-        }
-        const Key span = static_cast<Key>(mx - mn);
-        if (span == std::numeric_limits<Key>::max()) return false;
-        const unsigned long long range64 = static_cast<unsigned long long>(span) + 1ull;
-        if (range64 == 0 || range64 > static_cast<unsigned long long>(MaxParallelRange)) return false;
-        const std::size_t range = static_cast<std::size_t>(range64);
+        // The sample's range is a guess, not a measurement.  Spending a whole
+        // sweep on the exact minimum and maximum costs one more read of the
+        // array than the sort itself needs, so the count pass below checks
+        // every key against the guess instead and abandons the sort if the
+        // sample missed an extreme -- the serial range sort then takes it.
+        const Key mn    = smn;
+        const std::size_t range = static_cast<std::size_t>(sample_range64);
+        std::atomic<unsigned> bail(0);
 
         std::vector<std::uint32_t> local(chunks * range, 0);
         auto count_job = [&](std::size_t c_lo, std::size_t c_hi) {
@@ -10109,11 +11234,15 @@ inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool desc
                 const std::size_t lo = (c * n) / chunks;
                 const std::size_t hi = ((c + 1) * n) / chunks;
                 std::uint32_t* lc = local.data() + c * range;
-                for (std::size_t i = lo; i < hi; ++i)
-                    ++lc[static_cast<std::size_t>(RT::encode(p[i]) - mn)];
+                for (std::size_t i = lo; i < hi; ++i) {
+                    const std::size_t d = static_cast<std::size_t>(RT::encode(p[i]) - mn);
+                    if (d >= range) { bail.store(1, std::memory_order_relaxed); return; }
+                    ++lc[d];
+                }
             }
         };
         parallel_for_index(std::size_t(0), chunks, std::size_t(1), count_job);
+        if (bail.load(std::memory_order_relaxed)) return false;
 
         std::vector<std::size_t> offset(range + 1, 0);
         if (!descending) {
@@ -10141,7 +11270,10 @@ inline bool try_integer_range_count_sort_parallel(T* p, std::size_t n, bool desc
                 std::fill(p + offset[out_rank], p + offset[out_rank + 1], v);
             }
         };
-        parallel_for_index(std::size_t(0), range, std::size_t(64), fill_job);
+        // Eight tasks per worker: with a range of sixteen the old grain of 64
+        // made the whole fill one task, i.e. one core writing the array.
+        const std::size_t fill_grain = std::max<std::size_t>(1, range / (chunks * 4));
+        parallel_for_index(std::size_t(0), range, fill_grain, fill_job);
         return true;
     }
 }
@@ -10367,14 +11499,14 @@ inline bool try_serial_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bool
     } else {
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n; (void)descending;
             return false;
         } else {
             if (n < std::size_t(262144)) return false;
             if (!radix_high_prefix_probe<T, PrefixBits>(p, n)) return false;
             constexpr unsigned Passes = PrefixBits / Bits;
-            constexpr unsigned FirstShift = 64u - PrefixBits;
+            constexpr unsigned FirstShift = unsigned(sizeof(Key) * 8) - PrefixBits;
             constexpr std::size_t Buckets = std::size_t(1) << Bits;
 
             ScratchLease<Key> lease(n * 2);
@@ -10383,27 +11515,52 @@ inline bool try_serial_radix_high_prefix_key_sort_wide(T* p, std::size_t n, bool
             Key* b = a + n;
             Key* src = a;
             Key* dst = b;
-            std::vector<std::uint32_t> count(Buckets);
+            std::vector<std::uint32_t> count(std::size_t(Passes) * Buckets);
             std::vector<std::size_t> pos(Buckets);
             const bool can_stream = have_nt_stores();
+            // Conflict/rank scatter while the keys stay in cache, write-
+            // combining scatter once they leave it: see the table above
+            // isa_avx512_scat::scatter32.  The AVX-512 path counts
+            // destinations in 32 bits, so it also needs n to fit in them.
+            const bool avx512_ok = use_avx512_conflict() &&
+                                   n <= std::size_t(0xffffffffu) &&
+                                   n * sizeof(Key) <= (std::size_t(1) << 23);
+            std::vector<std::uint32_t> off32(
+                (avx512_ok && sizeof(Key) == 4) ? Buckets : std::size_t(0));
+            // Only worth fusing from three passes up.  Passes after the first
+            // would otherwise re-read the scratch array, which the previous
+            // scatter wrote and which has already left the cache, so one sweep
+            // over the original keys beats several: double 1M, three passes,
+            // 0.0042s -> 0.0018s.  With two passes the extra banks cost more
+            // than the saved read (int32 8M: 0.0118s -> 0.0124s), so those keep
+            // counting pass by pass.
+            if constexpr (Passes >= 3)
+                radix_count_all_value_passes_wide<T, Bits, Passes>(p, n, FirstShift, count.data());
 
             for (unsigned pi = 0; pi < Passes; ++pi) {
                 const unsigned shift = FirstShift + pi * Bits;
-                if (pi == 0)
-                    radix_count_value_pass_banked_wide<T, Bits>(p, n, shift, count.data());
-                else
-                    radix_count_key_pass_banked_wide<Key, Bits>(src, n, shift, count.data());
+                if constexpr (Passes < 3) {
+                    if (pi == 0)
+                        radix_count_value_pass_banked_wide<T, Bits>(p, n, shift, count.data());
+                    else
+                        radix_count_key_pass_banked_wide<Key, Bits>(
+                            src, n, shift, count.data() + Buckets);
+                }
+                const std::uint32_t* pc = count.data() + std::size_t(pi) * Buckets;
                 std::size_t run = 0;
                 for (std::size_t d = 0; d < Buckets; ++d) {
                     pos[d] = run;
-                    run += count[d];
+                    run += pc[d];
                 }
                 if (pi == 0) {
-                    radix_scatter_encode_pass_wide<T, Key, Bits>(p, n, src, shift, pos.data(), can_stream);
+                    radix_scatter_wide_pass<T, T, Key, Bits>(
+                        p, n, src, shift, pos.data(), off32.data(), avx512_ok, can_stream);
                 } else if (pi + 1 == Passes) {
-                    radix_scatter_key_decode_pass_wide<T, Key, Bits>(src, n, p, shift, pos.data(), can_stream);
+                    radix_scatter_wide_pass<T, Key, T, Bits>(
+                        src, n, p, shift, pos.data(), off32.data(), avx512_ok, can_stream);
                 } else {
-                    radix_scatter_key_pass_wide<Key, Bits>(src, n, dst, shift, pos.data(), can_stream);
+                    radix_scatter_wide_pass<T, Key, Key, Bits>(
+                        src, n, dst, shift, pos.data(), off32.data(), avx512_ok, can_stream);
                     Key* t = src; src = dst; dst = t;
                 }
             }
@@ -10421,16 +11578,34 @@ inline bool try_serial_radix_high_prefix_sort(T* p, std::size_t n, bool descendi
         return false;
     } else {
         using Key = typename RadixTraits<T>::Key;
-        if constexpr (sizeof(Key) != 8) {
+        if constexpr (sizeof(Key) != 8 && sizeof(Key) != 4) {
             (void)p; (void)n; (void)descending;
             return false;
-        } else if constexpr (std::is_same<T, double>::value) {
-            if (n <= (std::size_t(1) << 21))
-                return try_serial_radix_high_prefix_key_sort_wide<T, 36, 12>(p, n, descending);
-            return try_serial_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
-        } else if constexpr (std::is_integral<T>::value && sizeof(T) == 8) {
-            if (n <= (std::size_t(1) << 21))
-                return try_serial_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending);
+        } else if constexpr (std::is_same<T, double>::value ||
+                             (std::is_integral<T>::value && sizeof(T) == 8)) {
+            // Same choice as the parallel path: see radix_choose_prefix_bits.
+            if (n <= (std::size_t(1) << 21)) {
+                const unsigned w = radix_choose_prefix_bits<T>(p, n, 24, 36);
+                return w == 24
+                    ? try_serial_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending)
+                    : try_serial_radix_high_prefix_key_sort_wide<T, 36, 12>(p, n, descending);
+            }
+            const unsigned w = radix_choose_prefix_bits<T>(p, n, 26, 39);
+            return w == 26
+                ? try_serial_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending)
+                : try_serial_radix_high_prefix_key_sort_wide<T, 39, 13>(p, n, descending);
+        } else if constexpr (sizeof(Key) == 4) {
+            // The helpers take their shifts from the key width now, so a 32-bit
+            // key gets the same treatment a 64-bit one does: two passes over
+            // the high bits, then the ties are finished bucket by bucket while
+            // they are still in cache.  1M random int32: 0.0120s through the
+            // 32-wide sort, 0.0090s here.  8M: 0.154s against 0.080s.
+            if (n <= (std::size_t(1) << 21)) {
+                const unsigned w = radix_choose_prefix_bits<T>(p, n, 24, 26);
+                return w == 24
+                    ? try_serial_radix_high_prefix_key_sort_wide<T, 24, 12>(p, n, descending)
+                    : try_serial_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
+            }
             return try_serial_radix_high_prefix_key_sort_wide<T, 26, 13>(p, n, descending);
         } else {
             (void)p; (void)n; (void)descending;
@@ -10643,8 +11818,8 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
             done = try_radix_permutation_range_sort(p, n, descending);
 #if FYX_ENABLE_PARALLEL
         if (!done && prefer_parallel && high_entropy)
-            done = try_parallel_radix32_wide_sort(p, n, descending) ||
-                   try_parallel_radix_high_prefix_sort(p, n, descending);
+            done = try_parallel_radix_high_prefix_sort(p, n, descending) ||
+                   try_parallel_radix32_wide_sort(p, n, descending);
         if (!done && prefer_parallel)
             done = try_parallel_radix_sort(p, n, descending, high_entropy);
 #else
@@ -10670,9 +11845,68 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
 // sorted ascending and must reverse to honour a ">" comparator).  For the
 // generic comparison path it is ignored and `comp` is used directly.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Ordered except for one stretch in the middle
+// ---------------------------------------------------------------------------
+
 template <class T, class Comp>
 inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
-                    const InputProfile<T, Comp>* known_profile = nullptr) {
+                    const InputProfile<T, Comp>* known_profile = nullptr);
+
+/// Sorts a range that is ordered except for one contiguous stretch: a table
+/// with a batch of new records appended, a log with an unflushed tail, a file
+/// with one damaged region.  Those cost sort(middle) plus one merge pass, and
+/// paying for the whole range instead is the difference between 0.005s and
+/// 0.031s for a million int32 whose last tenth is shuffled -- which is what
+/// radix spends, because radix cannot see order that stops part way.
+///
+/// Finding the stretch is free.  Both scans walk inwards from an end and stop
+/// at the first inversion, so a range with no ordered head or tail costs two
+/// comparisons, and the cost of a range that has one is the length of it.
+template <class T, class Comp>
+inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp) {
+#if !FYX_ENABLE_ADAPTIVE_WEAPONS
+    (void)p; (void)n; (void)comp;
+    return false;
+#else
+    if (n < 8192) return false;
+    if constexpr (!std::is_move_constructible<T>::value ||
+                  !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    } else {
+        auto before = adaptive_order<T>(comp);
+        std::size_t head = 1;
+        while (head < n && !before(p[head], p[head - 1])) ++head;
+        if (head == n) return true;                  // ordered already
+        std::size_t tail = n - 1;
+        while (tail > head && !before(p[tail], p[tail - 1])) --tail;
+        // No room between the two affixes, or so little order that sorting the
+        // middle and merging costs about as much as sorting the whole range.
+        if (tail <= head || (tail - head) * 2u > n) return false;
+
+        // Everything that can fail fails before anything is moved, so a range
+        // this weapon declines is left exactly as it was.
+        const std::size_t need1 = tail < n ? std::min(tail - head, n - tail) : std::size_t(0);
+        const std::size_t need2 = std::min(head, n - head);
+        std::unique_ptr<ScratchLease<T>> lease;
+        T* buf = nullptr;
+        if constexpr (std::is_trivially_copyable<T>::value) {
+            lease.reset(new ScratchLease<T>(need1 > need2 ? need1 : need2));
+            if (!lease->valid()) return false;
+            buf = lease->get();
+        }
+        sort_st(p + head, tail - head, comp, false);
+        if (tail < n) merge_adjacent_runs(p, head, tail, n, buf, before);
+        merge_adjacent_runs(p, 0, head, n, buf, before);
+        return true;
+    }
+#endif
+}
+
+template <class T, class Comp>
+inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
+                    const InputProfile<T, Comp>* known_profile) {
     constexpr bool radix_type = radix_supported_v<T>;
     const bool ascending      = is_ascending_v<Comp, T>;
     const bool radix_order    = radix_type && (ascending || descending);
@@ -10709,6 +11943,10 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
 
     if (try_zigzag_organ_pipe_sort(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
     if (try_numeric_half_organ_fill(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+    // Adaptive natural-run merge: see sort_pointer_core.
+    if (try_natural_run_merge_adaptive(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+    // Ordered except for one stretch in the middle: see try_sorted_affix_sort.
+    if (try_sorted_affix_sort(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
 
     const bool high_entropy = prof && prof->is_high_entropy;
     const bool partial_pdq = prof && prof->is_partially_sorted &&
@@ -10742,11 +11980,15 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
         if constexpr (radix_type) {
             if (n >= kRadixThreshold || std::is_floating_point<T>::value) {
 #if FYX_ENABLE_PARALLEL
-                if (high_entropy && try_serial_radix32_wide_sort(p, n, descending)) {
+                // The high-prefix sort beats the 32-wide one on every size
+                // measured -- 1M int32: 0.0090s against 0.0120s, 8M: 0.080s
+                // against 0.154s -- so it goes first and the wide sort is the
+                // fallback for the shapes whose prefix it declines.
+                if (high_entropy && try_serial_radix_high_prefix_sort(p, n, descending)) {
                     record_dispatch(DispatchDecision::Radix);
                     return;
                 }
-                if (high_entropy && try_serial_radix_high_prefix_sort(p, n, descending)) {
+                if (high_entropy && try_serial_radix32_wide_sort(p, n, descending)) {
                     record_dispatch(DispatchDecision::Radix);
                     return;
                 }
@@ -10777,9 +12019,11 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
     // Generic path: strings, structs and custom comparators get an ips4o-style
     // sample sort once they are large enough; smaller ranges use pdqsort.
     if (n >= kSampleThreshold && (!std::is_arithmetic<T>::value || !radix_order)) {
-        sample_sort(p, p + n, comp);
-        record_dispatch(DispatchDecision::Sample);
-        return;
+        if constexpr (std::is_copy_constructible<T>::value) {
+            sample_sort(p, p + n, comp);
+            record_dispatch(DispatchDecision::Sample);
+            return;
+        }
     }
     pdqsort(p, p + n, comp);
     record_dispatch(DispatchDecision::Pdq);
@@ -10977,6 +12221,21 @@ inline bool try_msd_radix_bucket_sort(T* p, std::size_t n, bool descending) {
     }
 }
 
+/// The same stable merge as std::merge -- equal elements keep the order of the
+/// first run -- except that it moves.  std::merge assigns through a const
+/// lvalue, which a move-only payload (std::unique_ptr, say) cannot take, and
+/// that used to make the parallel merge refuse to compile for them.
+template <class T, class Comp>
+inline void merge_runs_moving(T* a, std::size_t n1, T* b, std::size_t n2, T* dst, Comp comp) {
+    std::size_t i = 0, j = 0, w = 0;
+    while (i != n1 && j != n2) {
+        if (comp(b[j], a[i])) dst[w++] = std::move(b[j++]);
+        else                  dst[w++] = std::move(a[i++]);
+    }
+    while (i != n1) dst[w++] = std::move(a[i++]);
+    while (j != n2) dst[w++] = std::move(b[j++]);
+}
+
 template <class T, class Comp>
 inline void parallel_merge_to_buffer_rec(T* src,
                                          std::size_t a0, std::size_t a1,
@@ -10989,7 +12248,7 @@ inline void parallel_merge_to_buffer_rec(T* src,
     if (total == 0) return;
     constexpr std::size_t kMergeGrain = 8192;
     if (total <= kMergeGrain || !parallel_available()) {
-        std::merge(src + a0, src + a1, src + b0, src + b1, dst + out, comp);
+        merge_runs_moving(src + a0, a1 - a0, src + b0, b1 - b0, dst + out, comp);
         return;
     }
 
@@ -11071,7 +12330,7 @@ inline void stable_merge_sort(It first, It last, Comp comp) {
     if (n < 2) return;
 
     std::vector<T> a(n), b(n);
-    for (std::size_t i = 0; i < n; ++i) a[i] = first[i];
+    for (std::size_t i = 0; i < n; ++i) a[i] = std::move(first[i]);
 
     bool from_a = true;
     for (std::size_t width = 1; width < n; width *= 2) {
@@ -11080,12 +12339,12 @@ inline void stable_merge_sort(It first, It last, Comp comp) {
         for (std::size_t i = 0; i < n; i += 2 * width) {
             const std::size_t m = std::min(i + width, n);
             const std::size_t r = std::min(i + 2 * width, n);
-            std::merge(src + i, src + m, src + m, src + r, dst + i, comp);
+            merge_runs_moving(src + i, m - i, src + m, r - m, dst + i, comp);
         }
         from_a = !from_a;
     }
     T* final = from_a ? a.data() : b.data();
-    for (std::size_t i = 0; i < n; ++i) first[i] = final[i];
+    for (std::size_t i = 0; i < n; ++i) first[i] = std::move(final[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -11148,7 +12407,7 @@ inline void partial_sort_impl(It first, It middle, It last, Comp comp) {
 // ---------------------------------------------------------------------------
 
 template <class T, class Comp>
-inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) {
+inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options& o) {
     (void)o;   // consumed only by the parallel branches (compiled out otherwise)
     if (n == 0) return;
 #if FYX_ENABLE_GPU
@@ -11191,6 +12450,23 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
         return;
     }
     if (n > detail::kNetworkMax && detail::try_fast_order_exit(p, n, comp, true)) return;
+    // Inputs made of a handful of monotone runs (rotated sorted arrays,
+    // concatenated sorted blocks, shuffled block permutations, ...) cost
+    // O(n log R) sequential moves here instead of a fixed 4-8 radix passes or
+    // a full comparison recursion.  Random data is rejected inside the scan
+    // after touching a couple of hundred elements.
+    if (n > detail::kNetworkMax && detail::try_natural_run_merge_adaptive(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+    // Ordered except for one stretch in the middle: see
+    // try_sorted_affix_sort.  Like the run merge this has to be reachable
+    // before the parallel kernels are chosen, or a range that is three
+    // quarters sorted pays for all of it on every worker.
+    if (n > detail::kNetworkMax && detail::try_sorted_affix_sort(p, n, comp)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
     if (n > detail::kNetworkMax && detail::try_adjacent_swap_repair(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
@@ -11222,8 +12498,8 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
             // repairs decline, send them straight to the radix family.
 #if FYX_ENABLE_PARALLEL
             if (detail::dynamic_parallel_allowed<T>(n, o)) {
-                if (detail::try_parallel_radix32_wide_sort(p, n, descending) ||
-                    detail::try_parallel_radix_high_prefix_sort(p, n, descending) ||
+                if (detail::try_parallel_radix_high_prefix_sort(p, n, descending) ||
+                    detail::try_parallel_radix32_wide_sort(p, n, descending) ||
                     detail::try_parallel_radix_sort(p, n, descending, true)) {
                     detail::record_dispatch(detail::DispatchDecision::Radix);
                     return;
@@ -11336,8 +12612,8 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
             }
             if (partial_pdq && detail::try_partially_sorted_local_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
             if (detail::try_radix_permutation_range_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
-            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
+            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_parallel_radix_sort(p, n, descending, high_entropy)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
         } else {
@@ -11367,11 +12643,11 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
             }
-            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) {
+            if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
             }
-            if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) {
+            if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
             }
@@ -11402,16 +12678,43 @@ inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) 
             detail::record_dispatch(detail::DispatchDecision::Radix);
             return;
         }
-        if (n >= detail::kSampleThreshold) {
-            detail::parallel_sample_sort(p, p + n, comp);
-            detail::record_dispatch(detail::DispatchDecision::ParallelSample);
-            return;
+        // The parallel sample sort samples by copying, so a move-only payload
+        // takes the task-parallel divide and conquer instead, which only
+        // moves -- see merge_runs_moving.
+        if constexpr (std::is_copy_constructible<T>::value) {
+            if (n >= detail::kSampleThreshold) {
+                detail::parallel_sample_sort(p, p + n, comp);
+                detail::record_dispatch(detail::DispatchDecision::ParallelSample);
+                return;
+            }
         }
         detail::parallel_sort_ptr(p, n, comp, descending, o);
         return;
     }
 #endif
     detail::sort_st(p, n, comp, descending, prof);
+}
+
+/// The kernels above allocate: scratch for radix and merges, buffers for the
+/// sample sort, worker threads for the parallel paths.  std::sort never
+/// allocates and therefore never fails for want of memory; a sorter whose fast
+/// paths do must not inherit that failure, so out of memory -- or no address
+/// space left to start a worker -- falls back to the in-place comparison sort,
+/// which needs neither.  The range is already permuted by whatever threw, and
+/// pdqsort is happy to start from any permutation.
+template <class T, class Comp>
+inline void sort_pointer_core(T* p, std::size_t n, Comp comp, const Options& o) {
+#if FYX_HAS_EXCEPTIONS
+    try {
+        sort_pointer_core_impl(p, n, comp, o);
+    } catch (const std::bad_alloc&) {
+        detail::pdqsort(p, p + n, comp);
+    } catch (const std::system_error&) {
+        detail::pdqsort(p, p + n, comp);
+    }
+#else
+    sort_pointer_core_impl(p, n, comp, o);
+#endif
 }
 
 template <class It, class Comp>
@@ -11437,19 +12740,108 @@ inline void sort_iter_core(It first, It last, Comp comp, const Options& o) {
         return;
     }
     if (detail::try_monotonic_sort(first, last, comp, true)) return;
+    // Segmented storage (std::deque) cannot be indexed, so radix, the adaptive
+    // weapons and the parallel pool are all out of reach here -- and `o` used
+    // to be dropped on the floor, so asking for parallel silently cost the
+    // same as not asking.  Buffering gets them back: see
+    // try_buffered_iter_sort.
+    if (try_buffered_iter_sort(first, last, comp, o, n)) return;
     if (detail::try_low_cardinality_count_sort(first, last, comp)) return;
+    using T = typename std::iterator_traits<It>::value_type;
     if (n >= detail::kSampleThreshold) {
-        detail::sample_sort(first, last, comp);
-        return;
+        if constexpr (std::is_copy_constructible<T>::value) {
+            detail::sample_sort(first, last, comp);
+            return;
+        }
     }
     detail::pdqsort(first, last, comp);
 }
 
 template <class Container, class Comp>
 inline void sort_container_core(Container& c, Comp comp, const Options& o) {
-    auto* p = std::data(c);
-    const std::size_t n = static_cast<std::size_t>(std::size(c));
-    sort_pointer_core(p, n, comp, o);
+    if constexpr (detail::has_std_data_v<Container>) {
+        auto* p = std::data(c);
+        const std::size_t n = static_cast<std::size_t>(std::size(c));
+        sort_pointer_core(p, n, comp, o);
+    } else if constexpr (detail::has_member_sort_with_v<Container, Comp>) {
+        // Node-based: see has_member_sort.  Nothing to gain from a buffer --
+        // the elements are never moved -- and Options cannot apply, since
+        // splicing is not something worth spreading across workers.
+        c.sort(comp);
+    } else {
+        sort_iter_core(std::begin(c), std::end(c), comp, o);
+    }
+}
+
+/// Sorts a range that the contiguous kernels cannot address -- a segmented
+/// container, or anything whose iterators cannot be indexed -- by moving the
+/// elements into a buffer, sorting that, and moving them back.
+///
+/// Two extra passes buy everything a vector gets: radix, the adaptive weapons,
+/// the profile, and the parallel pool.  1M int32 in a std::deque is 0.051s
+/// through the iterator kernels and 0.017s this way, against 0.084s for
+/// std::sort.
+///
+/// Returns false only when the buffer cannot be had, in which case nothing has
+/// been moved.  If the sort itself throws, the elements go back where they
+/// came from: unsorted, but the range still owns every one of them.
+template <class It, class Comp>
+inline bool try_buffered_iter_sort(It first, It last, Comp comp, const Options& o, std::size_t n) {
+    using T = typename std::iterator_traits<It>::value_type;
+    if constexpr (!std::is_move_constructible<T>::value ||
+                  !std::is_move_assignable<T>::value) {
+        (void)first; (void)last; (void)comp; (void)o; (void)n;
+        return false;
+    } else {
+        std::vector<T> buf;
+        try {
+            buf.reserve(n);
+        } catch (...) {
+            return false;
+        }
+        std::size_t taken = 0;
+        try {
+            for (It it = first; it != last; ++it) { buf.push_back(std::move(*it)); ++taken; }
+        } catch (...) {
+            It out = first;
+            for (std::size_t i = 0; i < taken; ++i) { *out = std::move(buf[i]); ++out; }
+            return false;
+        }
+        try {
+            sort_pointer_core(buf.data(), buf.size(), comp, o);
+        } catch (...) {
+            It out = first;
+            for (std::size_t i = 0; i < n; ++i) { *out = std::move(buf[i]); ++out; }
+            throw;
+        }
+        It out = first;
+        for (std::size_t i = 0; i < n; ++i) { *out = std::move(buf[i]); ++out; }
+        return true;
+    }
+}
+
+template <class It, class Comp>
+inline void sort_forward_core(It first, It last, Comp comp, const Options& o) {
+    std::size_t n = 0;
+    for (It it = first; it != last; ++it) ++n;
+    if (n < 2) return;
+    if (try_buffered_iter_sort(first, last, comp, o, n)) return;
+    // No buffer to be had.  Quadratic, but it is the only thing left that
+    // works through a forward iterator, and it is reached only when the
+    // allocation for the buffer has already failed.
+    for (It i = first; i != last; ++i) {
+        typename std::iterator_traits<It>::value_type v = std::move(*i);
+        It j = i;
+        It prev = j;
+        bool done = false;
+        while (!done) {
+            if (j == first) { done = true; break; }
+            --prev;
+            if (comp(v, *prev)) { *j = std::move(*prev); j = prev; prev = j; }
+            else                { done = true; }
+        }
+        *j = std::move(v);
+    }
 }
 
 // ===========================================================================
@@ -11484,6 +12876,12 @@ template <class It,
 inline void sort(It first, It last) {
     sort_iter_core(first, last, fyx::less{}, Options{});
 }
+// Anything less than random access: see sort_forward_core.
+template <class It,
+          std::enable_if_t<!detail::is_random_access_v<It>, int> = 0>
+inline void sort(It first, It last) {
+    sort_forward_core(first, last, fyx::less{}, Options{});
+}
 template <class It, class Comp,
           std::enable_if_t<detail::is_random_access_v<It> &&
                            !detail::is_fyx_options_v<Comp> &&
@@ -11491,10 +12889,22 @@ template <class It, class Comp,
 inline void sort(It first, It last, Comp comp) {
     sort_iter_core(first, last, comp, Options{});
 }
+template <class It, class Comp,
+          std::enable_if_t<!detail::is_random_access_v<It> &&
+                           !detail::is_fyx_options_v<Comp> &&
+                           !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
+inline void sort(It first, It last, Comp comp) {
+    sort_forward_core(first, last, comp, Options{});
+}
 template <class It,
           std::enable_if_t<detail::is_random_access_v<It>, int> = 0>
 inline void sort(It first, It last, const Options& o) {
     sort_iter_core(first, last, fyx::less{}, o);
+}
+template <class It,
+          std::enable_if_t<!detail::is_random_access_v<It>, int> = 0>
+inline void sort(It first, It last, const Options& o) {
+    sort_forward_core(first, last, fyx::less{}, o);
 }
 template <class It, class Comp,
           std::enable_if_t<detail::is_random_access_v<It> &&
@@ -11503,31 +12913,38 @@ template <class It, class Comp,
 inline void sort(It first, It last, Comp comp, const Options& o) {
     sort_iter_core(first, last, comp, o);
 }
+template <class It, class Comp,
+          std::enable_if_t<!detail::is_random_access_v<It> &&
+                           !detail::is_fyx_options_v<Comp> &&
+                           !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
+inline void sort(It first, It last, Comp comp, const Options& o) {
+    sort_forward_core(first, last, comp, o);
+}
 
 // ---- contiguous container --------------------------------------------------
 template <class Container,
-          std::enable_if_t<detail::has_std_data_v<Container> &&
-                           !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
+          std::enable_if_t<!std::is_pointer_v<std::remove_reference_t<Container>> &&
+                           !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
 inline void sort(Container& c) {
     sort_container_core(c, fyx::less{}, Options{});
 }
 template <class Container, class Comp,
-          std::enable_if_t<detail::has_std_data_v<Container> &&
-                           !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>> &&
+          std::enable_if_t<!std::is_pointer_v<std::remove_reference_t<Container>> &&
+                           !std::is_array_v<std::remove_reference_t<Container>> &&
                            !detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
 inline void sort(Container& c, Comp comp) {
     sort_container_core(c, comp, Options{});
 }
 template <class Container,
-          std::enable_if_t<detail::has_std_data_v<Container> &&
-                           !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
+          std::enable_if_t<!std::is_pointer_v<std::remove_reference_t<Container>> &&
+                           !std::is_array_v<std::remove_reference_t<Container>>, int> = 0>
 inline void sort(Container& c, const Options& o) {
     sort_container_core(c, fyx::less{}, o);
 }
 template <class Container, class Comp,
-          std::enable_if_t<detail::has_std_data_v<Container> &&
-                           !std::is_pointer_v<std::remove_reference_t<Container>> && !std::is_array_v<std::remove_reference_t<Container>> &&
+          std::enable_if_t<!std::is_pointer_v<std::remove_reference_t<Container>> &&
+                           !std::is_array_v<std::remove_reference_t<Container>> &&
                            !detail::is_fyx_options_v<Comp> &&
                            !std::is_integral_v<std::remove_reference_t<Comp>>, int> = 0>
 inline void sort(Container& c, Comp comp, const Options& o) {

@@ -151,6 +151,19 @@ done
 
 基础数值 benchmark 见 [`BENCHMARKS.md`](./BENCHMARKS.md)。IPS4o 对比 harness 与完整表格见 [`bench/README_ips4o_compare.md`](./bench/README_ips4o_compare.md)。
 
+**最硬的对手是 Google Highway 的 `vqsort`**，随 `tools/dev/vqsort.sh` 一起进仓库了。矩阵覆盖
+4 种类型 × 14 种分布，每个格子与 `std::sort` / `pdqsort` / `vqsort` 中最好的那个比
+（`bash tools/dev/vqsort.sh 1000000`，结果写入 `build/vqsort_<n>.txt`）：
+
+| 规模 | 胜 | 负 | 说明 |
+|---|---:|---:|---|
+| 100 万 | 35 | 7 | 输的格子：随机 int32（0.81x）、低基数/周期输入、远距离交换 int32 |
+| 800 万 | 37 | 5 | 输的格子：随机 int32（0.79x）、随机 double（0.99x）、全等 int32/int64、周期 int32 |
+
+结构化数据（已排序、逆序、近似有序、拼接、旋转、低基数、字符串）全线领先，多数在 2–7 倍；
+随机均匀键是唯一系统性落后的家族。完整表格和每一个输的格子的数字见
+[`BENCHMARKS.md`](./BENCHMARKS.md)。
+
 在本沙箱（2 vCPU Intel Xeon，GCC 12.2，`-O3 -march=native`）的 IPS4o sequential 与真实 oneTBB parallel 矩阵中，FYX 当前在已跟踪的 7 个分布上全部领先：
 
 | case | FYX seq | IPS4o seq | FYX par | IPS4o par |

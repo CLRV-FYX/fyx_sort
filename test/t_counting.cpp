@@ -422,8 +422,11 @@ int main() {
         fyx::Options o;
         o.parallel = fyx::Tri::On;
         fyx::sort(v, o);
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
-              "long-distance numeric nearly-sorted goes straight to radix");
+        // Sparse long-distance swaps leave a tiny dirty set behind: the patch
+        // merge repairs them with three linear passes, which measures ~3x
+        // faster here than the full radix fallback this case used to take.
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "long-distance numeric nearly-sorted uses the patch merge repair");
         CHECK(std::is_sorted(v.begin(), v.end()), "long-distance numeric nearly-sorted output");
     }
     {
@@ -440,8 +443,8 @@ int main() {
         fyx::Options o;
         o.parallel = fyx::Tri::On;
         fyx::sort(v, o);
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
-              "floating integer-permutation nearly-sorted uses radix permutation fill");
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
+              "floating integer-permutation nearly-sorted uses the patch merge repair");
         CHECK(std::is_sorted(v.begin(), v.end()), "floating integer-permutation nearly-sorted output");
     }
     {
