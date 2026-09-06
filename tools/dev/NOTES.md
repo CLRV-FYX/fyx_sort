@@ -262,3 +262,33 @@ whole remaining gap is that 9.4 against 7.2**, and since the per-pass cost
 will not move, the only way to close it is to do less than three passes of
 work -- which every two-pass design tried so far has failed to deliver, or to
 find a per-element scatter that is cheaper than 2.3 ns.
+
+### Our comparison sort is not the answer either
+
+`tools/dev/cmpsort.cpp` races `fyx::sort` against `fyx::stable_sort` (the
+parallel sample sort that is the `compare` column in the matrix), random int32:
+
+```
+8M   sort (radix) 0.04002    stable_sort 0.09856
+1M   sort (radix) 0.00553    stable_sort 0.01204
+```
+
+Two and a half times slower. So swapping radix for a comparison sort on random
+input would throw away more than it could ever gain, even though the fastest
+comparison sort we know of is the one beating us there.
+
+### Where that leaves the random-data gap
+
+The accounting is now closed at every level:
+
+- a pass costs 3.1 ns/elem and will not come down (fanout experiment);
+- 32 bits over at most 13 bits per pass means three passes is the floor, so
+  ~9.4 ns/elem of CPU work is the floor for LSD radix on int32 here;
+- blocking cannot help because at 8M the array already lives in L3;
+- our comparison sort is 2.5x slower than the radix it would replace.
+
+vqsort sits at ~7.2 ns/elem of CPU work on the same input. Closing 9.4 to
+under 7.2 therefore needs a vqsort-class vectorised sorter -- sorting networks
+in AVX-512 plus a vectorised merge partition, which is a large piece of work
+and not a tuning exercise. Everything cheaper has been tried and measured,
+and the numbers are above.
