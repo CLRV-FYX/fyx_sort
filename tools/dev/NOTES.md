@@ -405,3 +405,43 @@ already written at the top of this file, in new clothes:
 * **cold pages.** A harness that allocates a fresh `std::vector` per variant
   measures the page faults, not the sort: the same partition measured 0.0196 s
   warm and 0.0923 s cold. Allocate the work buffer once, `std::copy` into it.
+
+### What is still losing, and what the numbers say about why
+
+The matrix after this work is 33 W / 9 L at 1M and 36 W / 6 L at 8M (arithmetic
+cells only; `BENCHMARKS.md` has every number). The losses are no longer one
+family, they are three unrelated things, and none of them is a tuning knob:
+
+**1. Periodic, few-value input (`mod8`: 0.66x at 1M int32, 0.93x at 8M).**
+The counting kernel itself is not the problem -- called directly it is 0.00061 s
+against vqsort's 0.00053 for 1M int32. The gap is what runs *before* it:
+`fyx::sort` measures 0.00081 on the same input, so ~0.0002 s goes on the
+distribution weapons and the profile declining, one after another. On a sort
+whose whole job costs half a millisecond that is 25-40% of the runtime. Fixing
+it means making the weapon chain cheaper to decline (each weapon's early-exit
+budget, and the order they are tried in), not making the counter faster.
+
+**2. Block-swapped input (`blockswap` double: 0.71x at 8M, int32 0.92x).**
+8M sorted doubles with twenty 128-element blocks swapped: we take 0.062 s
+through the displacement patch merge, pdqsort takes 0.044. The patch merge is
+already galloping (`merge_patch_back` uses exponential search plus bulk moves),
+so the cost is the two characterisation passes plus the compaction -- four
+sequential passes over 64 MB -- and all four are sequential while pdqsort's
+comparisons are branch-predictable on this shape. The route is a *parallel*
+prefix-max / suffix-min characterisation and a parallel compaction; both are
+two-level scans, neither is hard, but they are real work.
+
+**3. Ties (`allequal`, `lowcard16`: 0.91x-0.99x).** These are memcmp-bound and
+within the run-to-run swing of this machine. Not worth chasing before the two
+above.
+
+Also open, and worth knowing:
+
+* **8M double over a narrow range** (values 0..1e6): the quicksort takes it at
+  0.064 s parallel where the radix path did 0.058. The array is 64 MB, past
+  L3, and the quicksort's levels cost more there than radix's skipped passes.
+  A size-and-span gate would fix it, but the difference is 10% and this machine
+  swings 20%, so it was left alone rather than fitted to noise.
+* **The single-thread 20% against vqsort** described above.
+* `FYX_ENABLE_GPU=1 FYX_GPU_COMPUTE=1` compiles now but has never run: there is
+  no GPU on this machine.
