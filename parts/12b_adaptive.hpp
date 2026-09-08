@@ -187,7 +187,6 @@ inline bool try_natural_run_merge(T* p, std::size_t n, Comp comp,
         std::vector<std::size_t> next(count + 1);
         bounds[0] = 0;
         for (std::size_t i = 0; i < count; ++i) bounds[i + 1] = runbuf[i].end;
-        std::size_t nruns = count;
         std::size_t levels = 0;
         std::size_t maxbuf = 1;
         {
@@ -452,12 +451,13 @@ inline bool try_dirty_patch_merge(T* p, std::size_t n, Comp comp,
 /// Budget wrapper: disorder beyond an eighth of the range is no longer "local",
 /// and the patch sort stops being cheaper than the kernels it replaces.
 template <class T, class Comp>
-inline bool try_dirty_patch_merge_adaptive(T* p, std::size_t n, Comp comp) {
+inline bool try_dirty_patch_merge_adaptive(T* p, std::size_t n, Comp comp,
+                                           std::size_t max_dirty = 0) {
 #if !FYX_ENABLE_ADAPTIVE_WEAPONS
-    (void)p; (void)n; (void)comp;
+    (void)p; (void)n; (void)comp; (void)max_dirty;
     return false;
 #else
-    return try_dirty_patch_merge(p, n, comp, n / 8);
+    return try_dirty_patch_merge(p, n, comp, max_dirty ? max_dirty : n / 8);
 #endif
 }
 
@@ -563,12 +563,13 @@ inline bool try_displacement_patch_merge(T* p, std::size_t n, Comp comp,
 }
 
 template <class T, class Comp>
-inline bool try_displacement_patch_merge_adaptive(T* p, std::size_t n, Comp comp) {
+inline bool try_displacement_patch_merge_adaptive(T* p, std::size_t n, Comp comp,
+                                                  std::size_t max_dirty = 0) {
 #if !FYX_ENABLE_ADAPTIVE_WEAPONS
-    (void)p; (void)n; (void)comp;
+    (void)p; (void)n; (void)comp; (void)max_dirty;
     return false;
 #else
-    return try_displacement_patch_merge(p, n, comp, n / 8);
+    return try_displacement_patch_merge(p, n, comp, max_dirty ? max_dirty : n / 8);
 #endif
 }
 

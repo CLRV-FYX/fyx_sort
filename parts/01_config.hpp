@@ -285,6 +285,9 @@
 #endif
 
 #define FYX_UNUSED(x) ((void)(x))
+/// Silences -Wunused-local-typedefs for a typedef that only some compile-time
+/// configurations look at (e.g. a kernel switched off by a FYX_* macro).
+#define FYX_UNUSED_TYPE(T) ((void)sizeof(T*))
 
 #define FYX_STRINGIFY_(x) #x
 #define FYX_STRINGIFY(x)  FYX_STRINGIFY_(x)
@@ -296,7 +299,13 @@
 #endif
 
 // Exceptions ----------------------------------------------------------------
-#if defined(FYX_NO_EXCEPTIONS) || (defined(__cpp_exceptions) && __cpp_exceptions == 0) \
+// GCC and Clang do not define __cpp_exceptions as 0 under -fno-exceptions --
+// they leave it undefined, along with __EXCEPTIONS -- so testing it for zero
+// never fired and a plain -fno-exceptions build (no FYX_NO_EXCEPTIONS) failed
+// to compile on the first try/catch it reached.
+#if defined(FYX_NO_EXCEPTIONS) \
+    || (defined(__cpp_exceptions) && __cpp_exceptions == 0) \
+    || (FYX_GNUC_LIKE && !defined(__EXCEPTIONS)) \
     || (FYX_COMPILER_MSVC && !defined(_CPPUNWIND))
 #  define FYX_HAS_EXCEPTIONS 0
 #else
@@ -365,6 +374,13 @@
 // Intrinsic headers ---------------------------------------------------------
 #if FYX_ARCH_X86 && (FYX_HAS_SSE42_CODE || FYX_HAS_AVX2_CODE || FYX_HAS_AVX512_CODE)
 #  include <immintrin.h>
+#elif FYX_ARCH_X86 && FYX_GNUC_LIKE
+// FYX_DISABLE_SIMD compiles every vector kernel out, but the spin hint
+// (_mm_pause) and the non-temporal store fence (_mm_sfence) are not vector
+// kernels and are still used.  They live in the SSE headers, which are
+// available on any x86 target without an -m switch, so a scalar-only build
+// stays a scalar-only build and still compiles.
+#  include <xmmintrin.h>
 #endif
 #if FYX_HAS_NEON_CODE
 #  include <arm_neon.h>
@@ -418,9 +434,26 @@ inline constexpr std::size_t kParallelThreshold = 1u << 15;   // 32768
 /// histogram pass plus a full ping-pong copy is not amortised yet).
 inline constexpr std::size_t kRadixThreshold = 1024;
 
+/// "Leave the patch merges their own budget" -- see patch_merge_dirty_budget.
+inline constexpr std::size_t kPatchDirtyDefault = static_cast<std::size_t>(-1);
+
+/// Digit width of the wide radix passes (10/11/11 for 32-bit keys).  Used to
+/// convert a key span into "how many passes would radix actually run".
+inline constexpr unsigned kRadixWidePassBits = 11;
+
+/// Evenly spaced elements read by every sampling probe (input profile,
+/// distinct estimate, pivot gates).  Lives here rather than next to the
+/// profile because the counting kernels sample before the profile exists.
+inline constexpr std::size_t kProfileSampleLimit = 1024;
+
 /// Sorting-network ceiling.  Everything at or below this length is sorted by a
 /// branch-free network, never by insertion sort.
 inline constexpr std::size_t kNetworkMax = 64;
+
+/// Below this length the AVX-512 vectorised quicksort (parts/10b_vsort.hpp)
+/// does not pay: a range that fits in L2 is where the radix passes are cheap,
+/// and the quicksort still has to walk log(n/leaf) levels over it.
+inline constexpr std::size_t kVqsortMinN = 1u << 14;          // 16384
 
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;

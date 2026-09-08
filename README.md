@@ -24,10 +24,17 @@ Chase-Lev 工作窃取线程池、自适应算法调度、稳定排序接口、�
   对数值类型则明显更快（见 `BENCHMARKS.md`）。这是可以复现、可以验证的。
 - **已知限制**：
   - 多核 ≥30 GB/s、A100 上含传输 ≤10 ms 等目标**无法在本沙箱验证**（仅 2 个硬件线程、无 GPU）。
-  - `FYX_DISABLE_PARALLEL`（纯单线程）已验证可编译。
-  - `FYX_DISABLE_SIMD` 当前在头文件里有一个**既有的、与本次 API 工作无关的编译问题**
-    （`cpu_pause` / `store_fence` 在关掉 SIMD 时缺少 intrinsic 头），尚未修复；
-    默认 `-march=native` 配置不受影响。
+  - 编译配置矩阵已逐个验证可编译**并跑通测试**：默认、`FYX_DISABLE_PARALLEL`、
+    `FYX_DISABLE_SIMD`（曾经是已知缺陷，现已修好：`_mm_pause` / `_mm_sfence` 不是向量内核，
+    但住在 SSE 头里）、`-fno-exceptions` / `FYX_NO_EXCEPTIONS`、`FYX_DISABLE_AVX512`、
+    `FYX_DISABLE_AVX2`、`FYX_ENABLE_FAST_PATHS=0`、`FYX_USE_PDQ_PARTITION=0`、
+    `FYX_SAMPLE_SORT_V2=0`、`FYX_USE_STRING_VIEW=0`、`FYX_ENABLE_GPU=1`（含
+    `FYX_GPU_COMPUTE=1`，那条 NVRTC 路径以前连编都编不过：raw string 用 `R"CUDA(` 开、
+    却用 `)"` 收），以及 C++17/20 × `-O0`/`-O3`（不带 `-march`）。
+    `FYX_DISABLE_SIMD` 与 `FYX_DISABLE_PARALLEL` 各自跑完整 API 套件（847 项）全绿。
+    注意 `-fno-exceptions` 现在**不需要**同时定义 `FYX_NO_EXCEPTIONS`：GCC/Clang 在
+    `-fno-exceptions` 下是不定义 `__cpp_exceptions`（而不是定义成 0），原来的特性检测抓不到。
+  - 没有 MSVC / ARM / GPU 硬件可供本机验证，那几条路径只有代码与编译期开关，没有实测数字。
 
 ---
 
@@ -88,6 +95,7 @@ adjacent-swap zigzag 先用 in-place pair repair 验证并直接交换相邻逆�
 | 整数小值域 | 计数排序（O(n + range)）；大输入先用 sample-gated 并行 dense-range count/fill 加速 256-way lowcard |
 | 数值/浮点默认顺序低基数（≤256 radix keys） | radix-key 稀疏计数排序；大输入可并行计数/填充，浮点/32/64-bit 稀疏键先尝试 rank16 direct-map 计数，dense integer range 与浮点 compact prefix direct-map 仍优先处理小值域（O(n)，保留 `-0/+0`/NaN 总序语义） |
 | 任意类型低基数（≤256 等价类） | 压缩计数排序，保留原始对象 payload；`stable_sort` 保持稳定 |
+| 数值类型 + 默认 `<`/`>` + 高基数 + 有 AVX-512（`int32/uint32/float/double`，n ≥ 16384） | **AVX-512 向量快排**：`vpcompressd`/`vcompressps` 原地分区（每轮 4 个向量、读哪一侧用 cmov 而不是分支），叶子是寄存器内 Batcher 双调网络（16 个向量：4 字节类型 256 个元素、8 字节 128 个），枢轴取两向量跨步样本的中位数；并行时前几层分区后把两侧交给线程池。浮点先做一次只读扫描，发现 NaN 或 `-0` 就让位给 radix（硬件比较复现不了那个总序）。64 位整数仍走 high-prefix radix：它两趟就能排完 24–26 位前缀，比快排的层数便宜 |
 | 数值类型 + 默认 `<`/`>` | LSD 基数排序（8 位桶，SIMD/scalar 直方图，非临时散射写；大规模高熵 32-bit integer random 先走 10/11/11 三趟 wide-key radix，64-bit random 先走 high-prefix radix：`int64/uint64` 在 1M 级别排序 encoded top24、较大输入排序 top26 后修复 tie，`double` 在 1M 级别排序 encoded top36、较大输入保留 top39，并在最后一趟解码；其它 numeric 回退 chunked parallel radix；2-worker/bandwidth-constrained 环境仍保留 MSD-bucket hybrid fallback） |
 | 默认顺序 `std::string` 大输入 | MSD 字节基数排序（随机字符串只读取区分前缀）；低基数字符串在 comparator 模式下也可走 unordered value-count/fill，大输入会并行计数/填充且只对 distinct key 排序 |
 | 自定义比较器但采样等价于自然升/降序的数值或 `std::string` | guarded radix/count/MSD recovery（采样确认 + 最终 `is_sorted(comp)` 校验；高熵 64-bit/`double` comparator 串行路径也可用自适应 high-prefix radix；失败则继续比较排序） |
@@ -135,7 +143,7 @@ fyx::sort(v, o);              // 或 fyx::sort(v.begin(), v.end(), o)
 
 ```bash
 ./build.sh
-for t in t_scalar t_net t_radix t_pdq t_pool t_deque_race t_api t_sample t_counting; do
+for t in t_scalar t_net t_radix t_pdq t_pool t_deque_race t_api t_sample t_counting t_adaptive t_vsort; do
   g++ -std=c++17 -O2 -march=native -pthread -Wall -Wextra -Werror test/$t.cpp -o /tmp/$t && /tmp/$t
 done
 ```
@@ -143,6 +151,10 @@ done
 `test/t_api.cpp` 覆盖：所有重载形态、`std::sort` / `std::stable_sort` 逐元素比对、
 稳定排序的 (key,idx) 稳定性验证、`partial_sort` / `nth_element` 契约验证、
 `-0`/`+0`/NaN 的浮点全序、以及 `extern "C"` ABI。
+`test/t_vsort.cpp` 覆盖 AVX-512 向量快排：10 种形状 × 17 种规模 × 6 种类型，
+内核直调（串行与并行驱动）与公开入口（升序/降序/stable）逐元素对比 `std::sort`；
+形状里包含快排会退化的那些（90% 是最小值、两个值、全等、周期）；
+浮点另外验证「有 NaN 或 `-0` 时内核必须让位」以及最终仍是 radix 总序。
 `test/t_counting.cpp` 覆盖低基数整数/字符串/结构体、稀疏 256 distinct、MSD 字符串边界、并行 sample sort 显式路径，以及快速/profile 调度（已排序、逆序、全等、低基数、部分有序、floating repair、front-reversed-organ/adjacent-swap/local-sawtooth/interleaved/half-organ zigzag、长距离 nearlysorted 数值 permutation/radix、高熵 comparator-key）。
 
 ---
@@ -157,12 +169,16 @@ done
 
 | 规模 | 胜 | 负 | 说明 |
 |---|---:|---:|---|
-| 100 万 | 35 | 7 | 输的格子：随机 int32（0.81x）、低基数/周期输入、远距离交换 int32 |
-| 800 万 | 37 | 5 | 输的格子：随机 int32（0.79x）、随机 double（0.99x）、全等 int32/int64、周期 int32 |
+| 100 万 | 33 | 9 | 输的格子：周期为 8（0.66x/0.68x/0.99x）、16 个不同值与全等（0.91x–0.99x）、块交换 double（0.82x） |
+| 800 万 | 36 | 6 | 输的格子：块交换 double（0.71x）、块交换 int32（0.92x）、周期为 8 int32（0.93x）、锯齿波 int32（0.92x）、全等 int64 与锯齿 double（0.97x–0.98x） |
 
-结构化数据（已排序、逆序、近似有序、拼接、旋转、低基数、字符串）全线领先，多数在 2–7 倍；
-随机均匀键是唯一系统性落后的家族。完整表格和每一个输的格子的数字见
-[`BENCHMARKS.md`](./BENCHMARKS.md)。
+**随机均匀键这一族已经翻过来了**：1M 随机 int32 从 0.0048 s 降到 0.0025 s（vqsort 0.0033 s，
+1.32x），随机 double 0.0068 → 0.0054 s（1.22x），随机 int64 1.47x；800 万上三种类型分别是
+1.03x / 1.25x / 1.40x。做法是给高基数数值输入加了一条 **AVX-512 向量快排**（见上表），
+LSD radix 的「int32 至少三趟、每趟约 3.1 ns/elem」下界不再是这条路的天花板。
+结构化数据（已排序、逆序、近似有序、拼接、旋转、低基数、字符串）仍然全线领先，多数在 2–7 倍。
+剩下的输的格子集中在「值很少但周期性」的输入和块交换 double 上。
+完整表格和每一个输的格子的数字见 [`BENCHMARKS.md`](./BENCHMARKS.md)。
 
 在本沙箱（2 vCPU Intel Xeon，GCC 12.2，`-O3 -march=native`）的 IPS4o sequential 与真实 oneTBB parallel 矩阵中，FYX 当前在已跟踪的 7 个分布上全部领先：
 

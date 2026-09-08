@@ -1,5 +1,87 @@
 # Changelog
 
+## Unreleased — v10.2 candidate
+
+Date: 2026-09-07
+
+### Added
+- `test/t_vsort.cpp`: 7044 checks over the new kernel -- 10 shapes x 17 sizes x
+  6 types, kernel and entry point, ascending, descending and stable, plus the
+  floating-point edge cases (a range holding a NaN or a -0 must make the kernel
+  step aside, and the result must still be the documented total order).
+- **AVX-512 vectorised quicksort** (`parts/10b_vsort.hpp`), the kernel the
+  radix accounting in `tools/dev/NOTES.md` said was the only route left on
+  high-entropy numeric data.  Three passes of LSD radix on int32 is ~9.4
+  ns/elem of CPU work and no cheaper radix exists (blocking, wider digits, a
+  deeper write-combining buffer and a vectorised scatter were all measured and
+  lost); this replaces the passes with an in-place `vpcompressd` partition,
+  four vectors per iteration, the side to read chosen with a cmov rather than
+  a branch, and a leaf of up to 16 vectors run through the existing Batcher
+  network over native values (no encode/decode).  1M random, parallel:
+
+  | | before | after | vqsort |
+  |---|---:|---:|---:|
+  | int32  | 0.0048 s | 0.0025 s | 0.0033 s |
+  | double | 0.0068 s | 0.0054 s | 0.0066 s |
+  | int64  | 0.0055 s | 0.0051 s | 0.0075 s |
+  | float  | 0.0122 s | 0.0032 s | -- |
+
+  8M random parallel: int32 0.038 -> 0.030, double 0.066 -> 0.054.  The random
+  family, which was the one systematic loss against vqsort (0.79x at 8M), is
+  now won at every size and type measured.  Floating point declines the kernel
+  when the range holds a NaN or a -0, whose total order a hardware compare
+  cannot reproduce; those keep the radix path.  64-bit integers keep the
+  high-prefix radix, which is still faster for them.
+
+### Changed
+- Dispatch: three measured corrections, all of them ranges that were going to
+  a kernel that is no longer the fastest available.
+  - The high-prefix radix degenerates when the prefix is nearly constant -- 4M
+    int32 drawn from a 2^22 range took 0.111 s through it, against 0.019 for
+    the quicksort.  The quicksort is now reachable for every key span.
+  - A narrow value range is not the same property as a low value count, so the
+    range counters were unreachable for high-entropy input: 4M int32 over a
+    2^10 range cost 0.049 s and now costs 0.0052.  Both range kernels self-gate
+    on range against n, and hand the wide half to the quicksort.
+  - The patch merges are sequential and move every element at least twice, so
+    a pool beats them once the dirt is real: 8M int32 with 0.1% of positions
+    swapped, 0.0454 s -> 0.0292.  They keep everything lighter than that.
+- Wide-range, few-value input goes to the sparse counter instead of the dense
+  one: 16 values spread over 61440 (1M int64 lowcard16) cost 0.0021 s parallel
+  and 0.0031 s serial, against 0.0013 / 0.0022 for the sparse kernel.
+
+### Fixed
+- **Wrong output order** (not just slow): `parallel_sort_ptr`, the task-parallel
+  fallback, sorted its two halves with the library's order -- for floating
+  point that is the radix total order, `-NaN < -inf < ... < -0 < +0 < ... <
+  +inf < +NaN` -- and then merged them with the raw comparator, which compares
+  NaN with `<` and gets false both ways.  70000 floats holding NaNs came out
+  with three inversions, on this version and on every earlier one.  The merge
+  now uses the same order the halves were built in.  Found by the new
+  `test/t_vsort.cpp`, which checks the documented total order after every sort.
+- A pivot equal to the range minimum partitioned into an empty low side, so a
+  range where one value owns more than half the elements walked its whole
+  depth budget before falling back to pdqsort.  It is re-partitioned with the
+  strict test now, which always moves at least the pivot-valued block: 2M
+  int32 that are 90% `INT32_MIN` sort in 0.0019 s.
+- `FYX_GPU_COMPUTE` never compiled: the CUDA kernel source is assembled from
+  raw string literals opened with `R"CUDA(` and closed with `)"`, which is not
+  the matching delimiter.  It builds now (still unverified at runtime -- there
+  is no GPU here), with and without exceptions.
+- Six build configurations that did not compile: `FYX_DISABLE_SIMD` (a known
+  defect, listed in the README as unfixed -- the spin hint and the store fence
+  are not vector kernels but live in the SSE headers), `FYX_DISABLE_PARALLEL`
+  (the moving merge used by the sequential stable merge sort sat inside the
+  parallel guard), `-fno-exceptions` (the C ABI wrappers had an unguarded
+  try/catch), a plain `-fno-exceptions` without `FYX_NO_EXCEPTIONS` (GCC and
+  Clang leave `__cpp_exceptions` undefined rather than defining it as 0, so the
+  feature test never fired), and `FYX_USE_PDQ_PARTITION=0` /
+  `FYX_SAMPLE_SORT_V2=0` (-Werror on an unused parameter and an unused
+  typedef).
+- Two `-Werror` warnings that broke *every* build of the shipping header at
+  `-Wall -Wextra -Werror`: an unused variable in the natural-run merge and an
+  unused typedef in the profile-pattern pdqsort.
+
 ## Unreleased — v10.1 candidate
 
 Date: 2026-08-27

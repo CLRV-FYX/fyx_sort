@@ -126,7 +126,7 @@ inline std::string gpu_radix_kernel_src(std::size_t key_bytes) {
                       : key_bytes == 2 ? "unsigned short"
                       :                  "unsigned char";
     return std::string(R"CUDA(
-extern "C" __global__ void fyx_hist(const )") + ktype + R"CUDA( *__restrict__ in,
+extern "C" __global__ void fyx_hist(const )CUDA") + ktype + R"CUDA( *__restrict__ in,
                                   unsigned int* __restrict__ hist,
                                   unsigned int shift, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -134,8 +134,8 @@ extern "C" __global__ void fyx_hist(const )") + ktype + R"CUDA( *__restrict__ in
     unsigned int d = (unsigned int)((in[i] >> shift) & 0xFFu);
     atomicAdd(&hist[d], 1u);
 }
-extern "C" __global__ void fyx_scatter(const )") + ktype + R"CUDA( *__restrict__ in,
-                                    )" + ktype + R"CUDA( *__restrict__ out,
+extern "C" __global__ void fyx_scatter(const )CUDA" + ktype + R"CUDA( *__restrict__ in,
+                                    )CUDA" + ktype + R"CUDA( *__restrict__ out,
                                     unsigned int* __restrict__ base,
                                     unsigned int shift, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -157,8 +157,12 @@ inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp, const Options&) {
     if (!s.ok) return false;   // no driver -> CPU fallback
 
 #if defined(FYX_GPU_COMPUTE)
-    // UNVERIFIED ON THIS BOX (no GPU).  Wrapped so any failure falls back.
+    // UNVERIFIED ON THIS BOX (no GPU).  Wrapped so any failure falls back;
+    // with exceptions switched off there is nothing to wrap, and every error
+    // path here already returns false explicitly.
+#if FYX_HAS_EXCEPTIONS
     try {
+#endif
         CUdevice dev = 0;
         CUcontext ctx = nullptr;
         if (s.cuInit(0) != 0) return false;
@@ -185,7 +189,7 @@ inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp, const Options&) {
             const char* opts[] = { "--gpu-architecture=compute_70" };
             if (s.nvrtcCompileProgram(prog, 1, opts) != 0)
                 { s.nvrtcDestroyProgram(&prog); s.cuCtxDestroy(ctx); return false; }
-            std::size_t sz = 0; char* buf = nullptr;
+            char* buf = nullptr;
             s.nvrtcGetPTX(prog, buf); /* buf points into prog; load below */
             ptx = std::string(buf ? buf : "");
             s.nvrtcDestroyProgram(&prog);
@@ -217,9 +221,11 @@ inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp, const Options&) {
         (void)dbl_buf;
         s.cuCtxDestroy(ctx);
         return true;   // GPU path completed
+#if FYX_HAS_EXCEPTIONS
     } catch (...) {
         return false;  // any failure -> CPU fallback
     }
+#endif
 #else
     (void)p; (void)n;
     return false;      // compute path disabled: CPU fallback (the documented default)

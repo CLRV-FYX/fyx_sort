@@ -459,7 +459,7 @@ template <class T, class Comp>
 inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp,
                                           bool thorough = false) {
 #if !FYX_USE_PDQ_PARTITION
-    (void)p; (void)n; (void)comp;
+    (void)p; (void)n; (void)comp; (void)thorough;
     return false;
 #else
     if (n < std::size_t(1024)) return false;
@@ -789,12 +789,19 @@ inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
 }
 
 
+/// `patch_dirty_max` caps how much disorder the patch merges may take on:
+/// kPatchDirtyDefault leaves their own budget of n/8, zero skips them.
+/// Callers that hold a kernel which scales better than three sequential
+/// passes lower it -- see patch_merge_dirty_budget.
 template <class T, class Comp>
-inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
+inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp,
+                                              std::size_t patch_dirty_max = kPatchDirtyDefault) {
 #if !FYX_USE_PDQ_PARTITION
-    (void)p; (void)n; (void)comp;
+    (void)p; (void)n; (void)comp; (void)patch_dirty_max;
     return false;
 #else
+    const std::size_t patch_max =
+        (patch_dirty_max == kPatchDirtyDefault) ? n / 8 : patch_dirty_max;
     if (try_adjacent_swap_repair(p, n, comp)) return true;
     // Insertion costs one pass plus the distance the displaced elements
     // actually travel, so it is the cheapest repair that exists for shapes
@@ -811,12 +818,12 @@ inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
     // passes instead of 4-8 radix passes, and it is width-independent, so
     // int64/double gain the most.  Densely disordered input is rejected after
     // touching about an eighth of the range, before anything is moved.
-    if (try_dirty_patch_merge_adaptive(p, n, comp)) return true;
+    if (patch_max && try_dirty_patch_merge_adaptive(p, n, comp, patch_max)) return true;
     // Adjacent inversions cannot see a block that was moved wholesale: every
     // element inside it is still in order.  The prefix-max / suffix-min
     // characterisation finds those, so spliced / block-moved inputs also cost
     // a couple of linear passes instead of a full sort.
-    if (try_displacement_patch_merge_adaptive(p, n, comp)) return true;
+    if (patch_max && try_displacement_patch_merge_adaptive(p, n, comp, patch_max)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
     return false;
 #endif
@@ -857,7 +864,6 @@ inline void pdqsort_for_profile_pattern(T* p, std::size_t n, Comp comp) {
         (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
     if constexpr (radix_order && std::is_floating_point<T>::value) {
         using RT = RadixTraits<T>;
-        using Key = typename RT::Key;
         if constexpr (is_descending_v<Comp, T>) {
             pdqsort(p, p + n, [](const T& a, const T& b) {
                 return RT::encode(b) < RT::encode(a);
@@ -1779,6 +1785,42 @@ inline bool try_bitonic_runs_sort(T* p, std::size_t n, Comp comp) {
 }
 
 template <class T>
+inline bool try_radix_key_sparse_count_sort(T* p, std::size_t n, bool descending);
+template <class Key>
+FYX_FORCE_INLINE std::size_t low_card_hash_key(Key k) noexcept;
+
+/// Distinct radix keys in an evenly spaced sample, counted exactly up to
+/// `cap` (the return is `cap + 1` when there are more).  Used to tell "a
+/// handful of values spread over a wide range" from "a value at every point of
+/// a narrow range": the two want different counting kernels, and the range
+/// alone cannot distinguish them.
+template <class T>
+inline std::size_t sample_distinct_keys(const T* p, std::size_t n, std::size_t cap) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr std::size_t kSlots = 1024;              // >= 2x the 256+1 cap
+    constexpr std::size_t kMask  = kSlots - 1;
+    Key          slot[kSlots];
+    std::uint8_t used[kSlots];
+    for (std::size_t i = 0; i < kSlots; ++i) used[i] = 0;
+
+    const std::size_t sample_n = std::min<std::size_t>(n, kProfileSampleLimit);
+    std::size_t distinct = 0;
+    for (std::size_t j = 0; j < sample_n; ++j) {
+        const std::size_t idx = (j * n) / sample_n;
+        const Key k = RT::encode(p[idx]);
+        std::size_t h = low_card_hash_key(k) & kMask;
+        while (used[h] && slot[h] != k) h = (h + 1) & kMask;
+        if (!used[h]) {
+            used[h] = 1;
+            slot[h] = k;
+            if (++distinct > cap) return cap + 1;
+        }
+    }
+    return distinct;
+}
+
+template <class T>
 inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending) {
     if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
         (void)p; (void)n; (void)descending;
@@ -1787,6 +1829,30 @@ inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending) {
         if (n < kCountingMinN) return false;
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
+
+        // Same crossover as the parallel kernel: a handful of values spread
+        // over a wide range belongs to the sparse counter, which finds them by
+        // value instead of paying for every slot between them.  Checked on the
+        // sample, before the min/max scan, so declining costs one pass less.
+        {
+            const std::size_t dhat = sample_distinct_keys(p, n, kCountingClassLimit);
+            if (dhat <= kCountingClassLimit) {
+                Key smn = RT::encode(p[0]), smx = smn;
+                const std::size_t sample_n = std::min<std::size_t>(n, kProfileSampleLimit);
+                for (std::size_t j = 1; j < sample_n; ++j) {
+                    const Key k = RT::encode(p[(j * n) / sample_n]);
+                    if (k < smn) smn = k;
+                    if (smx < k) smx = k;
+                }
+                const unsigned long long srange =
+                    static_cast<unsigned long long>(static_cast<Key>(smx - smn)) + 1ull;
+                const unsigned long long spread = sizeof(T) <= 4 ? 64ull : 256ull;
+                if (srange >= 32768ull &&
+                    srange > spread * static_cast<unsigned long long>(dhat)) {
+                    if (try_radix_key_sparse_count_sort(p, n, descending)) return true;
+                }
+            }
+        }
 
         T mn = p[0], mx = p[0];
         for (std::size_t i = 1; i < n; ++i) {
@@ -1799,7 +1865,16 @@ inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending) {
         const Key span = static_cast<Key>(hi - lo);
         if (span == std::numeric_limits<Key>::max()) return false;
 
-        const std::size_t adaptive = std::max<std::size_t>(std::size_t(4096), n);
+        // Dense counting is O(n + range): it wins while the range is small
+        // beside n and loses badly once they are comparable (4M int32 over a
+        // 2^22 range: 0.028 s counting, 0.016 s vectorised quicksort; over a
+        // 2^18 range: 0.013 s counting, 0.019 s quicksort).  Where a quicksort
+        // kernel exists for the type, hand the wide half of that trade to it;
+        // where it does not, counting is still better than the alternatives.
+        const std::size_t adaptive =
+            (vqsort_preferred<T>() && vqsort_usable<T>(n))
+                ? std::max<std::size_t>(std::size_t(4096), n / 8)
+                : std::max<std::size_t>(std::size_t(4096), n);
         const std::size_t limit    = std::min<std::size_t>(kCountingRangeLimit, adaptive);
         const unsigned long long range64 = static_cast<unsigned long long>(span) + 1ull;
         if (range64 > static_cast<unsigned long long>(limit)) return false;
@@ -1864,7 +1939,6 @@ FYX_FORCE_INLINE std::size_t low_card_hash_key(Key k) noexcept {
 // ---------------------------------------------------------------------------
 
 inline constexpr std::size_t kProfileMinN            = 1024;
-inline constexpr std::size_t kProfileSampleLimit     = 1024;
 inline constexpr std::size_t kProfilePartialDivisor  = 64;
 inline constexpr std::size_t kProfilePartialPdqMax   = 64u << 20;
 
@@ -1877,6 +1951,7 @@ enum class DispatchDecision : unsigned char {
     LowCardinality,
     PartialPdq,
     Radix,
+    VectorQuick,
     Sample,
     ParallelSample,
     Pdq
@@ -5445,8 +5520,27 @@ FYX_NOINLINE inline bool try_integer_range_count_sort_parallel(T* p, std::size_t
         const Key sample_span = static_cast<Key>(smx - smn);
         if (sample_span == std::numeric_limits<Key>::max()) return false;
         const unsigned long long sample_range64 = static_cast<unsigned long long>(sample_span) + 1ull;
-        if (sample_range64 < 2ull ||
-            sample_range64 > static_cast<unsigned long long>(MaxParallelRange)) return false;
+        const unsigned long long range_cap =
+            (vqsort_preferred<T>() && vqsort_usable<T>(n))
+                ? std::min<unsigned long long>(MaxParallelRange,
+                      std::max<unsigned long long>(4096ull, n / 8))
+                : MaxParallelRange;
+        if (sample_range64 < 2ull || sample_range64 > range_cap) return false;
+
+        // A wide range with few values in it is the sparse counter's shape,
+        // not this one's.  Dense counting pays for every slot of the range in
+        // every chunk -- 16 values spread over 61440 (1M int64, the matrix's
+        // lowcard16 shape) means 61440 counters per chunk cleared, summed and
+        // walked, and it measures 0.0021 s against the sparse counter's
+        // 0.0013.  Below the crossover the dense kernel is the faster one and
+        // keeps the work, and if the sample underestimated the value count the
+        // sparse kernel declines after validating and control returns here.
+        const std::size_t dhat = sample_distinct_keys(p, n, kCountingClassLimit);
+        const unsigned long long spread = sizeof(T) <= 4 ? 64ull : 256ull;
+        if (sample_range64 >= 32768ull && dhat <= kCountingClassLimit &&
+            sample_range64 > spread * static_cast<unsigned long long>(dhat)) {
+            if (try_radix_key_sparse_count_sort_parallel(p, n, descending)) return true;
+        }
 
         const std::size_t chunks = adaptive_parallel_chunks(n);
         if ((n + chunks - 1) / chunks >
@@ -6137,6 +6231,109 @@ inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Vectorised quicksort driver (parts/10b_vsort.hpp holds the kernel)
+// ---------------------------------------------------------------------------
+
+#if FYX_ENABLE_PARALLEL
+/// Partition at the top, then hand the two sides to the pool.  The partition
+/// itself is sequential -- a parallel partition needs a second array and a
+/// prefix-sum round, which costs more than it saves at two workers -- so the
+/// speedup ceiling is Amdahl over the first `depth` levels.  With two workers
+/// and three levels that is ~1.8x, which is what it measures.
+template <class T>
+inline void vqsort_parallel_rec(T* p, std::size_t n, int budget, unsigned depth) {
+    // Below this a task costs more than the sort it carries.
+    constexpr std::size_t kMinParTask = std::size_t(1) << 16;
+    while (true) {
+        if (depth == 0 || budget <= 0 || n < kMinParTask) {
+            vqsort_serial_budget(p, n, budget);
+            return;
+        }
+        const VqStep st = vqsort_partition_step(p, n);
+        --budget;
+        if (st.left_done && st.right_done) return;
+        if (st.left_done)  { p += st.split; n -= st.split; continue; }
+        if (st.right_done) { n = st.split; continue; }
+        T* const rp = p + st.split;
+        const std::size_t ln = st.split;
+        const std::size_t rn = n - st.split;
+        const int nb = budget;
+        const unsigned nd = depth - 1;
+        fork_join([=] { vqsort_parallel_rec(p, ln, nb, nd); },
+                  [=] { vqsort_parallel_rec(rp, rn, nb, nd); });
+        return;
+    }
+}
+#endif
+
+/// How much disorder the patch merges may repair before the vectorised
+/// quicksort becomes the better buy.  They pull the dirty positions out, sort
+/// them and merge them back -- three sequential passes that move every element
+/// at least twice, plus a sort of the patch, so their cost climbs with the
+/// amount of dirt while the quicksort's does not.  The crossovers below are
+/// measured, not guessed (random long-distance swaps, this machine):
+///
+/// 4M int32, sorted then a percentage of positions swapped at random:
+///
+///   swapped   patch merge   quicksort seq   quicksort pooled
+///    0.02%      0.0077          0.0178           ~0.011
+///    0.1%       0.0123          0.0169            0.0115
+///    0.3%       0.0150          0.0169            ~0.011
+///    1%         0.0265          0.0202            0.0108
+///
+/// Sequentially the patch merge holds on until the patch itself is expensive
+/// to sort, around half a percent; pooled, the quicksort takes over four times
+/// earlier because it is the only one of the two that uses the second core.
+/// The patch merge's own dirty count for those rows falls between n/256 and
+/// n/128 at 0.1% and above n/32 at 1%, which is what these two budgets pick
+/// out.  Declining is cheap either way (0.0005-0.002 s here).  The cheap
+/// repairs (adjacent-swap, bounded insertion) are never affected: they cost a
+/// fraction of a pass and beat both.
+template <class T>
+inline std::size_t patch_merge_dirty_budget(std::size_t n, bool parallel) {
+    if (!(vqsort_preferred<T>() && vqsort_usable<T>(n))) return kPatchDirtyDefault;
+#if FYX_ENABLE_PARALLEL
+    if (parallel && parallel_available()) return n / 256;
+#else
+    (void)parallel;
+#endif
+    return n / 64;
+}
+
+/// Sorts `p[0,n)` with the AVX-512 vectorised quicksort, or returns false and
+/// leaves the range untouched.  Declines when: the type has no kernel, the CPU
+/// has no AVX-512, the range is too small for the vector partition, the radix
+/// family is faster for the type, or -- for floating point -- the range holds
+/// a NaN or a -0, whose total order the hardware compare cannot reproduce.
+template <class T>
+inline bool try_vector_quicksort(T* p, std::size_t n, bool descending, bool parallel) {
+    if constexpr (!vqsort_kernel_supported_v<T>) {
+        (void)p; (void)n; (void)descending; (void)parallel;
+        return false;
+    } else {
+        if (!vqsort_preferred<T>()) return false;
+        if (!vqsort_usable<T>(n)) return false;
+        if (n < kVqsortMinN) return false;
+        if (!vqsort_range_clean(p, n)) return false;
+#if FYX_ENABLE_PARALLEL
+        if (parallel && parallel_available()) {
+            unsigned depth = 0;
+            for (unsigned w = global_pool().nworkers(); w > 1; w >>= 1) ++depth;
+            depth += 2;                       // a few extra levels for balance
+            vqsort_parallel_rec(p, n, vqsort_budget(n), depth);
+        } else {
+            vqsort_serial(p, n);
+        }
+#else
+        (void)parallel;
+        vqsort_serial(p, n);
+#endif
+        if (descending) std::reverse(p, p + n);
+        return true;
+    }
+}
+
 template <class T, class Comp>
 inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
                     const InputProfile<T, Comp>* known_profile) {
@@ -6210,6 +6407,11 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
         }
         if (partial_pdq && try_partially_sorted_local_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
         if (try_radix_permutation_range_sort(p, n, descending)) { record_dispatch(DispatchDecision::Radix); return; }
+        // A narrow value range is not the same property as a low value count:
+        // 4M int32 drawn from 2^18 values is high-entropy by every sample and
+        // still sorts fastest by counting.  Both range kernels self-gate on
+        // range vs n, so this costs a sample when it declines.
+        if (high_entropy && try_integer_range_count_sort(p, n, descending)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         if constexpr (radix_type) {
             if (n >= kRadixThreshold || std::is_floating_point<T>::value) {
 #if FYX_ENABLE_PARALLEL
@@ -6217,6 +6419,10 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
                 // measured -- 1M int32: 0.0090s against 0.0120s, 8M: 0.080s
                 // against 0.154s -- so it goes first and the wide sort is the
                 // fallback for the shapes whose prefix it declines.
+                if (try_vector_quicksort(p, n, descending, false)) {
+                    record_dispatch(DispatchDecision::VectorQuick);
+                    return;
+                }
                 if (high_entropy && try_serial_radix_high_prefix_sort(p, n, descending)) {
                     record_dispatch(DispatchDecision::Radix);
                     return;
@@ -6262,6 +6468,23 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
     record_dispatch(DispatchDecision::Pdq);
 }
 
+
+// The moving merge below is used by both the parallel merge and the sequential
+// stable merge sort, so it must stay outside the parallel guard.
+/// The same stable merge as std::merge -- equal elements keep the order of the
+/// first run -- except that it moves.  std::merge assigns through a const
+/// lvalue, which a move-only payload (std::unique_ptr, say) cannot take, and
+/// that used to make the parallel merge refuse to compile for them.
+template <class T, class Comp>
+inline void merge_runs_moving(T* a, std::size_t n1, T* b, std::size_t n2, T* dst, Comp comp) {
+    std::size_t i = 0, j = 0, w = 0;
+    while (i != n1 && j != n2) {
+        if (comp(b[j], a[i])) dst[w++] = std::move(b[j++]);
+        else                  dst[w++] = std::move(a[i++]);
+    }
+    while (i != n1) dst[w++] = std::move(a[i++]);
+    while (j != n2) dst[w++] = std::move(b[j++]);
+}
 
 #if FYX_ENABLE_PARALLEL
 
@@ -6454,21 +6677,6 @@ inline bool try_msd_radix_bucket_sort(T* p, std::size_t n, bool descending) {
     }
 }
 
-/// The same stable merge as std::merge -- equal elements keep the order of the
-/// first run -- except that it moves.  std::merge assigns through a const
-/// lvalue, which a move-only payload (std::unique_ptr, say) cannot take, and
-/// that used to make the parallel merge refuse to compile for them.
-template <class T, class Comp>
-inline void merge_runs_moving(T* a, std::size_t n1, T* b, std::size_t n2, T* dst, Comp comp) {
-    std::size_t i = 0, j = 0, w = 0;
-    while (i != n1 && j != n2) {
-        if (comp(b[j], a[i])) dst[w++] = std::move(b[j++]);
-        else                  dst[w++] = std::move(a[i++]);
-    }
-    while (i != n1) dst[w++] = std::move(a[i++]);
-    while (j != n2) dst[w++] = std::move(b[j++]);
-}
-
 template <class T, class Comp>
 inline void parallel_merge_to_buffer_rec(T* src,
                                          std::size_t a0, std::size_t a1,
@@ -6545,8 +6753,16 @@ inline void parallel_sort_ptr(T* p, std::size_t n, Comp comp, bool descending,
     const std::size_t mid = n / 2;
     fork_join([&] { sort_st(p, mid, comp, descending); },
               [&] { sort_st(p + mid, n - mid, comp, descending); });
-    if (!parallel_merge_buffered(p, mid, n, comp))
-        std::inplace_merge(p, p + mid, p + n, comp);
+    // The two halves come back in the order sort_st produces, which for
+    // floating point with a default comparator is the radix total order:
+    // -NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN.  Merging them with the
+    // raw comparator instead would compare NaN with `<`, which is false both
+    // ways, and interleave the two halves wrongly -- 70000 floats holding
+    // NaNs came out with three inversions.  adaptive_order is the same
+    // comparator everywhere else.
+    auto order = adaptive_order<T>(comp);
+    if (!parallel_merge_buffered(p, mid, n, order))
+        std::inplace_merge(p, p + mid, p + n, order);
 }
 #endif
 
@@ -6718,12 +6934,30 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
     }
     if (n <= detail::kProfilePartialPdqMax && detail::pdq_preferred_order_sample(p, n, comp)) {
         if (radix_ok) {
-            if (detail::try_partially_sorted_local_repair(p, n, comp)) {
+#if FYX_ENABLE_PARALLEL
+            const bool par_here = detail::dynamic_parallel_allowed<T>(n, o);
+#else
+            const bool par_here = false;
+#endif
+            const std::size_t patch_budget = detail::patch_merge_dirty_budget<T>(n, par_here);
+            if (detail::try_partially_sorted_local_repair(p, n, comp, patch_budget)) {
                 detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                 return;
             }
             if (detail::try_radix_permutation_range_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
+            if (detail::try_vector_quicksort(p, n, descending, par_here)) {
+                detail::record_dispatch(detail::DispatchDecision::VectorQuick);
+                return;
+            }
+            // The quicksort declined (no AVX-512, a NaN in the range, ...):
+            // the patch merges are the best thing left, so give them the turn
+            // that was held back for it.
+            if (patch_budget != detail::kPatchDirtyDefault &&
+                detail::try_partially_sorted_local_repair(p, n, comp)) {
+                detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                 return;
             }
             // Numeric long-distance nearly-sorted inputs should not pay the
@@ -6792,7 +7026,17 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             n <= detail::kProfilePartialPdqMax;
         if (partial_pdq && !(prof && prof->is_low_cardinality)) {
             if (radix_ok) {
-                if (detail::try_partially_sorted_local_repair(p, n, comp)) {
+                const std::size_t patch_budget = detail::patch_merge_dirty_budget<T>(n, want_parallel);
+                if (detail::try_partially_sorted_local_repair(p, n, comp, patch_budget)) {
+                    detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                    return;
+                }
+                if (detail::try_vector_quicksort(p, n, descending, want_parallel)) {
+                    detail::record_dispatch(detail::DispatchDecision::VectorQuick);
+                    return;
+                }
+                if (patch_budget != detail::kPatchDirtyDefault &&
+                detail::try_partially_sorted_local_repair(p, n, comp)) {
                     detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                     return;
                 }
@@ -6845,6 +7089,10 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             }
             if (partial_pdq && detail::try_partially_sorted_local_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
             if (detail::try_radix_permutation_range_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
+            // See sort_st: narrow range is not low cardinality, and the range
+            // kernels self-gate, so high-entropy input gets a chance too.
+            if (high_entropy && detail::try_integer_range_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+            if (detail::try_vector_quicksort(p, n, descending, true)) { detail::record_dispatch(detail::DispatchDecision::VectorQuick); return; }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
@@ -6874,6 +7122,10 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             const bool high_entropy = prof && prof->is_high_entropy;
             if (detail::try_radix_permutation_range_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
+            if (detail::try_vector_quicksort(p, n, descending, true)) {
+                detail::record_dispatch(detail::DispatchDecision::VectorQuick);
                 return;
             }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) {
@@ -7027,6 +7279,12 @@ inline bool try_buffered_iter_sort(It first, It last, Comp comp, const Options& 
         return false;
     } else {
         std::vector<T> buf;
+        // Without exceptions there is nothing to catch: an allocation that
+        // cannot be served terminates, and a move that cannot be made cannot
+        // report it.  The recovery arms below exist to leave the range holding
+        // every element it started with, which is only reachable when a throw
+        // is possible in the first place.
+#if FYX_HAS_EXCEPTIONS
         try {
             buf.reserve(n);
         } catch (...) {
@@ -7047,6 +7305,11 @@ inline bool try_buffered_iter_sort(It first, It last, Comp comp, const Options& 
             for (std::size_t i = 0; i < n; ++i) { *out = std::move(buf[i]); ++out; }
             throw;
         }
+#else
+        buf.reserve(n);
+        for (It it = first; it != last; ++it) buf.push_back(std::move(*it));
+        sort_pointer_core(buf.data(), buf.size(), comp, o);
+#endif
         It out = first;
         for (std::size_t i = 0; i < n; ++i) { *out = std::move(buf[i]); ++out; }
         return true;
@@ -7350,11 +7613,21 @@ inline void nth_element(Container& c, std::size_t nth_n) {
 //  these from C, compile one .cpp that #includes this header and references
 //  the symbols; they are emitted with external C linkage there.
 // ===========================================================================
+// The wrappers report failure through the return value, so with exceptions
+// switched off (-fno-exceptions / FYX_NO_EXCEPTIONS) they simply call through:
+// the library's own out-of-memory handling degrades to the in-place kernels
+// there, and nothing else can throw.
+#if FYX_HAS_EXCEPTIONS
+#  define FYX_C_ABI_BODY(call) try { call; return 0; } catch (...) { return -1; }
+#else
+#  define FYX_C_ABI_BODY(call) call; return 0;
+#endif
+
 extern "C" {
-inline int fyx_sort_int32 (std::int32_t*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_uint32(std::uint32_t* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_int64 (std::int64_t*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_uint64(std::uint64_t* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_float (float*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_double(double* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_int32 (std::int32_t*  d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_uint32(std::uint32_t* d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_int64 (std::int64_t*  d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_uint64(std::uint64_t* d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_float (float*  d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_double(double* d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
 }

@@ -18,6 +18,16 @@
 static int failures = 0;
 #define CHECK(c, m) do { if (!(c)) { std::printf("  FAIL: %s\n", m); ++failures; } } while (0)
 
+// High-entropy numeric input is claimed by one of the two full-range numeric
+// kernels: the AVX-512 vectorised quicksort where the CPU has it, the radix
+// family everywhere else.  Which one is a machine property, so the dispatch
+// checks below accept either and the point of the check -- that the range does
+// not fall through to a comparison sort -- is unchanged.
+static bool is_numeric_kernel(fyx::detail::DispatchDecision d) {
+    return d == fyx::detail::DispatchDecision::Radix ||
+           d == fyx::detail::DispatchDecision::VectorQuick;
+}
+
 template <class T, class Comp = std::less<T>>
 static void check_against_std(const char* tag, std::vector<T> v, Comp comp = Comp{}) {
     std::vector<T> ref = v;
@@ -233,8 +243,8 @@ int main() {
         fyx::Options o;
         o.parallel = fyx::Tri::Off;
         fyx::sort(v.begin(), v.end(), o);
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
-              "vector iterator numeric random uses pointer radix dispatch");
+        CHECK(is_numeric_kernel(fd::test_last_dispatch()),
+              "vector iterator numeric random uses a pointer numeric kernel");
         CHECK(std::is_sorted(v.begin(), v.end()), "vector iterator numeric random output");
     }
     {
@@ -333,8 +343,8 @@ int main() {
         fyx::Options o;
         o.parallel = fyx::Tri::On;
         fyx::sort(v.begin(), v.end(), o);
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
-              "parallel int32 high-entropy uses chunked radix dispatch");
+        CHECK(is_numeric_kernel(fd::test_last_dispatch()),
+              "parallel int32 high-entropy uses a numeric kernel");
         CHECK(std::is_sorted(v.begin(), v.end()), "parallel int32 high-entropy output");
     }
     {
@@ -345,8 +355,8 @@ int main() {
         fyx::Options o;
         o.parallel = fyx::Tri::On;
         fyx::sort(v.begin(), v.end(), o);
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
-              "parallel uint64 high-entropy uses chunked radix dispatch");
+        CHECK(is_numeric_kernel(fd::test_last_dispatch()),
+              "parallel uint64 high-entropy uses a numeric kernel");
         CHECK(std::is_sorted(v.begin(), v.end()), "parallel uint64 high-entropy output");
     }
     {
@@ -360,8 +370,8 @@ int main() {
         fyx::Options o;
         o.parallel = fyx::Tri::On;
         fyx::sort(v.begin(), v.end(), o);
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::Radix,
-              "parallel double high-entropy uses radix bucket dispatch");
+        CHECK(is_numeric_kernel(fd::test_last_dispatch()),
+              "parallel double high-entropy uses a numeric kernel");
         CHECK(std::is_sorted(v.begin(), v.end()), "parallel double high-entropy output");
     }
     {
@@ -422,11 +432,15 @@ int main() {
         fyx::Options o;
         o.parallel = fyx::Tri::On;
         fyx::sort(v, o);
-        // Sparse long-distance swaps leave a tiny dirty set behind: the patch
-        // merge repairs them with three linear passes, which measures ~3x
-        // faster here than the full radix fallback this case used to take.
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
-              "long-distance numeric nearly-sorted uses the patch merge repair");
+        // Sparse long-distance swaps leave a dirty set behind.  Repairing it
+        // with the patch merge's three linear passes beats the radix fallback
+        // this case used to take; where an AVX-512 quicksort exists it beats
+        // the patch merge in turn once the dirt is a percent of the range and
+        // a pool is available (see patch_merge_dirty_budget), so both answers
+        // are correct and which one appears is a property of the machine.
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq ||
+              fd::test_last_dispatch() == fd::DispatchDecision::VectorQuick,
+              "long-distance numeric nearly-sorted uses a repair or the quicksort");
         CHECK(std::is_sorted(v.begin(), v.end()), "long-distance numeric nearly-sorted output");
     }
     {
@@ -443,8 +457,16 @@ int main() {
         fyx::Options o;
         o.parallel = fyx::Tri::On;
         fyx::sort(v, o);
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
-              "floating integer-permutation nearly-sorted uses the patch merge repair");
+        // Values 0..n-1 as doubles: once the patch merge steps aside for the
+        // quicksort (dirt of a percent, pool available) the permutation-range
+        // radix kernel gets its turn and is the fastest of the three here --
+        // 0.0037 s against 0.0067 for the quicksort and 0.0089 for the patch
+        // merge.  Any of the three is a correct answer; a comparison sort is
+        // not, which is what this check is for.
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq ||
+              fd::test_last_dispatch() == fd::DispatchDecision::VectorQuick ||
+              fd::test_last_dispatch() == fd::DispatchDecision::Radix,
+              "floating integer-permutation nearly-sorted keeps a numeric kernel");
         CHECK(std::is_sorted(v.begin(), v.end()), "floating integer-permutation nearly-sorted output");
     }
     {

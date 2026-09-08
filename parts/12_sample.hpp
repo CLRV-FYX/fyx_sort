@@ -729,6 +729,7 @@ inline void parallel_sample_sort_arithmetic64_top(It first, It last, Comp comp, 
 template <class It, class Comp>
 inline void parallel_sample_sort(It first, It last, Comp comp) {
     using T = typename std::iterator_traits<It>::value_type;
+    FYX_UNUSED_TYPE(T);        // only the v2 top-level split looks at it
     const std::size_t n = static_cast<std::size_t>(last - first);
     unsigned depth = static_cast<unsigned>(2 * log2_floor(static_cast<std::uint64_t>(n ? n : 1)) + 8);
 #if FYX_SAMPLE_SORT_V2

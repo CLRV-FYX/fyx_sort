@@ -285,6 +285,9 @@
 #endif
 
 #define FYX_UNUSED(x) ((void)(x))
+/// Silences -Wunused-local-typedefs for a typedef that only some compile-time
+/// configurations look at (e.g. a kernel switched off by a FYX_* macro).
+#define FYX_UNUSED_TYPE(T) ((void)sizeof(T*))
 
 #define FYX_STRINGIFY_(x) #x
 #define FYX_STRINGIFY(x)  FYX_STRINGIFY_(x)
@@ -296,7 +299,13 @@
 #endif
 
 // Exceptions ----------------------------------------------------------------
-#if defined(FYX_NO_EXCEPTIONS) || (defined(__cpp_exceptions) && __cpp_exceptions == 0) \
+// GCC and Clang do not define __cpp_exceptions as 0 under -fno-exceptions --
+// they leave it undefined, along with __EXCEPTIONS -- so testing it for zero
+// never fired and a plain -fno-exceptions build (no FYX_NO_EXCEPTIONS) failed
+// to compile on the first try/catch it reached.
+#if defined(FYX_NO_EXCEPTIONS) \
+    || (defined(__cpp_exceptions) && __cpp_exceptions == 0) \
+    || (FYX_GNUC_LIKE && !defined(__EXCEPTIONS)) \
     || (FYX_COMPILER_MSVC && !defined(_CPPUNWIND))
 #  define FYX_HAS_EXCEPTIONS 0
 #else
@@ -365,6 +374,13 @@
 // Intrinsic headers ---------------------------------------------------------
 #if FYX_ARCH_X86 && (FYX_HAS_SSE42_CODE || FYX_HAS_AVX2_CODE || FYX_HAS_AVX512_CODE)
 #  include <immintrin.h>
+#elif FYX_ARCH_X86 && FYX_GNUC_LIKE
+// FYX_DISABLE_SIMD compiles every vector kernel out, but the spin hint
+// (_mm_pause) and the non-temporal store fence (_mm_sfence) are not vector
+// kernels and are still used.  They live in the SSE headers, which are
+// available on any x86 target without an -m switch, so a scalar-only build
+// stays a scalar-only build and still compiles.
+#  include <xmmintrin.h>
 #endif
 #if FYX_HAS_NEON_CODE
 #  include <arm_neon.h>
@@ -418,9 +434,26 @@ inline constexpr std::size_t kParallelThreshold = 1u << 15;   // 32768
 /// histogram pass plus a full ping-pong copy is not amortised yet).
 inline constexpr std::size_t kRadixThreshold = 1024;
 
+/// "Leave the patch merges their own budget" -- see patch_merge_dirty_budget.
+inline constexpr std::size_t kPatchDirtyDefault = static_cast<std::size_t>(-1);
+
+/// Digit width of the wide radix passes (10/11/11 for 32-bit keys).  Used to
+/// convert a key span into "how many passes would radix actually run".
+inline constexpr unsigned kRadixWidePassBits = 11;
+
+/// Evenly spaced elements read by every sampling probe (input profile,
+/// distinct estimate, pivot gates).  Lives here rather than next to the
+/// profile because the counting kernels sample before the profile exists.
+inline constexpr std::size_t kProfileSampleLimit = 1024;
+
 /// Sorting-network ceiling.  Everything at or below this length is sorted by a
 /// branch-free network, never by insertion sort.
 inline constexpr std::size_t kNetworkMax = 64;
+
+/// Below this length the AVX-512 vectorised quicksort (parts/10b_vsort.hpp)
+/// does not pay: a range that fits in L2 is where the radix passes are cheap,
+/// and the quicksort still has to walk log(n/leaf) levels over it.
+inline constexpr std::size_t kVqsortMinN = 1u << 14;          // 16384
 
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;
@@ -3913,6 +3946,705 @@ inline void pdqsort(It first, It last, Compare comp) {
 } // namespace fyx
 
 // ============================================================================
+//  Section 10b -- AVX-512 vectorised quicksort
+//
+//  Why this exists
+//  ---------------
+//  `tools/dev/NOTES.md` closes the accounting on the LSD radix for
+//  high-entropy numeric input: one count+scatter pass costs ~3.1 ns/elem and
+//  does not respond to blocking, wider digits or a deeper write-combining
+//  buffer, and 32 bits at <=13 bits per pass means three passes is the floor.
+//  ~9.4 ns/elem of CPU work is therefore the floor for LSD radix on int32
+//  here, against ~7.2 for a vectorised quicksort of the vqsort class.  Every
+//  cheaper idea was measured and lost.  This is that vectorised quicksort.
+//
+//  Structure (the same one vqsort and x86-simd-sort use)
+//  -----------------------------------------------------
+//    * partition with `vpcompressd`/`vcompressps`: one compare gives a mask,
+//      two masked compress-stores place the low and high halves at the two
+//      ends of the free gap, and no element is ever written twice;
+//    * four vectors are consumed per iteration and the side to read from is
+//      chosen *branchlessly*.  That choice depends on how the data splits, so
+//      a branch there mispredicts on roughly every other iteration -- at one
+//      vector per iteration the misprediction alone costs more than the
+//      partition (measured: 1 vector/branchy 0.0062 s vs 4 vectors/branchless
+//      0.0042 s for 1M int32);
+//    * the leaf (<=16 vectors) is a Batcher bitonic network run entirely in
+//      registers, reusing the generic template from `parts/_network_body.inc`
+//      with policies over the *native* type -- inside a quicksort the
+//      comparisons are already in the value domain, so the encode and decode
+//      passes the radix networks need are pure loss here.
+//
+//  Ordering semantics
+//  ------------------
+//  Integers compare natively.  Floating point uses `_CMP_GE_OQ`, which orders
+//  everything except NaN and cannot separate -0 from +0, while the rest of the
+//  library promises the radix total order (-0 before +0, NaN at one end).  The
+//  entry point therefore screens the range first (a read-only SIMD pass) and
+//  declines when it holds a NaN or a -0, leaving those inputs to the radix
+//  path that already handles them.
+// ============================================================================
+
+#if FYX_HAS_AVX512_CODE
+
+FYX_ISA_BEGIN("avx512f,avx512bw,avx512dq,avx512vl,avx512cd")
+namespace fyx {
+namespace detail {
+namespace isa_avx512 {
+
+// ---------------------------------------------------------------------------
+// Per-type policies.  Everything is expressed in the native type: no encode.
+// ---------------------------------------------------------------------------
+template <class T>
+struct VOps;
+
+template <>
+struct VOps<std::int32_t> {
+    using T    = std::int32_t;
+    using reg  = __m512i;
+    using mask = __mmask16;
+    static constexpr int V = 16;
+    FYX_FORCE_INLINE static reg  loadu(const T* p) { return _mm512_loadu_si512(reinterpret_cast<const void*>(p)); }
+    FYX_FORCE_INLINE static void storeu(T* p, reg v) { _mm512_storeu_si512(reinterpret_cast<void*>(p), v); }
+    FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi32(k, p); }
+    FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi32(s, k, p); }
+    FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi32(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi32(p, k, v); }
+    FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epi32_mask(a, b, _MM_CMPINT_NLT); }
+    FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epi32_mask(a, b, _MM_CMPINT_NLE); }
+    FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epi32(a, b); }
+    FYX_FORCE_INLINE static reg  max(reg a, reg b) { return _mm512_max_epi32(a, b); }
+    FYX_FORCE_INLINE static reg  mask_min(reg s, mask k, reg a, reg b) { return _mm512_mask_min_epi32(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  mask_max(reg s, mask k, reg a, reg b) { return _mm512_mask_max_epi32(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  set1(T x) { return _mm512_set1_epi32(x); }
+    FYX_FORCE_INLINE static T    reduce_min(reg v) { return _mm512_reduce_min_epi32(v); }
+    FYX_FORCE_INLINE static T    reduce_max(reg v) { return _mm512_reduce_max_epi32(v); }
+    FYX_FORCE_INLINE static T    hi() { return (std::numeric_limits<T>::max)(); }
+    FYX_FORCE_INLINE static T    lo() { return (std::numeric_limits<T>::lowest)(); }
+    template <unsigned J>
+    FYX_FORCE_INLINE static reg permute_xor(reg v) {
+        const __m512i idx = _mm512_set_epi32(
+            int(15u ^ J), int(14u ^ J), int(13u ^ J), int(12u ^ J),
+            int(11u ^ J), int(10u ^ J), int( 9u ^ J), int( 8u ^ J),
+            int( 7u ^ J), int( 6u ^ J), int( 5u ^ J), int( 4u ^ J),
+            int( 3u ^ J), int( 2u ^ J), int( 1u ^ J), int( 0u ^ J));
+        return _mm512_permutexvar_epi32(idx, v);
+    }
+    FYX_FORCE_INLINE static reg blend(mask keepmin, reg mn, reg mx) { return _mm512_mask_blend_epi32(keepmin, mx, mn); }
+};
+
+template <>
+struct VOps<std::uint32_t> {
+    using T    = std::uint32_t;
+    using reg  = __m512i;
+    using mask = __mmask16;
+    static constexpr int V = 16;
+    FYX_FORCE_INLINE static reg  loadu(const T* p) { return _mm512_loadu_si512(reinterpret_cast<const void*>(p)); }
+    FYX_FORCE_INLINE static void storeu(T* p, reg v) { _mm512_storeu_si512(reinterpret_cast<void*>(p), v); }
+    FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi32(k, p); }
+    FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi32(s, k, p); }
+    FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi32(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi32(p, k, v); }
+    FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epu32_mask(a, b, _MM_CMPINT_NLT); }
+    FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epu32_mask(a, b, _MM_CMPINT_NLE); }
+    FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epu32(a, b); }
+    FYX_FORCE_INLINE static reg  max(reg a, reg b) { return _mm512_max_epu32(a, b); }
+    FYX_FORCE_INLINE static reg  mask_min(reg s, mask k, reg a, reg b) { return _mm512_mask_min_epu32(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  mask_max(reg s, mask k, reg a, reg b) { return _mm512_mask_max_epu32(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  set1(T x) { return _mm512_set1_epi32(static_cast<int>(x)); }
+    FYX_FORCE_INLINE static T    reduce_min(reg v) { return static_cast<T>(_mm512_reduce_min_epu32(v)); }
+    FYX_FORCE_INLINE static T    reduce_max(reg v) { return static_cast<T>(_mm512_reduce_max_epu32(v)); }
+    FYX_FORCE_INLINE static T    hi() { return (std::numeric_limits<T>::max)(); }
+    FYX_FORCE_INLINE static T    lo() { return (std::numeric_limits<T>::lowest)(); }
+    template <unsigned J>
+    FYX_FORCE_INLINE static reg permute_xor(reg v) { return VOps<std::int32_t>::permute_xor<J>(v); }
+    FYX_FORCE_INLINE static reg blend(mask keepmin, reg mn, reg mx) { return _mm512_mask_blend_epi32(keepmin, mx, mn); }
+};
+
+template <>
+struct VOps<std::int64_t> {
+    using T    = std::int64_t;
+    using reg  = __m512i;
+    using mask = __mmask8;
+    static constexpr int V = 8;
+    FYX_FORCE_INLINE static reg  loadu(const T* p) { return _mm512_loadu_si512(reinterpret_cast<const void*>(p)); }
+    FYX_FORCE_INLINE static void storeu(T* p, reg v) { _mm512_storeu_si512(reinterpret_cast<void*>(p), v); }
+    FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi64(k, p); }
+    FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi64(s, k, p); }
+    FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi64(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi64(p, k, v); }
+    FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_NLT); }
+    FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_NLE); }
+    FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epi64(a, b); }
+    FYX_FORCE_INLINE static reg  max(reg a, reg b) { return _mm512_max_epi64(a, b); }
+    FYX_FORCE_INLINE static reg  mask_min(reg s, mask k, reg a, reg b) { return _mm512_mask_min_epi64(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  mask_max(reg s, mask k, reg a, reg b) { return _mm512_mask_max_epi64(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  set1(T x) { return _mm512_set1_epi64(x); }
+    FYX_FORCE_INLINE static T    reduce_min(reg v) { return _mm512_reduce_min_epi64(v); }
+    FYX_FORCE_INLINE static T    reduce_max(reg v) { return _mm512_reduce_max_epi64(v); }
+    FYX_FORCE_INLINE static T    hi() { return (std::numeric_limits<T>::max)(); }
+    FYX_FORCE_INLINE static T    lo() { return (std::numeric_limits<T>::lowest)(); }
+    template <unsigned J>
+    FYX_FORCE_INLINE static reg permute_xor(reg v) {
+        const __m512i idx = _mm512_set_epi64(
+            static_cast<long long>(7u ^ J), static_cast<long long>(6u ^ J),
+            static_cast<long long>(5u ^ J), static_cast<long long>(4u ^ J),
+            static_cast<long long>(3u ^ J), static_cast<long long>(2u ^ J),
+            static_cast<long long>(1u ^ J), static_cast<long long>(0u ^ J));
+        return _mm512_permutexvar_epi64(idx, v);
+    }
+    FYX_FORCE_INLINE static reg blend(mask keepmin, reg mn, reg mx) { return _mm512_mask_blend_epi64(keepmin, mx, mn); }
+};
+
+template <>
+struct VOps<std::uint64_t> {
+    using T    = std::uint64_t;
+    using reg  = __m512i;
+    using mask = __mmask8;
+    static constexpr int V = 8;
+    FYX_FORCE_INLINE static reg  loadu(const T* p) { return _mm512_loadu_si512(reinterpret_cast<const void*>(p)); }
+    FYX_FORCE_INLINE static void storeu(T* p, reg v) { _mm512_storeu_si512(reinterpret_cast<void*>(p), v); }
+    FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi64(k, p); }
+    FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi64(s, k, p); }
+    FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi64(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi64(p, k, v); }
+    FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epu64_mask(a, b, _MM_CMPINT_NLT); }
+    FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epu64_mask(a, b, _MM_CMPINT_NLE); }
+    FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epu64(a, b); }
+    FYX_FORCE_INLINE static reg  max(reg a, reg b) { return _mm512_max_epu64(a, b); }
+    FYX_FORCE_INLINE static reg  mask_min(reg s, mask k, reg a, reg b) { return _mm512_mask_min_epu64(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  mask_max(reg s, mask k, reg a, reg b) { return _mm512_mask_max_epu64(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  set1(T x) { return _mm512_set1_epi64(static_cast<long long>(x)); }
+    FYX_FORCE_INLINE static T    reduce_min(reg v) { return _mm512_reduce_min_epu64(v); }
+    FYX_FORCE_INLINE static T    reduce_max(reg v) { return _mm512_reduce_max_epu64(v); }
+    FYX_FORCE_INLINE static T    hi() { return (std::numeric_limits<T>::max)(); }
+    FYX_FORCE_INLINE static T    lo() { return (std::numeric_limits<T>::lowest)(); }
+    template <unsigned J>
+    FYX_FORCE_INLINE static reg permute_xor(reg v) { return VOps<std::int64_t>::permute_xor<J>(v); }
+    FYX_FORCE_INLINE static reg blend(mask keepmin, reg mn, reg mx) { return _mm512_mask_blend_epi64(keepmin, mx, mn); }
+};
+
+template <>
+struct VOps<float> {
+    using T    = float;
+    using reg  = __m512;
+    using mask = __mmask16;
+    static constexpr int V = 16;
+    FYX_FORCE_INLINE static reg  loadu(const T* p) { return _mm512_loadu_ps(p); }
+    FYX_FORCE_INLINE static void storeu(T* p, reg v) { _mm512_storeu_ps(p, v); }
+    FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_ps(k, p); }
+    FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_ps(s, k, p); }
+    FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_ps(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_ps(p, k, v); }
+    FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_ps_mask(a, b, _CMP_GE_OQ); }
+    FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_ps_mask(a, b, _CMP_GT_OQ); }
+    FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_ps(a, b); }
+    FYX_FORCE_INLINE static reg  max(reg a, reg b) { return _mm512_max_ps(a, b); }
+    FYX_FORCE_INLINE static reg  mask_min(reg s, mask k, reg a, reg b) { return _mm512_mask_min_ps(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  mask_max(reg s, mask k, reg a, reg b) { return _mm512_mask_max_ps(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  set1(T x) { return _mm512_set1_ps(x); }
+    FYX_FORCE_INLINE static T    reduce_min(reg v) { return _mm512_reduce_min_ps(v); }
+    FYX_FORCE_INLINE static T    reduce_max(reg v) { return _mm512_reduce_max_ps(v); }
+    FYX_FORCE_INLINE static T    hi() { return (std::numeric_limits<T>::infinity)(); }
+    FYX_FORCE_INLINE static T    lo() { return -(std::numeric_limits<T>::infinity)(); }
+    template <unsigned J>
+    FYX_FORCE_INLINE static reg permute_xor(reg v) {
+        const __m512i idx = _mm512_set_epi32(
+            int(15u ^ J), int(14u ^ J), int(13u ^ J), int(12u ^ J),
+            int(11u ^ J), int(10u ^ J), int( 9u ^ J), int( 8u ^ J),
+            int( 7u ^ J), int( 6u ^ J), int( 5u ^ J), int( 4u ^ J),
+            int( 3u ^ J), int( 2u ^ J), int( 1u ^ J), int( 0u ^ J));
+        return _mm512_permutexvar_ps(idx, v);
+    }
+    FYX_FORCE_INLINE static reg blend(mask keepmin, reg mn, reg mx) { return _mm512_mask_blend_ps(keepmin, mx, mn); }
+};
+
+template <>
+struct VOps<double> {
+    using T    = double;
+    using reg  = __m512d;
+    using mask = __mmask8;
+    static constexpr int V = 8;
+    FYX_FORCE_INLINE static reg  loadu(const T* p) { return _mm512_loadu_pd(p); }
+    FYX_FORCE_INLINE static void storeu(T* p, reg v) { _mm512_storeu_pd(p, v); }
+    FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_pd(k, p); }
+    FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_pd(s, k, p); }
+    FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_pd(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_pd(p, k, v); }
+    FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_pd_mask(a, b, _CMP_GE_OQ); }
+    FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_pd_mask(a, b, _CMP_GT_OQ); }
+    FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_pd(a, b); }
+    FYX_FORCE_INLINE static reg  max(reg a, reg b) { return _mm512_max_pd(a, b); }
+    FYX_FORCE_INLINE static reg  mask_min(reg s, mask k, reg a, reg b) { return _mm512_mask_min_pd(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  mask_max(reg s, mask k, reg a, reg b) { return _mm512_mask_max_pd(s, k, a, b); }
+    FYX_FORCE_INLINE static reg  set1(T x) { return _mm512_set1_pd(x); }
+    FYX_FORCE_INLINE static T    reduce_min(reg v) { return _mm512_reduce_min_pd(v); }
+    FYX_FORCE_INLINE static T    reduce_max(reg v) { return _mm512_reduce_max_pd(v); }
+    FYX_FORCE_INLINE static T    hi() { return (std::numeric_limits<T>::infinity)(); }
+    FYX_FORCE_INLINE static T    lo() { return -(std::numeric_limits<T>::infinity)(); }
+    template <unsigned J>
+    FYX_FORCE_INLINE static reg permute_xor(reg v) {
+        const __m512i idx = _mm512_set_epi64(
+            static_cast<long long>(7u ^ J), static_cast<long long>(6u ^ J),
+            static_cast<long long>(5u ^ J), static_cast<long long>(4u ^ J),
+            static_cast<long long>(3u ^ J), static_cast<long long>(2u ^ J),
+            static_cast<long long>(1u ^ J), static_cast<long long>(0u ^ J));
+        return _mm512_permutexvar_pd(idx, v);
+    }
+    FYX_FORCE_INLINE static reg blend(mask keepmin, reg mn, reg mx) { return _mm512_mask_blend_pd(keepmin, mx, mn); }
+};
+
+// ---------------------------------------------------------------------------
+// Leaf: the generic bitonic network over native values.
+// ---------------------------------------------------------------------------
+template <class T>
+struct VNetOps {
+    using P    = VOps<T>;
+    using Key  = T;
+    using Vec  = typename P::reg;
+    using Mask = typename P::mask;
+    static constexpr unsigned kLanes = static_cast<unsigned>(P::V);
+
+    FYX_FORCE_INLINE static Vec  load(const Key* p)   { return P::loadu(p); }
+    FYX_FORCE_INLINE static void store(Key* p, Vec v) { P::storeu(p, v); }
+    FYX_FORCE_INLINE static Vec  splat(Key k)         { return P::set1(k); }
+    FYX_FORCE_INLINE static Vec  min(Vec a, Vec b)    { return P::min(a, b); }
+    FYX_FORCE_INLINE static Vec  max(Vec a, Vec b)    { return P::max(a, b); }
+    FYX_FORCE_INLINE static Vec  load_partial(const Key* p, unsigned n, Key fill) {
+        const Mask m = static_cast<Mask>((1ull << n) - 1ull);
+        return P::mask_loadu(P::set1(fill), m, p);
+    }
+    FYX_FORCE_INLINE static void store_partial(Key* p, Vec v, unsigned n) {
+        P::mask_storeu(p, static_cast<Mask>((1ull << n) - 1ull), v);
+    }
+    template <unsigned J>
+    FYX_FORCE_INLINE static Vec permute_xor(Vec v) { return P::template permute_xor<J>(v); }
+    FYX_FORCE_INLINE static Vec blend(Mask keepmin, Vec mn, Vec mx) { return P::blend(keepmin, mn, mx); }
+};
+
+/// Like `network_sort_v`, but the padding sentinel comes from the policy (a
+/// float network must pad with +inf, not FLT_MAX) and the leaf may hold up to
+/// 16 vectors rather than 64 elements.
+template <class T, unsigned NV>
+FYX_FORCE_INLINE void vnet_sort_v(T* keys, std::size_t n) {
+    using Ops = VNetOps<T>;
+    using Vec = typename Ops::Vec;
+    constexpr unsigned L = Ops::kLanes;
+    const T sentinel = VOps<T>::hi();
+    Vec v[NV];
+    for (unsigned i = 0; i < NV; ++i) {
+        const std::size_t off = static_cast<std::size_t>(i) * L;
+        if (off + L <= n)  v[i] = Ops::load(keys + off);
+        else if (off < n)  v[i] = Ops::load_partial(keys + off, static_cast<unsigned>(n - off), sentinel);
+        else               v[i] = Ops::splat(sentinel);
+    }
+    BitonicVec<Ops, NV>::run(v);
+    for (unsigned i = 0; i < NV; ++i) {
+        const std::size_t off = static_cast<std::size_t>(i) * L;
+        if (off + L <= n)  Ops::store(keys + off, v[i]);
+        else if (off < n)  Ops::store_partial(keys + off, v[i], static_cast<unsigned>(n - off));
+    }
+}
+
+/// Leaf sort for n <= 16 vectors' worth of elements.
+template <class T>
+inline void vnet_sort(T* a, std::size_t n) {
+    constexpr unsigned L = static_cast<unsigned>(VOps<T>::V);
+    if (n < 2) return;
+    const std::size_t vecs = (static_cast<std::size_t>(next_pow2(n)) + L - 1) / L;
+    switch (vecs) {
+        case 1:  vnet_sort_v<T, 1>(a, n);  return;
+        case 2:  vnet_sort_v<T, 2>(a, n);  return;
+        case 4:  vnet_sort_v<T, 4>(a, n);  return;
+        case 8:  vnet_sort_v<T, 8>(a, n);  return;
+        case 16: vnet_sort_v<T, 16>(a, n); return;
+        default: break;
+    }
+    pdqsort(a, a + n, std::less<T>());
+}
+
+// ---------------------------------------------------------------------------
+// Partition
+// ---------------------------------------------------------------------------
+/// The high side takes `>= pivot` normally and `> pivot` in the Strict form,
+/// which is what separates a pivot-valued block from the rest.
+template <class T, bool Strict>
+FYX_FORCE_INLINE typename VOps<T>::mask vhigh_mask(typename VOps<T>::reg curr,
+                                                   typename VOps<T>::reg pivot) {
+    if constexpr (Strict) return VOps<T>::gt(curr, pivot);
+    else                  return VOps<T>::ge(curr, pivot);
+}
+
+template <class T, bool Strict>
+FYX_FORCE_INLINE void vpart_vec(T* a, std::size_t& ls, std::size_t& rs,
+                                typename VOps<T>::reg curr, typename VOps<T>::reg pivot,
+                                typename VOps<T>::reg& vmin, typename VOps<T>::reg& vmax) {
+    using P = VOps<T>;
+    const typename P::mask gek = vhigh_mask<T, Strict>(curr, pivot);
+    const int gc = static_cast<int>(popcount64(static_cast<std::uint64_t>(gek)));
+    P::compressstore(a + ls, static_cast<typename P::mask>(~gek), curr);
+    P::compressstore(a + rs - static_cast<std::size_t>(gc), gek, curr);
+    ls += static_cast<std::size_t>(P::V - gc);
+    rs -= static_cast<std::size_t>(gc);
+    vmin = P::min(vmin, curr);
+    vmax = P::max(vmax, curr);
+}
+
+template <class T, bool Strict>
+FYX_FORCE_INLINE void vpart_vec_masked(T* a, std::size_t& ls, std::size_t& rs,
+                                       typename VOps<T>::reg curr, typename VOps<T>::reg pivot,
+                                       typename VOps<T>::mask valid,
+                                       typename VOps<T>::reg& vmin, typename VOps<T>::reg& vmax) {
+    using P = VOps<T>;
+    const typename P::mask gek =
+        static_cast<typename P::mask>(vhigh_mask<T, Strict>(curr, pivot) & valid);
+    const typename P::mask ltk = static_cast<typename P::mask>((~gek) & valid);
+    const int gc = static_cast<int>(popcount64(static_cast<std::uint64_t>(gek)));
+    const int lc = static_cast<int>(popcount64(static_cast<std::uint64_t>(ltk)));
+    P::compressstore(a + ls, ltk, curr);
+    P::compressstore(a + rs - static_cast<std::size_t>(gc), gek, curr);
+    ls += static_cast<std::size_t>(lc);
+    rs -= static_cast<std::size_t>(gc);
+    vmin = P::mask_min(vmin, valid, vmin, curr);
+    vmax = P::mask_max(vmax, valid, vmax, curr);
+}
+
+/// Scalar partition for ranges too small to hold the two boundary vectors.
+template <class T, bool Strict>
+inline std::size_t vpartition_scalar(T* a, std::size_t n, T pivot, T& out_min, T& out_max) {
+    T mn = VOps<T>::hi();
+    T mx = VOps<T>::lo();
+    for (std::size_t i = 0; i < n; ++i) {
+        const T x = a[i];
+        mn = x < mn ? x : mn;
+        mx = mx < x ? x : mx;
+    }
+    std::size_t i = 0, j = n;
+    while (i < j) {
+        const bool low = Strict ? !(pivot < a[i]) : (a[i] < pivot);
+        if (low) { ++i; continue; }
+        --j;
+        const T t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    out_min = mn;
+    out_max = mx;
+    return i;
+}
+
+/// In-place partition of `a[0,n)` around `pivot`: everything `< pivot` moves
+/// to the front, everything `>= pivot` to the back, and the count of the
+/// former is returned.  `out_min`/`out_max` are the extremes of the whole
+/// range, which is what lets the caller prune a side that is all pivot.
+///
+/// `U` vectors are consumed per iteration; the side read from is selected
+/// without a branch (see the file header).
+template <class T, bool Strict = false, int U = 4>
+inline std::size_t vpartition(T* a, std::size_t n, T pivot, T& out_min, T& out_max) {
+    using P   = VOps<T>;
+    using reg = typename P::reg;
+    constexpr int V = P::V;
+    constexpr std::size_t CH = static_cast<std::size_t>(U) * V;
+
+    if (n < 2 * CH) {
+        if constexpr (U > 1) return vpartition<T, Strict, U / 2>(a, n, pivot, out_min, out_max);
+        else                 return vpartition_scalar<T, Strict>(a, n, pivot, out_min, out_max);
+    }
+
+    const reg pv = P::set1(pivot);
+    reg vmin = P::set1(P::hi());
+    reg vmax = P::set1(P::lo());
+
+    std::size_t l = 0, r = n;      // unread region [l, r)
+    std::size_t ls = 0, rs = n;    // free gap: [ls, l) on the left, [r, rs) on the right
+
+    // Lift the U boundary vectors on each side into registers to make room.
+    reg vl[U], vr[U];
+    for (int i = 0; i < U; ++i) vl[i] = P::loadu(a + static_cast<std::size_t>(i) * V);
+    for (int i = 0; i < U; ++i) vr[i] = P::loadu(a + n - static_cast<std::size_t>(i + 1) * V);
+    l += CH;
+    r -= CH;
+
+    // Reading from the side with less free space keeps at least CH free on
+    // both sides, which is what a worst-case split of one iteration needs.
+    while (r - l >= CH) {
+        const bool from_right = (rs - r) < (l - ls);
+        const std::size_t src = from_right ? (r - CH) : l;
+        reg cur[U];
+        for (int i = 0; i < U; ++i) cur[i] = P::loadu(a + src + static_cast<std::size_t>(i) * V);
+        r -= from_right ? CH : 0;
+        l += from_right ? 0 : CH;
+        for (int i = 0; i < U; ++i) vpart_vec<T, Strict>(a, ls, rs, cur[i], pv, vmin, vmax);
+    }
+    while (r - l >= static_cast<std::size_t>(V)) {
+        const bool from_right = (rs - r) < (l - ls);
+        const std::size_t src = from_right ? (r - V) : l;
+        const reg cur = P::loadu(a + src);
+        r -= from_right ? V : 0;
+        l += from_right ? 0 : V;
+        vpart_vec<T, Strict>(a, ls, rs, cur, pv, vmin, vmax);
+    }
+    if (r != l) {  // 0 < r - l < V; once these are read the gap is contiguous
+        const unsigned m = static_cast<unsigned>(r - l);
+        const typename P::mask valid = static_cast<typename P::mask>((1ull << m) - 1ull);
+        const reg cur = P::maskz_loadu(valid, a + l);
+        vpart_vec_masked<T, Strict>(a, ls, rs, cur, pv, valid, vmin, vmax);
+    }
+    for (int i = 0; i < U; ++i) vpart_vec<T, Strict>(a, ls, rs, vl[i], pv, vmin, vmax);
+    for (int i = 0; i < U; ++i) vpart_vec<T, Strict>(a, ls, rs, vr[i], pv, vmin, vmax);
+
+    out_min = P::reduce_min(vmin);
+    out_max = P::reduce_max(vmax);
+    return ls;
+}
+
+/// Pivot: two vectors' worth of strided samples, sorted in registers.
+template <class T>
+inline T vpick_pivot(const T* a, std::size_t n) {
+    constexpr int S = 2 * VOps<T>::V;
+    T s[S];
+    const std::size_t step = n / S;
+    for (int i = 0; i < S; ++i) s[i] = a[static_cast<std::size_t>(i) * step + (step >> 1)];
+    vnet_sort<T>(s, static_cast<std::size_t>(S));
+    return s[S / 2];
+}
+
+/// Leaf size: 16 vectors, i.e. 256 elements for 4-byte types and 128 for
+/// 8-byte ones (measured best of 64/128/256 for both widths).
+template <class T>
+struct VqLeaf {
+    static constexpr std::size_t value = 16u * static_cast<std::size_t>(VOps<T>::V);
+};
+
+template <class T>
+inline void vqsort_rec(T* a, std::size_t n, int budget) {
+    while (n > VqLeaf<T>::value) {
+        if (budget <= 0) {           // pathological splits: hand over to pdqsort
+            pdqsort(a, a + n, std::less<T>());
+            return;
+        }
+        --budget;
+        const T pivot = vpick_pivot<T>(a, n);
+        T lo, hi;
+        std::size_t split = vpartition<T>(a, n, pivot, lo, hi);
+        if (!(lo < pivot)) {
+            // The pivot is the range minimum, so the low side came out empty
+            // and splitting there again would not move.  Re-partition with the
+            // strict test instead: that puts the pivot-valued elements -- at
+            // least one, and they are already in their final place -- in front
+            // of everything else, so the range always shrinks.  Ranges where
+            // one value owns more than half the elements go this way.
+            if (!(pivot < hi)) return;          // the whole range is one value
+            T lo2, hi2;
+            const std::size_t eq = vpartition<T, true>(a, n, pivot, lo2, hi2);
+            a += eq;
+            n -= eq;
+            continue;
+        }
+        if (!(pivot < hi)) {          // the high side is all pivot: already done
+            n = split;
+            continue;
+        }
+        if (split < n - split) {      // recurse into the smaller side
+            vqsort_rec<T>(a, split, budget);
+            a += split;
+            n -= split;
+        } else {
+            vqsort_rec<T>(a + split, n - split, budget);
+            n = split;
+        }
+    }
+    vnet_sort<T>(a, n);
+}
+
+/// True when the range holds no NaN and no negative zero, i.e. when the
+/// hardware's floating-point order is the same total order the radix path
+/// would have produced.  Integers are always clean.
+template <class T>
+inline bool vrange_clean(const T* a, std::size_t n) {
+    if constexpr (!std::is_floating_point<T>::value) {
+        (void)a; (void)n;
+        return true;
+    } else if constexpr (sizeof(T) == 4) {
+        const std::size_t V = 16;
+        __mmask16 bad = 0;
+        const __m512i negzero = _mm512_set1_epi32(static_cast<int>(0x80000000u));
+        std::size_t i = 0;
+        for (; i + V <= n; i += V) {
+            const __m512 v = _mm512_loadu_ps(a + i);
+            bad = static_cast<__mmask16>(bad | _mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q));
+            bad = static_cast<__mmask16>(bad | _mm512_cmpeq_epi32_mask(_mm512_castps_si512(v), negzero));
+            if (bad) return false;
+        }
+        if (i < n) {
+            const __mmask16 k = static_cast<__mmask16>((1u << (n - i)) - 1u);
+            const __m512 v = _mm512_maskz_loadu_ps(k, a + i);
+            bad = static_cast<__mmask16>(bad | (k & _mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q)));
+            bad = static_cast<__mmask16>(bad | (k & _mm512_cmpeq_epi32_mask(_mm512_castps_si512(v), negzero)));
+        }
+        return bad == 0;
+    } else {
+        const std::size_t V = 8;
+        __mmask8 bad = 0;
+        const __m512i negzero = _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ull));
+        std::size_t i = 0;
+        for (; i + V <= n; i += V) {
+            const __m512d v = _mm512_loadu_pd(a + i);
+            bad = static_cast<__mmask8>(bad | _mm512_cmp_pd_mask(v, v, _CMP_UNORD_Q));
+            bad = static_cast<__mmask8>(bad | _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(v), negzero));
+            if (bad) return false;
+        }
+        if (i < n) {
+            const __mmask8 k = static_cast<__mmask8>((1u << (n - i)) - 1u);
+            const __m512d v = _mm512_maskz_loadu_pd(k, a + i);
+            bad = static_cast<__mmask8>(bad | (k & _mm512_cmp_pd_mask(v, v, _CMP_UNORD_Q)));
+            bad = static_cast<__mmask8>(bad | (k & _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(v), negzero)));
+        }
+        return bad == 0;
+    }
+}
+
+} // namespace isa_avx512
+} // namespace detail
+} // namespace fyx
+FYX_ISA_END
+
+#endif // FYX_HAS_AVX512_CODE
+
+namespace fyx {
+namespace detail {
+
+/// Types the vectorised quicksort has a kernel for.
+template <class T>
+struct vqsort_kernel_supported : std::integral_constant<bool,
+#if FYX_HAS_AVX512_CODE
+    std::is_same<T, std::int32_t>::value  || std::is_same<T, std::uint32_t>::value ||
+    std::is_same<T, std::int64_t>::value  || std::is_same<T, std::uint64_t>::value ||
+    std::is_same<T, float>::value         || std::is_same<T, double>::value
+#else
+    false
+#endif
+> {};
+
+template <class T>
+inline constexpr bool vqsort_kernel_supported_v = vqsort_kernel_supported<T>::value;
+
+/// One partition step, for callers that want to drive the recursion
+/// themselves (the parallel driver).  `left_done`/`right_done` mark a side
+/// that holds one value only and therefore needs no sort.  `split` is always
+/// a real reduction: see the strict re-partition in vqsort_rec.
+struct VqStep {
+    std::size_t split      = 0;
+    bool        left_done  = false;
+    bool        right_done = false;
+};
+
+#if FYX_HAS_AVX512_CODE
+
+template <class T>
+inline bool vqsort_range_clean(const T* p, std::size_t n) {
+    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; return false; }
+    else return isa_avx512::vrange_clean<T>(p, n);
+}
+
+/// Depth budget: 2 log2(n) partitions is what a correct pivot stream needs;
+/// past that the range goes to pdqsort, which has its own introsort guard.
+inline int vqsort_budget(std::size_t n) {
+    int budget = 2;
+    for (std::size_t m = n; m > 1; m >>= 1) budget += 2;
+    return budget;
+}
+
+template <class T>
+inline void vqsort_serial(T* p, std::size_t n) {
+    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; }
+    else isa_avx512::vqsort_rec<T>(p, n, vqsort_budget(n));
+}
+
+template <class T>
+inline void vqsort_serial_budget(T* p, std::size_t n, int budget) {
+    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; (void)budget; }
+    else isa_avx512::vqsort_rec<T>(p, n, budget);
+}
+
+template <class T>
+inline VqStep vqsort_partition_step(T* p, std::size_t n) {
+    VqStep out;
+    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; return out; }
+    else {
+        const T pivot = isa_avx512::vpick_pivot<T>(p, n);
+        T lo, hi;
+        out.split = isa_avx512::vpartition<T>(p, n, pivot, lo, hi);
+        if (!(lo < pivot)) {                    // pivot is the range minimum
+            if (!(pivot < hi)) {                // ... and its maximum
+                out.split      = n;
+                out.left_done  = true;
+                out.right_done = true;
+                return out;
+            }
+            T lo2, hi2;
+            out.split     = isa_avx512::vpartition<T, true>(p, n, pivot, lo2, hi2);
+            out.left_done = true;               // the prefix is all pivot
+            return out;
+        }
+        out.right_done = !(pivot < hi);
+        return out;
+    }
+}
+
+/// Leaf size of the kernel, exported so drivers can stop splitting in time.
+template <class T>
+inline constexpr std::size_t vqsort_leaf() {
+#if FYX_HAS_AVX512_CODE
+    if constexpr (vqsort_kernel_supported_v<T>) return isa_avx512::VqLeaf<T>::value;
+    else return 0;
+#else
+    return 0;
+#endif
+}
+
+#else  // no AVX-512 kernel compiled in
+
+template <class T> inline bool   vqsort_range_clean(const T*, std::size_t) { return false; }
+inline int                       vqsort_budget(std::size_t) { return 0; }
+template <class T> inline void   vqsort_serial(T*, std::size_t) {}
+template <class T> inline void   vqsort_serial_budget(T*, std::size_t, int) {}
+template <class T> inline VqStep vqsort_partition_step(T*, std::size_t) { return VqStep{}; }
+template <class T> inline constexpr std::size_t vqsort_leaf() { return 0; }
+
+#endif // FYX_HAS_AVX512_CODE
+
+/// Which types the vector quicksort is actually *faster* on than the radix
+/// family, measured on this machine at 1M and 8M random elements, serial and
+/// parallel (see BENCHMARKS.md):
+///
+///   int32   radix 0.0070 -> vq 0.0044 s (8M serial)   take it
+///   float   radix 0.147  -> vq 0.038  s (8M serial)   take it
+///   double  radix 0.114  -> vq 0.088  s (8M serial)   take it
+///   int64   radix 0.089  -> vq 0.096  s (8M serial)   keep radix
+///
+/// 64-bit integers are the one case where the radix family already wins: they
+/// have the high-prefix kernel, which sorts a 24-26 bit prefix in two passes
+/// and repairs the ties, so it pays for fewer passes than the quicksort pays
+/// for levels.  Floating point has no such shortcut (the prefix carries the
+/// exponent, so its groups are large), and neither does int32 at three passes.
+template <class T>
+inline constexpr bool vqsort_preferred() {
+    return std::is_same<T, std::int32_t>::value || std::is_same<T, std::uint32_t>::value ||
+           std::is_same<T, float>::value        || std::is_same<T, double>::value;
+}
+
+/// Runtime gate: the kernel exists for this type, the CPU has AVX-512, and
+/// the range is big enough for the vector partition to pay for itself.
+template <class T>
+inline bool vqsort_usable(std::size_t n) {
+    if constexpr (!vqsort_kernel_supported_v<T>) { (void)n; return false; }
+    else return use_avx512() && n > vqsort_leaf<T>();
+}
+
+} // namespace detail
+} // namespace fyx
+
+// ============================================================================
 //  Section 11 -- Parallel execution engine
 //
 //  A lazily-initialised thread pool over Chase-Lev work-stealing deques.
@@ -5170,6 +5902,7 @@ inline void parallel_sample_sort_arithmetic64_top(It first, It last, Comp comp, 
 template <class It, class Comp>
 inline void parallel_sample_sort(It first, It last, Comp comp) {
     using T = typename std::iterator_traits<It>::value_type;
+    FYX_UNUSED_TYPE(T);        // only the v2 top-level split looks at it
     const std::size_t n = static_cast<std::size_t>(last - first);
     unsigned depth = static_cast<unsigned>(2 * log2_floor(static_cast<std::uint64_t>(n ? n : 1)) + 8);
 #if FYX_SAMPLE_SORT_V2
@@ -5377,7 +6110,6 @@ inline bool try_natural_run_merge(T* p, std::size_t n, Comp comp,
         std::vector<std::size_t> next(count + 1);
         bounds[0] = 0;
         for (std::size_t i = 0; i < count; ++i) bounds[i + 1] = runbuf[i].end;
-        std::size_t nruns = count;
         std::size_t levels = 0;
         std::size_t maxbuf = 1;
         {
@@ -5642,12 +6374,13 @@ inline bool try_dirty_patch_merge(T* p, std::size_t n, Comp comp,
 /// Budget wrapper: disorder beyond an eighth of the range is no longer "local",
 /// and the patch sort stops being cheaper than the kernels it replaces.
 template <class T, class Comp>
-inline bool try_dirty_patch_merge_adaptive(T* p, std::size_t n, Comp comp) {
+inline bool try_dirty_patch_merge_adaptive(T* p, std::size_t n, Comp comp,
+                                           std::size_t max_dirty = 0) {
 #if !FYX_ENABLE_ADAPTIVE_WEAPONS
-    (void)p; (void)n; (void)comp;
+    (void)p; (void)n; (void)comp; (void)max_dirty;
     return false;
 #else
-    return try_dirty_patch_merge(p, n, comp, n / 8);
+    return try_dirty_patch_merge(p, n, comp, max_dirty ? max_dirty : n / 8);
 #endif
 }
 
@@ -5753,12 +6486,13 @@ inline bool try_displacement_patch_merge(T* p, std::size_t n, Comp comp,
 }
 
 template <class T, class Comp>
-inline bool try_displacement_patch_merge_adaptive(T* p, std::size_t n, Comp comp) {
+inline bool try_displacement_patch_merge_adaptive(T* p, std::size_t n, Comp comp,
+                                                  std::size_t max_dirty = 0) {
 #if !FYX_ENABLE_ADAPTIVE_WEAPONS
-    (void)p; (void)n; (void)comp;
+    (void)p; (void)n; (void)comp; (void)max_dirty;
     return false;
 #else
-    return try_displacement_patch_merge(p, n, comp, n / 8);
+    return try_displacement_patch_merge(p, n, comp, max_dirty ? max_dirty : n / 8);
 #endif
 }
 
@@ -6226,7 +6960,7 @@ template <class T, class Comp>
 inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp,
                                           bool thorough = false) {
 #if !FYX_USE_PDQ_PARTITION
-    (void)p; (void)n; (void)comp;
+    (void)p; (void)n; (void)comp; (void)thorough;
     return false;
 #else
     if (n < std::size_t(1024)) return false;
@@ -6556,12 +7290,19 @@ inline bool try_nearly_sorted_repair(T* p, std::size_t n, Comp comp) {
 }
 
 
+/// `patch_dirty_max` caps how much disorder the patch merges may take on:
+/// kPatchDirtyDefault leaves their own budget of n/8, zero skips them.
+/// Callers that hold a kernel which scales better than three sequential
+/// passes lower it -- see patch_merge_dirty_budget.
 template <class T, class Comp>
-inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
+inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp,
+                                              std::size_t patch_dirty_max = kPatchDirtyDefault) {
 #if !FYX_USE_PDQ_PARTITION
-    (void)p; (void)n; (void)comp;
+    (void)p; (void)n; (void)comp; (void)patch_dirty_max;
     return false;
 #else
+    const std::size_t patch_max =
+        (patch_dirty_max == kPatchDirtyDefault) ? n / 8 : patch_dirty_max;
     if (try_adjacent_swap_repair(p, n, comp)) return true;
     // Insertion costs one pass plus the distance the displaced elements
     // actually travel, so it is the cheapest repair that exists for shapes
@@ -6578,12 +7319,12 @@ inline bool try_partially_sorted_local_repair(T* p, std::size_t n, Comp comp) {
     // passes instead of 4-8 radix passes, and it is width-independent, so
     // int64/double gain the most.  Densely disordered input is rejected after
     // touching about an eighth of the range, before anything is moved.
-    if (try_dirty_patch_merge_adaptive(p, n, comp)) return true;
+    if (patch_max && try_dirty_patch_merge_adaptive(p, n, comp, patch_max)) return true;
     // Adjacent inversions cannot see a block that was moved wholesale: every
     // element inside it is still in order.  The prefix-max / suffix-min
     // characterisation finds those, so spliced / block-moved inputs also cost
     // a couple of linear passes instead of a full sort.
-    if (try_displacement_patch_merge_adaptive(p, n, comp)) return true;
+    if (patch_max && try_displacement_patch_merge_adaptive(p, n, comp, patch_max)) return true;
     if (try_nearly_sorted_insertion_repair(p, n, comp)) return true;
     return false;
 #endif
@@ -6624,7 +7365,6 @@ inline void pdqsort_for_profile_pattern(T* p, std::size_t n, Comp comp) {
         (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
     if constexpr (radix_order && std::is_floating_point<T>::value) {
         using RT = RadixTraits<T>;
-        using Key = typename RT::Key;
         if constexpr (is_descending_v<Comp, T>) {
             pdqsort(p, p + n, [](const T& a, const T& b) {
                 return RT::encode(b) < RT::encode(a);
@@ -7546,6 +8286,42 @@ inline bool try_bitonic_runs_sort(T* p, std::size_t n, Comp comp) {
 }
 
 template <class T>
+inline bool try_radix_key_sparse_count_sort(T* p, std::size_t n, bool descending);
+template <class Key>
+FYX_FORCE_INLINE std::size_t low_card_hash_key(Key k) noexcept;
+
+/// Distinct radix keys in an evenly spaced sample, counted exactly up to
+/// `cap` (the return is `cap + 1` when there are more).  Used to tell "a
+/// handful of values spread over a wide range" from "a value at every point of
+/// a narrow range": the two want different counting kernels, and the range
+/// alone cannot distinguish them.
+template <class T>
+inline std::size_t sample_distinct_keys(const T* p, std::size_t n, std::size_t cap) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr std::size_t kSlots = 1024;              // >= 2x the 256+1 cap
+    constexpr std::size_t kMask  = kSlots - 1;
+    Key          slot[kSlots];
+    std::uint8_t used[kSlots];
+    for (std::size_t i = 0; i < kSlots; ++i) used[i] = 0;
+
+    const std::size_t sample_n = std::min<std::size_t>(n, kProfileSampleLimit);
+    std::size_t distinct = 0;
+    for (std::size_t j = 0; j < sample_n; ++j) {
+        const std::size_t idx = (j * n) / sample_n;
+        const Key k = RT::encode(p[idx]);
+        std::size_t h = low_card_hash_key(k) & kMask;
+        while (used[h] && slot[h] != k) h = (h + 1) & kMask;
+        if (!used[h]) {
+            used[h] = 1;
+            slot[h] = k;
+            if (++distinct > cap) return cap + 1;
+        }
+    }
+    return distinct;
+}
+
+template <class T>
 inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending) {
     if constexpr (!(std::is_integral<T>::value && !std::is_same<T, bool>::value && radix_supported_v<T>)) {
         (void)p; (void)n; (void)descending;
@@ -7554,6 +8330,30 @@ inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending) {
         if (n < kCountingMinN) return false;
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
+
+        // Same crossover as the parallel kernel: a handful of values spread
+        // over a wide range belongs to the sparse counter, which finds them by
+        // value instead of paying for every slot between them.  Checked on the
+        // sample, before the min/max scan, so declining costs one pass less.
+        {
+            const std::size_t dhat = sample_distinct_keys(p, n, kCountingClassLimit);
+            if (dhat <= kCountingClassLimit) {
+                Key smn = RT::encode(p[0]), smx = smn;
+                const std::size_t sample_n = std::min<std::size_t>(n, kProfileSampleLimit);
+                for (std::size_t j = 1; j < sample_n; ++j) {
+                    const Key k = RT::encode(p[(j * n) / sample_n]);
+                    if (k < smn) smn = k;
+                    if (smx < k) smx = k;
+                }
+                const unsigned long long srange =
+                    static_cast<unsigned long long>(static_cast<Key>(smx - smn)) + 1ull;
+                const unsigned long long spread = sizeof(T) <= 4 ? 64ull : 256ull;
+                if (srange >= 32768ull &&
+                    srange > spread * static_cast<unsigned long long>(dhat)) {
+                    if (try_radix_key_sparse_count_sort(p, n, descending)) return true;
+                }
+            }
+        }
 
         T mn = p[0], mx = p[0];
         for (std::size_t i = 1; i < n; ++i) {
@@ -7566,7 +8366,16 @@ inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending) {
         const Key span = static_cast<Key>(hi - lo);
         if (span == std::numeric_limits<Key>::max()) return false;
 
-        const std::size_t adaptive = std::max<std::size_t>(std::size_t(4096), n);
+        // Dense counting is O(n + range): it wins while the range is small
+        // beside n and loses badly once they are comparable (4M int32 over a
+        // 2^22 range: 0.028 s counting, 0.016 s vectorised quicksort; over a
+        // 2^18 range: 0.013 s counting, 0.019 s quicksort).  Where a quicksort
+        // kernel exists for the type, hand the wide half of that trade to it;
+        // where it does not, counting is still better than the alternatives.
+        const std::size_t adaptive =
+            (vqsort_preferred<T>() && vqsort_usable<T>(n))
+                ? std::max<std::size_t>(std::size_t(4096), n / 8)
+                : std::max<std::size_t>(std::size_t(4096), n);
         const std::size_t limit    = std::min<std::size_t>(kCountingRangeLimit, adaptive);
         const unsigned long long range64 = static_cast<unsigned long long>(span) + 1ull;
         if (range64 > static_cast<unsigned long long>(limit)) return false;
@@ -7631,7 +8440,6 @@ FYX_FORCE_INLINE std::size_t low_card_hash_key(Key k) noexcept {
 // ---------------------------------------------------------------------------
 
 inline constexpr std::size_t kProfileMinN            = 1024;
-inline constexpr std::size_t kProfileSampleLimit     = 1024;
 inline constexpr std::size_t kProfilePartialDivisor  = 64;
 inline constexpr std::size_t kProfilePartialPdqMax   = 64u << 20;
 
@@ -7644,6 +8452,7 @@ enum class DispatchDecision : unsigned char {
     LowCardinality,
     PartialPdq,
     Radix,
+    VectorQuick,
     Sample,
     ParallelSample,
     Pdq
@@ -11212,8 +12021,27 @@ FYX_NOINLINE inline bool try_integer_range_count_sort_parallel(T* p, std::size_t
         const Key sample_span = static_cast<Key>(smx - smn);
         if (sample_span == std::numeric_limits<Key>::max()) return false;
         const unsigned long long sample_range64 = static_cast<unsigned long long>(sample_span) + 1ull;
-        if (sample_range64 < 2ull ||
-            sample_range64 > static_cast<unsigned long long>(MaxParallelRange)) return false;
+        const unsigned long long range_cap =
+            (vqsort_preferred<T>() && vqsort_usable<T>(n))
+                ? std::min<unsigned long long>(MaxParallelRange,
+                      std::max<unsigned long long>(4096ull, n / 8))
+                : MaxParallelRange;
+        if (sample_range64 < 2ull || sample_range64 > range_cap) return false;
+
+        // A wide range with few values in it is the sparse counter's shape,
+        // not this one's.  Dense counting pays for every slot of the range in
+        // every chunk -- 16 values spread over 61440 (1M int64, the matrix's
+        // lowcard16 shape) means 61440 counters per chunk cleared, summed and
+        // walked, and it measures 0.0021 s against the sparse counter's
+        // 0.0013.  Below the crossover the dense kernel is the faster one and
+        // keeps the work, and if the sample underestimated the value count the
+        // sparse kernel declines after validating and control returns here.
+        const std::size_t dhat = sample_distinct_keys(p, n, kCountingClassLimit);
+        const unsigned long long spread = sizeof(T) <= 4 ? 64ull : 256ull;
+        if (sample_range64 >= 32768ull && dhat <= kCountingClassLimit &&
+            sample_range64 > spread * static_cast<unsigned long long>(dhat)) {
+            if (try_radix_key_sparse_count_sort_parallel(p, n, descending)) return true;
+        }
 
         const std::size_t chunks = adaptive_parallel_chunks(n);
         if ((n + chunks - 1) / chunks >
@@ -11904,6 +12732,109 @@ inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Vectorised quicksort driver (parts/10b_vsort.hpp holds the kernel)
+// ---------------------------------------------------------------------------
+
+#if FYX_ENABLE_PARALLEL
+/// Partition at the top, then hand the two sides to the pool.  The partition
+/// itself is sequential -- a parallel partition needs a second array and a
+/// prefix-sum round, which costs more than it saves at two workers -- so the
+/// speedup ceiling is Amdahl over the first `depth` levels.  With two workers
+/// and three levels that is ~1.8x, which is what it measures.
+template <class T>
+inline void vqsort_parallel_rec(T* p, std::size_t n, int budget, unsigned depth) {
+    // Below this a task costs more than the sort it carries.
+    constexpr std::size_t kMinParTask = std::size_t(1) << 16;
+    while (true) {
+        if (depth == 0 || budget <= 0 || n < kMinParTask) {
+            vqsort_serial_budget(p, n, budget);
+            return;
+        }
+        const VqStep st = vqsort_partition_step(p, n);
+        --budget;
+        if (st.left_done && st.right_done) return;
+        if (st.left_done)  { p += st.split; n -= st.split; continue; }
+        if (st.right_done) { n = st.split; continue; }
+        T* const rp = p + st.split;
+        const std::size_t ln = st.split;
+        const std::size_t rn = n - st.split;
+        const int nb = budget;
+        const unsigned nd = depth - 1;
+        fork_join([=] { vqsort_parallel_rec(p, ln, nb, nd); },
+                  [=] { vqsort_parallel_rec(rp, rn, nb, nd); });
+        return;
+    }
+}
+#endif
+
+/// How much disorder the patch merges may repair before the vectorised
+/// quicksort becomes the better buy.  They pull the dirty positions out, sort
+/// them and merge them back -- three sequential passes that move every element
+/// at least twice, plus a sort of the patch, so their cost climbs with the
+/// amount of dirt while the quicksort's does not.  The crossovers below are
+/// measured, not guessed (random long-distance swaps, this machine):
+///
+/// 4M int32, sorted then a percentage of positions swapped at random:
+///
+///   swapped   patch merge   quicksort seq   quicksort pooled
+///    0.02%      0.0077          0.0178           ~0.011
+///    0.1%       0.0123          0.0169            0.0115
+///    0.3%       0.0150          0.0169            ~0.011
+///    1%         0.0265          0.0202            0.0108
+///
+/// Sequentially the patch merge holds on until the patch itself is expensive
+/// to sort, around half a percent; pooled, the quicksort takes over four times
+/// earlier because it is the only one of the two that uses the second core.
+/// The patch merge's own dirty count for those rows falls between n/256 and
+/// n/128 at 0.1% and above n/32 at 1%, which is what these two budgets pick
+/// out.  Declining is cheap either way (0.0005-0.002 s here).  The cheap
+/// repairs (adjacent-swap, bounded insertion) are never affected: they cost a
+/// fraction of a pass and beat both.
+template <class T>
+inline std::size_t patch_merge_dirty_budget(std::size_t n, bool parallel) {
+    if (!(vqsort_preferred<T>() && vqsort_usable<T>(n))) return kPatchDirtyDefault;
+#if FYX_ENABLE_PARALLEL
+    if (parallel && parallel_available()) return n / 256;
+#else
+    (void)parallel;
+#endif
+    return n / 64;
+}
+
+/// Sorts `p[0,n)` with the AVX-512 vectorised quicksort, or returns false and
+/// leaves the range untouched.  Declines when: the type has no kernel, the CPU
+/// has no AVX-512, the range is too small for the vector partition, the radix
+/// family is faster for the type, or -- for floating point -- the range holds
+/// a NaN or a -0, whose total order the hardware compare cannot reproduce.
+template <class T>
+inline bool try_vector_quicksort(T* p, std::size_t n, bool descending, bool parallel) {
+    if constexpr (!vqsort_kernel_supported_v<T>) {
+        (void)p; (void)n; (void)descending; (void)parallel;
+        return false;
+    } else {
+        if (!vqsort_preferred<T>()) return false;
+        if (!vqsort_usable<T>(n)) return false;
+        if (n < kVqsortMinN) return false;
+        if (!vqsort_range_clean(p, n)) return false;
+#if FYX_ENABLE_PARALLEL
+        if (parallel && parallel_available()) {
+            unsigned depth = 0;
+            for (unsigned w = global_pool().nworkers(); w > 1; w >>= 1) ++depth;
+            depth += 2;                       // a few extra levels for balance
+            vqsort_parallel_rec(p, n, vqsort_budget(n), depth);
+        } else {
+            vqsort_serial(p, n);
+        }
+#else
+        (void)parallel;
+        vqsort_serial(p, n);
+#endif
+        if (descending) std::reverse(p, p + n);
+        return true;
+    }
+}
+
 template <class T, class Comp>
 inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
                     const InputProfile<T, Comp>* known_profile) {
@@ -11977,6 +12908,11 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
         }
         if (partial_pdq && try_partially_sorted_local_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
         if (try_radix_permutation_range_sort(p, n, descending)) { record_dispatch(DispatchDecision::Radix); return; }
+        // A narrow value range is not the same property as a low value count:
+        // 4M int32 drawn from 2^18 values is high-entropy by every sample and
+        // still sorts fastest by counting.  Both range kernels self-gate on
+        // range vs n, so this costs a sample when it declines.
+        if (high_entropy && try_integer_range_count_sort(p, n, descending)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         if constexpr (radix_type) {
             if (n >= kRadixThreshold || std::is_floating_point<T>::value) {
 #if FYX_ENABLE_PARALLEL
@@ -11984,6 +12920,10 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
                 // measured -- 1M int32: 0.0090s against 0.0120s, 8M: 0.080s
                 // against 0.154s -- so it goes first and the wide sort is the
                 // fallback for the shapes whose prefix it declines.
+                if (try_vector_quicksort(p, n, descending, false)) {
+                    record_dispatch(DispatchDecision::VectorQuick);
+                    return;
+                }
                 if (high_entropy && try_serial_radix_high_prefix_sort(p, n, descending)) {
                     record_dispatch(DispatchDecision::Radix);
                     return;
@@ -12029,6 +12969,23 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
     record_dispatch(DispatchDecision::Pdq);
 }
 
+
+// The moving merge below is used by both the parallel merge and the sequential
+// stable merge sort, so it must stay outside the parallel guard.
+/// The same stable merge as std::merge -- equal elements keep the order of the
+/// first run -- except that it moves.  std::merge assigns through a const
+/// lvalue, which a move-only payload (std::unique_ptr, say) cannot take, and
+/// that used to make the parallel merge refuse to compile for them.
+template <class T, class Comp>
+inline void merge_runs_moving(T* a, std::size_t n1, T* b, std::size_t n2, T* dst, Comp comp) {
+    std::size_t i = 0, j = 0, w = 0;
+    while (i != n1 && j != n2) {
+        if (comp(b[j], a[i])) dst[w++] = std::move(b[j++]);
+        else                  dst[w++] = std::move(a[i++]);
+    }
+    while (i != n1) dst[w++] = std::move(a[i++]);
+    while (j != n2) dst[w++] = std::move(b[j++]);
+}
 
 #if FYX_ENABLE_PARALLEL
 
@@ -12221,21 +13178,6 @@ inline bool try_msd_radix_bucket_sort(T* p, std::size_t n, bool descending) {
     }
 }
 
-/// The same stable merge as std::merge -- equal elements keep the order of the
-/// first run -- except that it moves.  std::merge assigns through a const
-/// lvalue, which a move-only payload (std::unique_ptr, say) cannot take, and
-/// that used to make the parallel merge refuse to compile for them.
-template <class T, class Comp>
-inline void merge_runs_moving(T* a, std::size_t n1, T* b, std::size_t n2, T* dst, Comp comp) {
-    std::size_t i = 0, j = 0, w = 0;
-    while (i != n1 && j != n2) {
-        if (comp(b[j], a[i])) dst[w++] = std::move(b[j++]);
-        else                  dst[w++] = std::move(a[i++]);
-    }
-    while (i != n1) dst[w++] = std::move(a[i++]);
-    while (j != n2) dst[w++] = std::move(b[j++]);
-}
-
 template <class T, class Comp>
 inline void parallel_merge_to_buffer_rec(T* src,
                                          std::size_t a0, std::size_t a1,
@@ -12312,8 +13254,16 @@ inline void parallel_sort_ptr(T* p, std::size_t n, Comp comp, bool descending,
     const std::size_t mid = n / 2;
     fork_join([&] { sort_st(p, mid, comp, descending); },
               [&] { sort_st(p + mid, n - mid, comp, descending); });
-    if (!parallel_merge_buffered(p, mid, n, comp))
-        std::inplace_merge(p, p + mid, p + n, comp);
+    // The two halves come back in the order sort_st produces, which for
+    // floating point with a default comparator is the radix total order:
+    // -NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN.  Merging them with the
+    // raw comparator instead would compare NaN with `<`, which is false both
+    // ways, and interleave the two halves wrongly -- 70000 floats holding
+    // NaNs came out with three inversions.  adaptive_order is the same
+    // comparator everywhere else.
+    auto order = adaptive_order<T>(comp);
+    if (!parallel_merge_buffered(p, mid, n, order))
+        std::inplace_merge(p, p + mid, p + n, order);
 }
 #endif
 
@@ -12485,12 +13435,30 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
     }
     if (n <= detail::kProfilePartialPdqMax && detail::pdq_preferred_order_sample(p, n, comp)) {
         if (radix_ok) {
-            if (detail::try_partially_sorted_local_repair(p, n, comp)) {
+#if FYX_ENABLE_PARALLEL
+            const bool par_here = detail::dynamic_parallel_allowed<T>(n, o);
+#else
+            const bool par_here = false;
+#endif
+            const std::size_t patch_budget = detail::patch_merge_dirty_budget<T>(n, par_here);
+            if (detail::try_partially_sorted_local_repair(p, n, comp, patch_budget)) {
                 detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                 return;
             }
             if (detail::try_radix_permutation_range_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
+            if (detail::try_vector_quicksort(p, n, descending, par_here)) {
+                detail::record_dispatch(detail::DispatchDecision::VectorQuick);
+                return;
+            }
+            // The quicksort declined (no AVX-512, a NaN in the range, ...):
+            // the patch merges are the best thing left, so give them the turn
+            // that was held back for it.
+            if (patch_budget != detail::kPatchDirtyDefault &&
+                detail::try_partially_sorted_local_repair(p, n, comp)) {
+                detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                 return;
             }
             // Numeric long-distance nearly-sorted inputs should not pay the
@@ -12559,7 +13527,17 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             n <= detail::kProfilePartialPdqMax;
         if (partial_pdq && !(prof && prof->is_low_cardinality)) {
             if (radix_ok) {
-                if (detail::try_partially_sorted_local_repair(p, n, comp)) {
+                const std::size_t patch_budget = detail::patch_merge_dirty_budget<T>(n, want_parallel);
+                if (detail::try_partially_sorted_local_repair(p, n, comp, patch_budget)) {
+                    detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                    return;
+                }
+                if (detail::try_vector_quicksort(p, n, descending, want_parallel)) {
+                    detail::record_dispatch(detail::DispatchDecision::VectorQuick);
+                    return;
+                }
+                if (patch_budget != detail::kPatchDirtyDefault &&
+                detail::try_partially_sorted_local_repair(p, n, comp)) {
                     detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                     return;
                 }
@@ -12612,6 +13590,10 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             }
             if (partial_pdq && detail::try_partially_sorted_local_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
             if (detail::try_radix_permutation_range_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
+            // See sort_st: narrow range is not low cardinality, and the range
+            // kernels self-gate, so high-entropy input gets a chance too.
+            if (high_entropy && detail::try_integer_range_count_sort_parallel(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
+            if (detail::try_vector_quicksort(p, n, descending, true)) { detail::record_dispatch(detail::DispatchDecision::VectorQuick); return; }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_parallel_radix32_wide_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (high_entropy && detail::try_msd_radix_bucket_sort(p, n, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
@@ -12641,6 +13623,10 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             const bool high_entropy = prof && prof->is_high_entropy;
             if (detail::try_radix_permutation_range_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::Radix);
+                return;
+            }
+            if (detail::try_vector_quicksort(p, n, descending, true)) {
+                detail::record_dispatch(detail::DispatchDecision::VectorQuick);
                 return;
             }
             if (high_entropy && detail::try_parallel_radix_high_prefix_sort(p, n, descending)) {
@@ -12794,6 +13780,12 @@ inline bool try_buffered_iter_sort(It first, It last, Comp comp, const Options& 
         return false;
     } else {
         std::vector<T> buf;
+        // Without exceptions there is nothing to catch: an allocation that
+        // cannot be served terminates, and a move that cannot be made cannot
+        // report it.  The recovery arms below exist to leave the range holding
+        // every element it started with, which is only reachable when a throw
+        // is possible in the first place.
+#if FYX_HAS_EXCEPTIONS
         try {
             buf.reserve(n);
         } catch (...) {
@@ -12814,6 +13806,11 @@ inline bool try_buffered_iter_sort(It first, It last, Comp comp, const Options& 
             for (std::size_t i = 0; i < n; ++i) { *out = std::move(buf[i]); ++out; }
             throw;
         }
+#else
+        buf.reserve(n);
+        for (It it = first; it != last; ++it) buf.push_back(std::move(*it));
+        sort_pointer_core(buf.data(), buf.size(), comp, o);
+#endif
         It out = first;
         for (std::size_t i = 0; i < n; ++i) { *out = std::move(buf[i]); ++out; }
         return true;
@@ -13117,13 +14114,23 @@ inline void nth_element(Container& c, std::size_t nth_n) {
 //  these from C, compile one .cpp that #includes this header and references
 //  the symbols; they are emitted with external C linkage there.
 // ===========================================================================
+// The wrappers report failure through the return value, so with exceptions
+// switched off (-fno-exceptions / FYX_NO_EXCEPTIONS) they simply call through:
+// the library's own out-of-memory handling degrades to the in-place kernels
+// there, and nothing else can throw.
+#if FYX_HAS_EXCEPTIONS
+#  define FYX_C_ABI_BODY(call) try { call; return 0; } catch (...) { return -1; }
+#else
+#  define FYX_C_ABI_BODY(call) call; return 0;
+#endif
+
 extern "C" {
-inline int fyx_sort_int32 (std::int32_t*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_uint32(std::uint32_t* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_int64 (std::int64_t*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_uint64(std::uint64_t* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_float (float*  d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
-inline int fyx_sort_double(double* d, std::size_t n) noexcept { try { fyx::sort(d, n); return 0; } catch (...) { return -1; } }
+inline int fyx_sort_int32 (std::int32_t*  d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_uint32(std::uint32_t* d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_int64 (std::int64_t*  d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_uint64(std::uint64_t* d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_float (float*  d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
+inline int fyx_sort_double(double* d, std::size_t n) noexcept { FYX_C_ABI_BODY(fyx::sort(d, n)) }
 }
 
 // ===========================================================================
@@ -13254,7 +14261,7 @@ inline std::string gpu_radix_kernel_src(std::size_t key_bytes) {
                       : key_bytes == 2 ? "unsigned short"
                       :                  "unsigned char";
     return std::string(R"CUDA(
-extern "C" __global__ void fyx_hist(const )") + ktype + R"CUDA( *__restrict__ in,
+extern "C" __global__ void fyx_hist(const )CUDA") + ktype + R"CUDA( *__restrict__ in,
                                   unsigned int* __restrict__ hist,
                                   unsigned int shift, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -13262,8 +14269,8 @@ extern "C" __global__ void fyx_hist(const )") + ktype + R"CUDA( *__restrict__ in
     unsigned int d = (unsigned int)((in[i] >> shift) & 0xFFu);
     atomicAdd(&hist[d], 1u);
 }
-extern "C" __global__ void fyx_scatter(const )") + ktype + R"CUDA( *__restrict__ in,
-                                    )" + ktype + R"CUDA( *__restrict__ out,
+extern "C" __global__ void fyx_scatter(const )CUDA" + ktype + R"CUDA( *__restrict__ in,
+                                    )CUDA" + ktype + R"CUDA( *__restrict__ out,
                                     unsigned int* __restrict__ base,
                                     unsigned int shift, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -13285,8 +14292,12 @@ inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp, const Options&) {
     if (!s.ok) return false;   // no driver -> CPU fallback
 
 #if defined(FYX_GPU_COMPUTE)
-    // UNVERIFIED ON THIS BOX (no GPU).  Wrapped so any failure falls back.
+    // UNVERIFIED ON THIS BOX (no GPU).  Wrapped so any failure falls back;
+    // with exceptions switched off there is nothing to wrap, and every error
+    // path here already returns false explicitly.
+#if FYX_HAS_EXCEPTIONS
     try {
+#endif
         CUdevice dev = 0;
         CUcontext ctx = nullptr;
         if (s.cuInit(0) != 0) return false;
@@ -13313,7 +14324,7 @@ inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp, const Options&) {
             const char* opts[] = { "--gpu-architecture=compute_70" };
             if (s.nvrtcCompileProgram(prog, 1, opts) != 0)
                 { s.nvrtcDestroyProgram(&prog); s.cuCtxDestroy(ctx); return false; }
-            std::size_t sz = 0; char* buf = nullptr;
+            char* buf = nullptr;
             s.nvrtcGetPTX(prog, buf); /* buf points into prog; load below */
             ptx = std::string(buf ? buf : "");
             s.nvrtcDestroyProgram(&prog);
@@ -13345,9 +14356,11 @@ inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp, const Options&) {
         (void)dbl_buf;
         s.cuCtxDestroy(ctx);
         return true;   // GPU path completed
+#if FYX_HAS_EXCEPTIONS
     } catch (...) {
         return false;  // any failure -> CPU fallback
     }
+#endif
 #else
     (void)p; (void)n;
     return false;      // compute path disabled: CPU fallback (the documented default)

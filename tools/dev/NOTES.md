@@ -292,3 +292,116 @@ under 7.2 therefore needs a vqsort-class vectorised sorter -- sorting networks
 in AVX-512 plus a vectorised merge partition, which is a large piece of work
 and not a tuning exercise. Everything cheaper has been tried and measured,
 and the numbers are above.
+
+---
+
+## The accounting reopened: the vectorised quicksort got built (2026-09-07)
+
+The section above ends by saying the only route left is "a vqsort-class
+vectorised sorter -- sorting networks in AVX-512 plus a vectorised merge
+partition". That is what `parts/10b_vsort.hpp` now is, and this section is the
+measurement trail for it. Everything below was measured on the same machine
+(2 vCPU Ice Lake-SP, g++ 12.2, `-O3 -march=native`), interleaved in one
+process, best of N, warm pages -- the hazard from the top of this file bit
+twice during this work and both times the numbers were nonsense until the
+variants were put back in one harness (see "measurement hygiene" below).
+
+### What the kernel is
+
+* partition in place with `vpcompressd` / `vcompressps`: one compare per
+  vector gives a mask, two masked compress-stores drop the low and high halves
+  at the two ends of the free gap, nothing is written twice;
+* **four vectors per iteration** and the side to read chosen **branchlessly**.
+  This is the single biggest tuning result of the whole exercise: the choice
+  depends on how the data splits, so at one vector per iteration the branch
+  mispredicts about every other time and costs more than the partition does.
+  1M random int32, serial, same code otherwise:
+
+  | vectors/iteration, leaf | time |
+  |---|---:|
+  | 1 vector, branchy, leaf 64   | 0.00604 s |
+  | 2 vectors, leaf 64           | 0.00518 s |
+  | 4 vectors, leaf 64           | 0.00481 s |
+  | 4 vectors, leaf 128          | 0.00429 s |
+  | 4 vectors, leaf 256          | 0.00423 s |
+  | 8 vectors, leaf 128          | 0.00438 s |
+
+  Eight vectors is worse than four: 2x8 held plus 8 in flight spills.
+* the leaf is the existing Batcher network from `parts/_network_body.inc`, but
+  driven by policies over the **native** type instead of RadixTraits keys.
+  Inside a quicksort the comparisons are already in the value domain, so the
+  encode and decode passes the radix networks need are pure loss. Leaf = 16
+  vectors (256 elements for 4-byte types, 128 for 8-byte), measured best of
+  64/128/256 for both widths.
+* pivot = median of two vectors' worth of strided samples, sorted in registers.
+  One vector's worth measured the same within noise; 64 samples through
+  `small_sort_numeric` (with its encode/decode) was measurably worse.
+
+### Where it stands against the reference implementations
+
+`tools/dev/vqs.cpp` races the prototype against Highway's vqsort and Intel's
+x86-simd-sort in one process (build it with `-DHAVE_XSS -DHAVE_VQSORT`):
+
+```
+1M   int32   proto 0.00499   x86-simd-sort 0.00398   vqsort 0.00341
+1M   float   proto 0.00854   x86-simd-sort 0.00277   vqsort 0.00285
+8M   int32   proto 0.05171   x86-simd-sort 0.04050   vqsort 0.03629
+8M   float   proto 0.06826   x86-simd-sort 0.03936   vqsort 0.03998
+```
+
+that was *before* the unrolling and the native-typed leaf; after them the
+shipping kernel is at 0.0042 (1M int32) and 0.0384 (8M float), i.e. level with
+x86-simd-sort and ~20% behind vqsort single-threaded. The second core makes up
+the difference and more: 1M int32 parallel is 0.0025 against vqsort's 0.0034.
+**Anyone continuing this should know the remaining single-thread 20% is real
+and unexplained** -- both references use the same partition primitive, so it is
+in the details (their leaf networks are hand-written per size, ours is a
+generic bitonic; their pivot uses more samples at the top).
+
+### What it did *not* beat, and why those cells kept their kernel
+
+* **64-bit integers.** 8M random int64: quicksort 0.096 s, high-prefix radix
+  0.089 s. The high-prefix kernel sorts a 24-26 bit prefix in two passes and
+  repairs the ties, so it pays for fewer passes than the quicksort pays for
+  levels. `vqsort_preferred()` therefore excludes them. Floating point has no
+  such shortcut (the prefix carries the exponent, so its groups are large).
+* **Low cardinality.** Counting still wins every shape the profile recognises:
+  1M int32 mod8 counting 0.00051 s against the quicksort's 0.00183.
+* **Very light disorder.** 4M int32 with 0.02% of positions swapped: patch
+  merge 0.0077 s, quicksort 0.0178. See `patch_merge_dirty_budget` for the
+  crossover table.
+
+### Two dispatch pathologies this work uncovered
+
+Both were pre-existing and both cost more than the kernel work saved:
+
+* the **high-prefix radix on a near-constant prefix**: 4M int32 drawn from a
+  2^22 range took 0.206 s in that kernel alone (plain `radix_sort` 0.035,
+  quicksort 0.020) because the whole array lands in one tie group;
+* **the range counters were unreachable for high-entropy input**: "narrow
+  range" and "few values" were being treated as the same property. 4M int32
+  over a 2^10 range: 0.049 s before, 0.0052 s after.
+
+### Degenerate pivot (a real bug, now fixed)
+
+The partition is two-way (`< pivot` | `>= pivot`), so a pivot equal to the
+range minimum produces an empty low side and no progress: the recursion just
+burned its depth budget and fell out to pdqsort. Ranges where one value owns
+more than half the elements hit this. The fix is a second partition with the
+strict test (`> pivot`), which puts the pivot-valued block -- at least one
+element, already in its final place -- in front of everything else. 2M int32
+that are 90% `INT32_MIN`: 0.0019 s.
+
+### Measurement hygiene, again
+
+Two full afternoons of numbers in this session were wrong for the reasons
+already written at the top of this file, in new clothes:
+
+* **a background test run.** A `fyx_test.py` left running in another process
+  made every measurement 4-5x slow and mutually inconsistent -- including one
+  that said the kernel was pathological on nearly-sorted data, which it is not
+  (4.5-5.2 ns/elem on random, sorted, reverse and nearly-sorted alike). Check
+  `uptime` before believing a surprising number.
+* **cold pages.** A harness that allocates a fresh `std::vector` per variant
+  measures the page faults, not the sort: the same partition measured 0.0196 s
+  warm and 0.0923 s cold. Allocate the work buffer once, `std::copy` into it.
