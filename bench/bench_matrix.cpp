@@ -18,8 +18,18 @@
 // Copy time is excluded: the work vector is refilled before each timed run.
 // Best-of-R is reported.
 //
+// WARNING -- data context: all datasets are drawn from ONE shared g_rng
+// (mt19937_64) whose stream advances in matrix order: for every dist row the
+// int32/int64/double(/string) cases each consume rng draws, and reshape()
+// draws more.  A run with --filter= therefore generates DIFFERENT datasets
+// than the same row inside an unfiltered full run (different stream prefix).
+// Never compare numbers produced by different command lines; the canonical
+// table is the unfiltered full run.  Use --filter only as a quick smoke test.
+//
 // Build:
 //   g++ -std=c++17 -O3 -march=native -DNDEBUG -pthread -I. bench/bench_matrix.cpp -o /tmp/bm
+//   g++ ... -DFYX_MATRIX_HAVE_PDQ -I<pdqsort dir> ...
+//   g++ ... -DFYX_MATRIX_HAVE_VQSORT -I<highway root> ... -L<highway build> -lhwy_contrib -lhwy
 //
 #include "../fyx_sort.hpp"
 
@@ -34,7 +44,10 @@
 #  include "hwy/aligned_allocator.h"
 #endif
 #ifdef FYX_MATRIX_HAVE_XSS
-#  include "x86simdsort.h"
+// Header-only build of intel/x86-simd-sort: the "static-incl" translation
+// unit exposes x86simdsortStatic::qsort and needs no separate library.  The
+// compiled-library header ("x86simdsort.h") would require their build system.
+#  include "x86simdsort-static-incl.h"
 #endif
 
 #include <algorithm>
@@ -348,7 +361,7 @@ static void run_algo(Algo a, T* p, std::size_t n) {
 #ifdef FYX_MATRIX_HAVE_XSS
         case Algo::Xss:
             if constexpr (std::is_arithmetic_v<T>)
-                x86simdsort::qsort(p, n);
+                x86simdsortStatic::qsort(p, n, false, false);
             break;
 #endif
         default: break;
@@ -392,6 +405,14 @@ static Result bench_one(const std::vector<T>& base, Algo a, int reps) {
 static const char* g_type_name = "";
 
 template <class T>
+static bool applies(Algo a) {
+    // vqsort / xss are arithmetic-only; for std::string they cannot run and
+    // must not pollute the best-other comparison with a ~0 no-op time.
+    if (a != Algo::Vqsort && a != Algo::Xss) return true;
+    return std::is_arithmetic_v<T>;
+}
+
+template <class T>
 static void run_case(const char* tname, std::size_t n, Dist d, int reps) {
     g_type_name = tname;
     std::vector<T> base = make_data<T>(n, d);
@@ -400,11 +421,12 @@ static void run_case(const char* tname, std::size_t n, Dist d, int reps) {
     for (int i = 0; i < static_cast<int>(Algo::Count); ++i) times[i] = std::numeric_limits<double>::quiet_NaN();
     for (int i = 0; i < static_cast<int>(Algo::Count); ++i) {
         if (!g_have[i]) continue;
+        if (!applies<T>(static_cast<Algo>(i))) continue;   // leave NaN -> "n/a"
         Result r = bench_one<T>(base, static_cast<Algo>(i), reps);
         times[i] = r.t;
         oks[i] = r.ok;
     }
-    // fastest available competitor (excluding fyx variants)
+    // fastest available competitor (excluding fyx variants and n/a cells)
     double best_other = std::numeric_limits<double>::infinity();
     const char* best_other_name = "-";
     for (int i = 0; i < static_cast<int>(Algo::Count); ++i) {
@@ -415,6 +437,7 @@ static void run_case(const char* tname, std::size_t n, Dist d, int reps) {
     std::printf("| %-7s | %8zu | %-13s |", tname, n, dist_name(d));
     for (int i = 0; i < static_cast<int>(Algo::Count); ++i) {
         if (!g_have[i]) continue;
+        if (!applies<T>(static_cast<Algo>(i))) { std::printf("        n/a"); continue; }
         std::printf(" %10.6f%s", times[i], oks[i] ? "" : "!");
     }
     double fyx_par = times[static_cast<int>(Algo::FyxPar)];

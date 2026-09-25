@@ -662,6 +662,255 @@ int main() {
         CHECK(v == ref, "parallel sample strings high distinct");
     }
 
+    // -----------------------------------------------------------------------
+    // The parallel orderedness proof must return exactly the serial detector's
+    // verdict on a corpus that includes shapes built specifically to fool its
+    // 4096-point sample (monotone at every sampled position, inverted in
+    // between; constant at every sampled position, not constant in between).
+    // -----------------------------------------------------------------------
+    std::printf("parallel vs serial orderedness proof equivalence\n");
+    {
+        namespace fd = fyx::detail;
+        const std::size_t sizes[] = {(std::size_t(1) << 21), (std::size_t(1) << 21) + 3,
+                                     (std::size_t(1) << 22) + 1};
+        for (std::size_t n : sizes) {
+            const std::size_t step = (n + 4095) / 4096;      // the sample stride
+            for (int shape = 0; shape < 8; ++shape) {
+                std::vector<std::int64_t> base(n);
+                for (std::size_t i = 0; i < n; ++i) base[i] = static_cast<std::int64_t>(rng() % 100000);
+                std::sort(base.begin(), base.end());
+                switch (shape) {
+                    case 1: std::reverse(base.begin(), base.end()); break;              // reverse
+                    case 2: for (auto& x : base) x = 5; break;                          // all equal
+                    case 3: for (std::size_t i = step / 2; i + 1 < n; i += step * 7)     // sorted, inversions only between samples
+                                std::swap(base[i], base[i + 1]);
+                            break;
+                    case 4: for (std::size_t i = step; i + step / 3 < n; i += step)      // constant at samples, moved between
+                                base[i + step / 3] = base[i / 2];
+                            break;
+                    case 5: base[n / 2] = base[0]; break;                               // one far drop
+                    case 6: for (std::size_t k = 0; k < n / 1000 + 1; ++k) {            // few random swaps
+                                std::size_t i = rng() % (n - 1); std::swap(base[i], base[i + 1]); }
+                            break;
+                    default: for (auto& x : base) x = static_cast<std::int64_t>(rng()); break;  // random
+                }
+                const fyx::less less{};
+                const std::greater<std::int64_t> greater{};
+                {   // ascending: the two proofs must agree
+                    std::vector<std::int64_t> a = base, b = base;
+                    fd::test_reset_dispatch();
+                    const bool par = fd::try_parallel_fast_order_exit(a.data(), a.size(), less, true);
+                    const fd::DispatchDecision dpar = fd::test_dispatch_slot();
+                    fd::test_reset_dispatch();
+                    const bool ser = fd::try_fast_order_exit(b.data(), b.size(), less, true);
+                    const fd::DispatchDecision dser = fd::test_dispatch_slot();
+                    CHECK(par == ser, "parallel and serial order verdict agree (ascending)");
+                    CHECK(!par || a == b, "both proofs leave the same array (ascending)");
+                    if (par) CHECK(dpar == dser, "parallel and serial order decision agree (ascending)");
+                    if (par && dpar == fd::DispatchDecision::ProfileReverse && a != b) {
+                        std::sort(a.begin(), a.end());
+                        CHECK(std::is_sorted(a.begin(), a.end()), "reverse proof leaves sorted data");
+                    }
+                    if (par) CHECK(std::is_sorted(a.begin(), a.end()), "ascending proof implies sorted");
+                }
+                {   // descending comparator: same expectations, reverse direction
+                    std::vector<std::int64_t> a = base, b = base;
+                    fd::test_reset_dispatch();
+                    const bool par = fd::try_parallel_fast_order_exit(a.data(), a.size(), greater, true);
+                    const fd::DispatchDecision dpar = fd::test_dispatch_slot();
+                    fd::test_reset_dispatch();
+                    const bool ser = fd::try_fast_order_exit(b.data(), b.size(), greater, true);
+                    const fd::DispatchDecision dser = fd::test_dispatch_slot();
+                    CHECK(par == ser, "parallel and serial order verdict agree (descending)");
+                    CHECK(!par || a == b, "both proofs leave the same array (descending)");
+                    if (par) CHECK(dpar == dser, "parallel and serial order decision agree (descending)");
+                    if (par) CHECK(std::is_sorted(a.begin(), a.end(), greater), "descending proof implies sorted");
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pool-assist orderedness proof (kParallelProofMinN .. kParallelOrderMinN).
+    // Below the full-parallel floor the dispatcher borrows the pool for the
+    // proof only; the assist opens with a *sequential* 4096-element prefix
+    // instead of the strided sample.  Same contract as the >=2M proof: the
+    // verdict, the array state and the dispatch record must equal the serial
+    // detector's, including shapes built to fool a prefix read (disorder only
+    // after the prefix; all-equal prefix over non-constant data).  1M sizes
+    // are odd on purpose so chunk seams land mid-run.
+    // -----------------------------------------------------------------------
+    std::printf("pool-assist orderedness proof equivalence\n");
+    {
+        namespace fd = fyx::detail;
+        const std::size_t sizes[] = {(std::size_t(1) << 20), (std::size_t(1) << 20) + 3};
+        for (std::size_t n : sizes) {
+            const std::size_t step = (n + 4095) / 4096;      // strided-sample step
+            for (int shape = 0; shape < 8; ++shape) {
+                std::vector<std::int64_t> base(n);
+                for (std::size_t i = 0; i < n; ++i) base[i] = static_cast<std::int64_t>(rng() % 100000);
+                std::sort(base.begin(), base.end());
+                switch (shape) {
+                    case 1: std::reverse(base.begin(), base.end()); break;              // reverse
+                    case 2: for (auto& x : base) x = 5; break;                          // all equal
+                    case 3: for (std::size_t i = step / 2; i + 1 < n; i += step * 7)     // sorted at the prefix, inversions only between strided samples
+                                std::swap(base[i], base[i + 1]);
+                            break;
+                    case 4: for (std::size_t i = 0; i < fd::kAssistOrderPrefix * 2; ++i)  // all-equal prefix
+                                base[i] = 42;
+                            for (std::size_t i = fd::kAssistOrderPrefix * 2; i < n; ++i)  // strictly decreasing tail below it
+                                base[i] = 40 - static_cast<std::int64_t>(i - fd::kAssistOrderPrefix * 2);
+                            break;
+                    case 5: for (std::size_t i = n - 1; i > n / 2; --i) base[i] = base[n / 2]; // sorted prefix, constant tail
+                            break;
+                    case 6: for (std::size_t k = 0; k < n / 1000 + 1; ++k) {            // few random swaps
+                                std::size_t i = rng() % (n - 1); std::swap(base[i], base[i + 1]); }
+                            break;
+                    case 7: for (std::size_t i = 0; i < n; ++i)                          // sorted prefix, random tail
+                                if (i >= fd::kAssistOrderPrefix * 2)
+                                    base[i] = static_cast<std::int64_t>(rng());
+                            break;
+                    default: break;                                                      // plain sorted
+                }
+                const fyx::less less{};
+                const std::greater<std::int64_t> greater{};
+                {   // ascending
+                    std::vector<std::int64_t> a = base, b = base;
+                    fd::test_reset_dispatch();
+                    const bool par = fd::try_pool_assist_order_exit(a.data(), a.size(), less, true);
+                    const fd::DispatchDecision dpar = fd::test_dispatch_slot();
+                    fd::test_reset_dispatch();
+                    const bool ser = fd::try_fast_order_exit(b.data(), b.size(), less, true);
+                    const fd::DispatchDecision dser = fd::test_dispatch_slot();
+                    CHECK(par == ser, "assist and serial order verdict agree (ascending)");
+                    CHECK(!par || a == b, "both proofs leave the same array (ascending)");
+                    if (par) CHECK(dpar == dser, "assist and serial order decision agree (ascending)");
+                    if (par) CHECK(std::is_sorted(a.begin(), a.end()), "assist proof implies sorted");
+                }
+                {   // descending comparator
+                    std::vector<std::int64_t> a = base, b = base;
+                    fd::test_reset_dispatch();
+                    const bool par = fd::try_pool_assist_order_exit(a.data(), a.size(), greater, true);
+                    const fd::DispatchDecision dpar = fd::test_dispatch_slot();
+                    fd::test_reset_dispatch();
+                    const bool ser = fd::try_fast_order_exit(b.data(), b.size(), greater, true);
+                    const fd::DispatchDecision dser = fd::test_dispatch_slot();
+                    CHECK(par == ser, "assist and serial order verdict agree (descending)");
+                    CHECK(!par || a == b, "both proofs leave the same array (descending)");
+                    if (par) CHECK(dpar == dser, "assist and serial order decision agree (descending)");
+                    if (par) CHECK(std::is_sorted(a.begin(), a.end(), greater), "assist descending proof implies sorted");
+                }
+            }
+        }
+        // dispatcher wiring: with threads allowed, a 1M sorted range must be
+        // proven by the assist (pool below the full-parallel floor); with
+        // threads disallowed the serial detector answers identically.
+        {
+            const std::size_t n = std::size_t(1) << 20;
+            std::vector<std::int64_t> v(n);
+            for (std::size_t i = 0; i < n; ++i) v[i] = static_cast<std::int64_t>(rng() % 70000);
+            std::sort(v.begin(), v.end());
+            std::vector<std::int64_t> w = v;
+            fd::test_reset_dispatch();
+            const bool par = fd::try_order_exit_adaptive(v.data(), v.size(), fyx::less{}, true, true);
+            const fd::DispatchDecision dpar = fd::test_dispatch_slot();
+            fd::test_reset_dispatch();
+            const bool ser = fd::try_order_exit_adaptive(w.data(), w.size(), fyx::less{}, true, false);
+            CHECK(par && ser, "1M sorted range exits through both routings");
+            CHECK(dpar == fd::DispatchDecision::ProfileSorted, "assist routing records ProfileSorted");
+            CHECK(par == ser && v == w, "both routings agree on verdict and array");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Large-n orderedness exits.  Above kParallelOrderMinN the parallel
+    // dispatcher proves sorted/reverse/all-equal with a strided sample gate, a
+    // chunked classification spread over the pool and a combine step that
+    // checks the chunk seams; the proof must be exactly as strong as the serial
+    // one.  Sizes are odd on purpose (chunk boundaries land mid-run) and cross
+    // the threshold, ascending and descending.
+    // -----------------------------------------------------------------------
+    std::printf("large-n parallel orderedness exits\n");
+    {
+        const std::size_t sizes[] = {(std::size_t(1) << 21) + 3, (std::size_t(1) << 21),
+                                     (std::size_t(1) << 22) + 1};
+        for (std::size_t n : sizes) {
+            for (int shape = 0; shape < 5; ++shape) {
+                std::vector<std::int64_t> base(n);
+                for (std::size_t i = 0; i < n; ++i)
+                    base[i] = static_cast<std::int64_t>(rng() % 1000000);
+                std::sort(base.begin(), base.end());
+                if (shape == 0) {                       // already sorted
+                } else if (shape == 1) {                // reverse order
+                    std::reverse(base.begin(), base.end());
+                } else if (shape == 2) {                // all equal
+                    for (auto& x : base) x = 7;
+                } else if (shape == 3) {                // sorted but for few swaps
+                    for (std::size_t k = 0; k < n / 1000 + 1; ++k) {
+                        std::size_t i = rng() % (n - 1);
+                        std::swap(base[i], base[i + 1]);
+                    }
+                } else {                                // random
+                    for (auto& x : base) x = static_cast<std::int64_t>(rng());
+                }
+                const char* sn = shape == 0 ? "sorted" : shape == 1 ? "reverse" :
+                                 shape == 2 ? "allequal" : shape == 3 ? "fewswap" : "random";
+                (void)sn;
+                for (int dir = 0; dir < 2; ++dir) {
+                    std::vector<double> d(base.begin(), base.end());
+                    std::vector<std::int32_t> w(n);
+                    for (std::size_t i = 0; i < n; ++i) w[i] = static_cast<std::int32_t>(base[i]);
+                    fyx::Options o;
+                    o.parallel = fyx::Tri::On;
+                    if (dir == 0) {
+                        fyx::sort(d, o);
+                        fyx::sort(w, o);
+                    } else {
+                        auto gt = std::greater<double>();
+                        auto gt32 = std::greater<std::int32_t>();
+                        std::vector<double> dref = d;
+                        std::vector<std::int32_t> wref = w;
+                        std::sort(dref.begin(), dref.end(), gt);
+                        std::sort(wref.begin(), wref.end(), gt32);
+                        fyx::sort(d.begin(), d.end(), gt, o);
+                        fyx::sort(w.begin(), w.end(), gt32, o);
+                        CHECK(d == dref, "large-n descending double");
+                        CHECK(w == wref, "large-n descending int32");
+                        continue;
+                    }
+                    std::vector<double> dref = d;
+                    std::vector<std::int32_t> wref = w;
+                    std::sort(dref.begin(), dref.end());
+                    std::sort(wref.begin(), wref.end());
+                    CHECK(d == dref, "large-n ascending double");
+                    CHECK(w == wref, "large-n ascending int32");
+                }
+            }
+        }
+        // strings exercise the non-radix branch of the chunked detector
+        {
+            const std::size_t n = (std::size_t(1) << 21) + 5;
+            std::vector<std::string> v(n);
+            for (auto& s : v) s = std::string(6, 'a') + std::to_string(rng() % 4096);
+            std::sort(v.begin(), v.end());
+            std::vector<std::string> ref = v;
+            fyx::Options o;
+            o.parallel = fyx::Tri::On;
+            fyx::detail::test_reset_dispatch();
+            fyx::sort(v, o);
+            CHECK(v == ref, "large-n ascending string (sorted input)");
+            CHECK(fyx::detail::test_last_dispatch() == fyx::detail::DispatchDecision::ProfileSorted,
+                  "large-n sorted string proved by the parallel order exit");
+            std::reverse(v.begin(), v.end());
+            ref = v;
+            std::sort(ref.begin(), ref.end());
+            fyx::sort(v, o);
+            CHECK(v == ref, "large-n ascending string (reversed input)");
+            CHECK(fyx::detail::test_last_dispatch() == fyx::detail::DispatchDecision::ProfileReverse,
+                  "large-n reversed string proved by the parallel order exit");
+        }
+    }
+
     std::printf(failures ? "COUNTING TEST FAILURES=%d\n" : "ALL COUNTING TESTS PASS\n", failures);
     return failures ? 1 : 0;
 }

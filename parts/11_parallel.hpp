@@ -364,8 +364,26 @@ public:
     bool     broken()   const noexcept { return broken_; }
     unsigned nworkers() const noexcept { return nworkers_; }
 
-    /// Index of the calling thread within the pool, or 0 for outsiders.
-    static unsigned this_worker() noexcept { return tls_worker_id(); }
+    /// Index of the calling thread within the pool.  Pool threads own their
+    /// slot; the first external thread to ask claims slot 0 -- the submitting
+    /// thread the deque design reserves -- and every further external thread
+    /// gets kNoWorker, which routes fork_join through the safe foreign queue.
+    /// A Chase-Lev deque has exactly one owner; two external threads both
+    /// pretending to be worker 0 pushed and popped the same deque and
+    /// occasionally lost a task, hanging the waiter forever.
+    static unsigned this_worker() noexcept {
+        const unsigned id = tls_worker_id();
+        if (id != kNoWorker) return id;
+        static std::atomic<bool> primary_taken{false};
+        bool expect = false;
+        if (primary_taken.compare_exchange_strong(expect, true)) {
+            tls_worker_id() = 0;
+            return 0;
+        }
+        return kNoWorker;
+    }
+
+    static constexpr unsigned kNoWorker = static_cast<unsigned>(-1);
 
     /// Submit a task to the calling thread's queue.  Returns false when the
     /// queue could not grow, in which case the caller must run it inline.
@@ -383,6 +401,36 @@ public:
         return true;
     }
 
+    /// Submit a task from a thread that owns no deque (every external caller
+    /// after the first).  Idle workers drain this FIFO after their steal
+    /// attempts miss, and foreign waiters help empty it while they wait.
+    bool submit_foreign(Task t) {
+        if (broken_) return false;
+        {
+            std::lock_guard<std::mutex> lk(foreign_mu_);
+            foreign_q_.push_back(t);
+        }
+        foreign_pending_.fetch_add(1, std::memory_order_acq_rel);
+        if (sleepers_.load(std::memory_order_acquire) != 0) {
+            {
+                std::lock_guard<std::mutex> lk(sleep_mu_);
+                ++wake_epoch_;
+            }
+            sleep_cv_.notify_all();
+        }
+        return true;
+    }
+
+    bool foreign_pop(Task& out) {
+        if (foreign_pending_.load(std::memory_order_acquire) == 0) return false;
+        std::lock_guard<std::mutex> lk(foreign_mu_);
+        if (foreign_q_.empty()) return false;
+        out = foreign_q_.front();
+        foreign_q_.pop_front();
+        foreign_pending_.fetch_sub(1, std::memory_order_acq_rel);
+        return true;
+    }
+
     /// Run tasks until `pending` reaches zero.  Used by the submitting thread
     /// to participate instead of blocking, which keeps all cores busy and
     /// makes nested parallelism deadlock-free.
@@ -396,7 +444,7 @@ public:
 
 private:
     static unsigned& tls_worker_id() noexcept {
-        static thread_local unsigned id = 0;
+        static thread_local unsigned id = kNoWorker;
         return id;
     }
 
@@ -417,6 +465,10 @@ private:
             if (s == StealStatus::Success) return true;
             // Abort means a lost race: worth retrying elsewhere immediately.
         }
+        // Only a foreign waiter drains the foreign FIFO: this function sits
+        // inside every spin-wait of every parallel sort, and an extra shared
+        // atomic read there measurably slowed the striped swaps.
+        if (self == kNoWorker) return foreign_pop(out);
         return false;
     }
 
@@ -431,6 +483,7 @@ private:
 
         while (!stop_.load(std::memory_order_acquire)) {
             Task t;
+            if (foreign_pop(t)) { t.run(); continue; }
             if (try_get_task(self, t)) { t.run(); continue; }
 
             // Nothing found: spin briefly, then sleep.
@@ -466,6 +519,13 @@ private:
     std::mutex               sleep_mu_;
     std::condition_variable  sleep_cv_;
     std::uint64_t            wake_epoch_ = 0;
+
+    // Tasks handed in by foreign threads (callers that own no deque).  See
+    // submit_foreign -- this exists so several application threads can sort
+    // concurrently without any two of them owning one work-stealing deque.
+    std::mutex               foreign_mu_;
+    std::deque<Task>         foreign_q_;
+    std::atomic<std::size_t> foreign_pending_{0};
 };
 
 /// The process-wide pool, created on first use.
@@ -509,7 +569,13 @@ inline void fork_join(FnA&& a, FnB&& b) {
     std::atomic<std::size_t> pending{1};
     Job job{&b, &pending};
 
-    if (!pool.submit(self, Task{&Job::run, &job})) {
+    // A foreign thread owns no deque; its half goes through the mutexed FIFO
+    // that workers and foreign waiters drain.  Only the primary external
+    // thread and pool threads use the Chase-Lev deques directly.
+    const bool queued = (self != ThreadPool::kNoWorker)
+        ? pool.submit(self, Task{&Job::run, &job})
+        : pool.submit_foreign(Task{&Job::run, &job});
+    if (!queued) {
         // Queue full: just do it here.
         a();
         b();

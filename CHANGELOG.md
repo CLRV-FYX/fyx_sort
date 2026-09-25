@@ -1,9 +1,192 @@
 # Changelog
 
+## Unreleased — v10.4 candidate
+
+Date: 2026-09-16
+
+### Added
+
+- **封顶自然归并前门（`try_proof_structured_sort`，工程名仍叫 PSS）**——
+  **不是新排序范式**，而是自然归并 / Timsort 家族的受限制特化：一次封顶扫描
+  （≤7 个违例位，第 8 个立刻放弃）找目标方向单调 run，然后标准稳定归并
+  （r=2 回绕则 rotate）。与 Timsort 的工程差别只有：封顶拒绝（随机期望 O(1)
+  退出）、r≤8 时固定二叉归并树（无栈）、rotate 特例、挂在 vqsort 调度链上。
+  随机输入在头几个元素攒够封顶违例而放弃（串行零税实测 -1.4% 噪声带内）。
+  串行入口仍只在 `!dynamic_parallel_allowed` 时触发；并行入口
+  `try_proof_structured_sort_parallel`（n≥256K）分块扫 break + r=2 wrap
+  走既有双缓冲 rotate，其余 fork_join 成对稳定归并。zigzag/bitonic 含反向
+  run，不假装吸收。套件 743/0；1M int64 同块交错：concat2 par/ser 0.57、
+  rotated 0.62、runs8 0.75、zigzag 1.02。**不是 canonical 矩阵。**
+  串行 1M int64：2 段 -27.5%、3 段 -18.0%、8 段 -17.2%、concat2 -4.5%
+  （3 轮同块交错中位），无任何回退。
+- **单断点结构证明**（`try_one_break_rotate` / `try_one_break_rotate_parallel`）：
+  有序性证明从 k=0（全单调才退出）推广到 k=1——前缀与后缀各自单调且端点回绕的
+  范围是旋转有序数组，rotate 回来 O(n) 且精确；扫描在第二个违例处放弃（随机输入
+  头几个元素攒够两个断点，实测串行零税）。串行版挂两处驱动；并行版为 chunk 缝隙
+  代数（全 chunk 向量化单调扫描 + 恰一条坏缝/一个坏 chunk 精化 + 回绕检查），
+  修复用全量双缓冲并行搬移。1M 并行 rotated：int64 -4%、int32 -6%、double -39%
+  （对最强对手增益 5.4→8.7x）；8M 与 vqsort 并行平手（rotate 的带宽本质）。
+  稳定路径（sort_st）用严格回绕条件守卫等值跨缝。
+
+### Changed
+
+- **串行向量快排 lean+max 分区**（`parts/10b_vsort.hpp`，仅 `vqsort_serial` 路径；
+  并行步进分区 `vqsort_partition_step` 原样不动）。热循环不再跟踪区间 min/max
+  （旧版每向量两条额外向量指令），改为只跟踪最大值（一条）：最小值与 `split == 0`
+  检测冗余（低侧为空 ⟺ 枢轴是区间最小值，免费），最大值保留旧版的两个免费早退——
+  整段与枢轴同值直接返回、高侧全为枢轴值时该侧已在终位、整体丢弃不再递归
+  （重复合输入上每个此类子区间省两整趟）。同块交错 A/B（七轮中位，对 hwy vqsort）：
+  int64 1M 0.82→0.85x、8M 0.84→0.86x；double 1M 0.87→0.89x、8M 0.85→0.86x；
+  int32 持平（0.85→0.86x / 0.85→0.86x）。并行侧子任务（<64K 走串行内核）同享，
+  并行 random 抽查无回退。
+- 同轮否定并回退的实验：主循环软件预取（int32 受害，中性）、int32 采样 4×V（中性）、
+  4 字节叶子 8 向量（更差）、分区 unroll=8（更差）、每槽 median-of-3 枢轴采样
+  （int32 崩至 0.6x，标量加载 3 倍）。串行差距的下一批候选：hwy BaseCase 网络、
+  PartitionRightmost 余数预处理、GatherSample 枢轴。
+
+### Fixed
+
+- **整数键的向量化证明变换用错**（v10.3 引入）：向量单调扫描对所有键类型套用
+  IEEE 浮点变换（符号传播全翻转），该变换对有符号整数在负数域内**逆序**、对高位
+  无符号值同样逆序——负 int64/高位 uint64 的单调数组被向量证明误拒（静默回落
+  慢路径）。三处统一修复：无符号=恒等、有符号=仅翻转符号位、浮点=符号传播翻转；
+  构造分析确认误收在现分发下不可达（无错误输出，仅性能）。教训：向量化键变换
+  必须从 RadixTraits 按类型推导。
+- 结构证明排序的向量化封顶扫描 off-by-one：第 7 个违例误触发封顶（应为第 8 个），
+  8 段形状被误拒；修复为先查后写。
+- **结构证明排序扫描向量化**：封顶违例扫描改 AVX-512（每 8/16 元素一次
+  load+encode+移位自比较，掩码逐位抽取，封顶中途退出）。同头隔离 A/B（3 轮交错）：
+  1M int64 r=3 证明路径 -13%、r=8 -14%（标量 encode 依赖链 ~2.5ms 是主要成本）。
+- lean+max 首版的掩码尾部向最大值跟踪器喂了未掩码计数（垃圾通道被计为右侧），
+  空隙簿记被破坏，右侧 compress-store 越过左界直至写出数组头（堆损坏 +
+  乱序输出）。修复：数据移动仍走掩码变体，最大值更新单独对「垃圾通道换枢轴」的
+  安全副本进行。教训：部分向量的垃圾通道不得进入任何计数或存储；探针的排序校验
+  （rc=1 BAD fyx）与 ASan 分别在 -O3 与 -O1 抓住同一 bug 的两种表现。
+
+### Result
+
+- 串行随机算术列对 vqsort 本尊的差距从 13–20% 收窄到 10–16%（均匀随机，
+  七轮同块交错中位）；正确性套件 743/0，ASan+UBSan 743/0，`-Werror` 干净。
+
+
+## Unreleased — v10.3 candidate
+
+Date: 2026-09-14
+
+### Fixed
+
+- **线程池外部线程竞态**（`parts/11_parallel.hpp`）：此前所有非池线程的
+  `this_worker()` 都返回 0，N 个应用线程并发排序时全部假冒 worker 0 推/弹同一条
+  Chase-Lev deque——单所有者协议被破坏，丢任务导致 `wait_for` 永转（8 线程压测
+  2/20 挂死）。现在第一个外部线程认领 worker 0（粘性），其余外部线程走互斥 FIFO
+  （空闲 worker 睡前抽干、外来等待者抽干）；热自旋路径不查 FIFO（同块 A/B 显示
+  无条件检查让逆序家族慢 1.5–2.2x）。修复后 30/30 压测零挂死，TSan 无警告。
+
+### Added
+
+- **AVX-512 比较式小基数计数趟**（d≤16）：每键每向量块一次比较 + 一次掩码加，
+  取代「乘→查表→依赖验证加载」链；未采样键表现为总数短缺而拒绝（`sum==n` 守恒
+  保障正确性）。值域远宽于键数的形状（mod8 摊在大窗口上）改走 rank 计数，
+  核开销 O(range×chunks) → O(n+d)。fill 按输出区间切分（计数倾斜不再单核写全数组）。
+- **向量化有序性证明**（`radix_key_monotone_scan`，<2M 池辅助与 ≥2M 全并行两路共用）：
+  每 8/16 元素一次加载 + 三条编码指令 + `alignr` 移位自比较 + 掩码测试，违例早退；
+  位精确键保持浮点 NaN/-0 总序，与标量探测器等价（t_counting 对抗形状测试）。
+- **向量化全等扫掠**（`range_all_equal_first_vec`，两路共用）：全等判定 = 每元素与
+  p[0] 比较，免三向分类免接缝簿记；-0/+0 仍按编码键区分；异议元素回落原分类路径。
+- **测量协议**（`tools/dev/merge_runs.py` + NOTES）：多轮独立进程逐格取中位数为
+  canonical 口径；结论必须来自同块交错的新旧双二进制 A/B（运行块漂移可达 ±2x）。
+
+### Result
+
+- 标准模式记分牌：**1M 56 胜 / 0 负，8M 42 胜 / 0 负**（六对手 × 4 类型 × 14 分布，
+  无任何一格低于 1.00x；最弱格 int64 远距离交换 1.01x）。上一版为 1M 53-3 / 8M 41-1。
+- 关键翻身格：8M double 已排序 0.94x 输 → 1.34x 赢；1M int64/double 全等
+  0.95x/1.07x → 3.17x/3.10x；8M 全等（int64/double）→ 3.8–4.0x；mod8 全家族
+  0.61–0.80x 输 → 1.40–2.02x 赢。
+
 ## Unreleased — v10.2 candidate
 
 Date: 2026-09-07
 
+### Fixed
+
+- **200 万以下的已排序/逆序/全等检查不再单线程空转**（`try_pool_assist_order_exit`）。
+  此前排序本体在 1M 规模走串行时，有序性证明连线程池都不碰，IPS4o 并行的跨线程
+  `is_sorted` 在这类平凡输入上把整个调用压到我们的 0.48x–0.65x。现在调度器在
+  `kParallelProofMinN`(128K) 与 `kParallelOrderMinN`(2M) 之间、且 `n·sizeof(T) ≥ 3 MB`
+  时，把 *证明扫描* 借给线程池而排序本体保持串行：只读、无分配，拒绝时调用方原路
+  落回串行检测器。
+  - 辅助路径不用 8M 的跨步抽样门：刚被写入的 1–8 MB 数组上，4096 个跨步探针是
+    ~0.3 ms 纯冷未命中（1M double 已排序实测因此 +0.1 ms），比它把守的扫描还贵。
+    改用顺序前缀（4096 元素串行分类，预取友好）：乱序输入微秒级拒绝且永不唤醒池；
+    前缀单调才把单向验证（每元素一次比较、每 chunk 验证跨缝对、浮点编码键缓存）铺到池上；
+    前缀全等才退回逐 chunk 分类 + 块缝合并。
+  - 前缀+chunk 恰好覆盖整段，仍是完整证明而非抽样；裁决与调度记录和串行检测器逐位一致。
+  - 合并逻辑的第一版把块缝错位一格并在 `p[n]` 越界读了一个垃圾对——只会错误拒绝、
+    不会错误证明，但被新增的等价性测试（「全等前缀 + 严格递减尾部」形状）当场抓住后修正。
+  - 实测（同机背靠背全量矩阵）：1M 已排序 int32 0.94x→1.52x、int64 0.65–0.83x→1.26x、
+    double 0.53x→1.08x、string 0.55x→0.94x–1.03x（vs IPS4o 并行）；8M int32 1.04→1.22x、
+    double 0.93→1.16x；decliner（随机/近似有序/旋转/拼接/块交换）1M 全部持平或更好。
+    全量战绩 1M 46W/10L→**48W/8L**，8M 39W/3L→**41W/1L**。
+
+### Verified
+
+- **运行时 ISA 分发实测背书**：基线编译（无 `-march`）与 native 编译在 1M 随机/
+  已排序全部格子性能持平（int32 随机 0.00253 vs 0.00251 s、int64 已排序 0.000203 vs
+  0.000206 s）——库的 SIMD 内核（网络、基数、向量快排、画像扫描）经 `FYX_ISA_BEGIN`
+  目标区域 + `use_avx512()` 运行时检查对**任何编译方式**自动生效，不要求用户懂得
+  加编译参数（MSVC 无 per-function target，文档已注明例外）。
+
+### Rejected
+
+- **AVX-512 one-hot 窗口计数**（尝试过、测量否决、已删除）。假设 mod8 家族的瓶颈是
+  标量计数链，向量化（每窗口值一次 cmpeq+popcount）能降 ALU；同树单变量 A/B 实测
+  int32/int64 mod8 一律慢约 2 倍（1M int64 0.00147 vs 0.00067 s）。小窗口的计数表
+  常驻 1-4 条缓存行、mod 循环模式天然错开自增依赖，标量已是强内核；one-hot 的操作数
+  随窗口宽度倍增。向量化直方图只对宽窗口（256 槽 radix，已有 vpconflict 版本）成立。
+
+### Changed
+
+- **int64/uint64 高熵随机改配 AVX-512 向量快排**（`vqsort_preferred` 路由翻转）。
+  旧决策是单机测量的产物：旧机器 8M 串行 radix 0.089 vs vsort 0.096（7%），本机
+  同样的对决**反转为 vsort 快 2–3 倍**（1M 全域随机 0.0061–0.0094 vs 0.014–0.030），
+  且 high-prefix radix 有病态 tie 案例（8M 40-bit 分布 0.73 s vs vsort 0.083，
+  **9 倍**——top 前缀不唯一时 tie 修复趟的代价）。最坏情况 -7% 的默认无法对抗
+  最坏情况 -90% 的默认：路由在所有主机上统一翻转向量快排，radix 家族保留它独占的
+  形状（置换范围、前缀守卫计数）。矩阵规范结果：int64 随机 1M 0.44–0.55x→**1.34x**、
+  8M 0.75x→**1.57x**（对 vqsort 本尊）；**8M 战绩 41 胜 1 负**——除一个坏窗口格外
+  （int32 已排序 0.87x，相邻轮 1.2x+），8M 对全部六个对手每个格子都获胜或打平
+  （vqsort / xss / IPS4o 串行 / pdqsort / std 均 42/0）。稳定性契约不受影响
+  （stable 路径走 stable_merge_sort，从不进 vsort）。嵌入套件 743/0、t_counting
+  `-Werror` 干净、int64 全形状探针（全域/负值/40-bit/20-bit/极值/降序）通过。
+
+### Changed
+
+- **镜像反转铺到线程池**（`reverse_range_adaptive(p, n, parallel_swap)`）。反转是
+  纯带宽操作，镜像对 (i, n-1-i) 相互独立；当调用方已获准用线程（有序性证明已经
+  并行验证）且数组 ≥3MB 时，交换按对空间分段并行。大 n 时 `try_fast_reverse_exit`
+  让位给「并行证明 + 并行交换」两趟。本机 2 核带宽封顶：int32 逆序 8M 稳定改善
+  （4.8ms→3.4ms），int64/double 持平不回归；核更多的机器随真实带宽继续放大。
+- **密集窗口计数扩展到全部 radix 类型**（按编码键）。浮点编码键是保序整数，
+  「编码值落在窄窗口」的 double 列（评分、定点金额、`i % 8`）现在与整数共用
+  O(n+窗口) 的 u32 计数器，不再走哈希探测的稀疏路径；窗口外键立即逃逸回精确路径。
+  1M double 逆序转赢、double mod8 0.40x→0.72x、int64 mod8 0.44x→0.66x（vs 小值域专精）。
+  **IPS4o（串行+并行）两个规模全部败格清零。**
+
+### Changed
+
+- **低基数计数路径去掉了一整趟与所有冗余读**（跨环境成立的结构性精简，`SampleWindow`）。
+  输入画像（profile）的 1024 点抽样现在把「已编码键的 min/max 窗口 + 精确 distinct 数」
+  随 `InputProfile` 一并携带，串行/并行密集计数、串行/并行稀疏计数全部改为消费这份
+  窗口证据，不再各自重读一条 1024 点跨步抽样（每条都是一排冷缓存行）；计数开始前
+  也不再需要全量 min/max 扫——直接按窗口计数，任一键落在窗口外立即逃逸回精确路径。
+  串行密集计数从 5 趟（画像、稀疏检测抽样、minmax 抽样、全量 minmax、计数+回填）
+  减到 3 趟；计数表从 `size_t` 换成 `uint32_t`（表流量减半）；稀疏计数在样本
+  distinct ≤ 24 时用 64 槽小表（与数据流同驻 L1，探测链消失，饱和即让位给大表）；
+  并行稀疏内核删掉对每个 chunk 17 KB 表的冗余 `fill(0)`（vector 值初始化已保证全零）。
+  该家族（状态码/枚举/类别——每个领域的最常见形态）在缓存更紧张的机器上受益更大。
+  本机 ±50% 噪声下逐格不可分辨，交替复核无回归信号（对照格同样摆动）；正确性由
+  嵌入套件（743/0）与 t_counting（计数内核全覆盖、窗口逃逸、-0/NaN 全序）保证。
 ### Added
 - `test/t_vsort.cpp`: 7044 checks over the new kernel -- 10 shapes x 17 sizes x
   6 types, kernel and entry point, ascending, descending and stable, plus the
@@ -49,7 +232,55 @@ Date: 2026-09-07
 - Wide-range, few-value input goes to the sparse counter instead of the dense
   one: 16 values spread over 61440 (1M int64 lowcard16) cost 0.0021 s parallel
   and 0.0031 s serial, against 0.0013 / 0.0022 for the sparse kernel.
-
+- Organ-pipe/zigzag detector: the two full-range shape scans (prefix must be
+  non-increasing, suffix non-decreasing) now run as one fused pass over the two
+  ranges instead of two sequential scans.  Semantics unchanged; halves the scan
+  loop overhead on shapes that reach the full check.  8M double zigzag (the
+  last big comparison loss at 8M, 0.92x vs pdqsort) goes to ~1.5x vs pdqsort
+  in paired runs; 1M double zigzag ~1.9x-2.0x from ~1.3x.  int32/int64 zigzag
+  also improve.
+- **Parallel orderedness proof** (`try_parallel_fast_order_exit`, reached above
+  `kParallelOrderMinN` = 2M elements when the caller allowed threads).  The
+  serial detector is one thread's O(n) scan, and on trivial input that scan *is*
+  the runtime: 8M already-sorted doubles spent 0.0032-0.0042 s proving order and
+  0.0004 s on everything else, so IPS4o -- whose sorted check is a striped
+  `std::is_sorted` over TBB threads -- beat the whole call 0.48x-0.60x.  The
+  proof is now split, and it matters *how* it is split:
+  - a 4096-point strided sample gate decides direction; if it sees neither
+    direction the range declines in microseconds, which is what keeps this from
+    taxing non-monotone shapes (random, rotated, blockswap: 3-5 us);
+  - when the sample both found a direction and witnessed a strictly ordered
+    pair, the range is monotone-or-nothing and the sampled direction is the only
+    answer that can be true, so each worker validates exactly that -- one
+    comparison per element, each chunk re-checking the pair across its seam, so
+    touching every element is the whole proof.  Classifying each chunk instead
+    (`detect_fast_order_kind`, which is built to answer *either* direction, and
+    on 2M+ strings per 512K-element chunk) costs two comparisons per element and
+    was the difference between a bandwidth-bound scan and one that cannot keep
+    the prefetcher fed: 8M int64 0.0054 s -> 0.0034 s, 8M int32 0.0037 ->
+    0.0029 s.  Floating point keeps the previous element's *encoded* key rather
+    than re-encoding both ends of every pair (two encodes per element measured
+    3x slower than the loop it replaced).
+  - only ranges the sample saw as all-equal fall through to the chunked
+    classification, which preserves the AllEqual verdict and the memcmp
+    shortcut for genuinely all-equal input.
+  Net against IPS4o parallel on 8M: int32 0.60x -> 1.06x, int64 0.48x -> 0.98x,
+  double 0.65x -> 0.97x (all three now at parity or better, and vqsort/x86-
+  simd-sort are 10-20x behind on this shape).  Threshold is 2M on purpose: at 1M
+  the pool wake-up costs more than it saves (measured +8-14% on the 1M
+  nearly-sorted row) and the 1M string scan gains nothing measurable from the
+  split.  `test/t_counting.cpp` now has two blocks: the parallel and serial
+  proofs are checked for *identical* verdicts and identical decisions over
+  1M/2M/4M x 8 shapes x {less, greater}, including shapes built to fool the
+  sample (monotone at every sampled position and inverted in between, constant
+  at every sampled position and not in between), plus end-to-end large-n sorts
+  that assert the parallel exit is what proved the sorted and reversed cases.
+- `bench_matrix`: vqsort/xss cells on `std::string` rows now print `n/a` and
+  are excluded from the best-other choice -- a no-op vqsort call previously
+  timed ~0 and hijacked the ratio column for every string row.  The file header
+  now warns that `--filter=` runs consume a different prefix of the shared rng
+  stream and therefore generate *different data* than the same row inside an
+  unfiltered run; only numbers from identical command lines are comparable.
 ### Fixed
 - **Wrong output order** (not just slow): `parallel_sort_ptr`, the task-parallel
   fallback, sorted its two halves with the library's order -- for floating

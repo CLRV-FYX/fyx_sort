@@ -227,6 +227,7 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <atomic>
 #include <unordered_map>
 #include <new>
 
@@ -246,6 +247,7 @@
 
 #if FYX_ENABLE_PARALLEL
 #  include <thread>
+#include <deque>
 #  include <mutex>
 #  include <atomic>
 #  include <condition_variable>

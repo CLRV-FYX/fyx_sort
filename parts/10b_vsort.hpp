@@ -450,6 +450,136 @@ inline std::size_t vpartition(T* a, std::size_t n, T pivot, T& out_min, T& out_m
     return ls;
 }
 
+template <class T, bool Strict>
+FYX_FORCE_INLINE void vpart_vec_lean(T* a, std::size_t& ls, std::size_t& rs,
+                                     typename VOps<T>::reg curr, typename VOps<T>::reg pivot) {
+    using P = VOps<T>;
+    const typename P::mask gek = vhigh_mask<T, Strict>(curr, pivot);
+    const int gc = static_cast<int>(popcount64(static_cast<std::uint64_t>(gek)));
+    P::compressstore(a + ls, static_cast<typename P::mask>(~gek), curr);
+    P::compressstore(a + rs - static_cast<std::size_t>(gc), gek, curr);
+    ls += static_cast<std::size_t>(P::V - gc);
+    rs -= static_cast<std::size_t>(gc);
+}
+
+template <class T, bool Strict>
+FYX_FORCE_INLINE void vpart_vec_lean_masked(T* a, std::size_t& ls, std::size_t& rs,
+                                            typename VOps<T>::reg curr, typename VOps<T>::reg pivot,
+                                            typename VOps<T>::mask valid) {
+    using P = VOps<T>;
+    const typename P::mask gek =
+        static_cast<typename P::mask>(vhigh_mask<T, Strict>(curr, pivot) & valid);
+    const typename P::mask ltk = static_cast<typename P::mask>((~gek) & valid);
+    const int gc = static_cast<int>(popcount64(static_cast<std::uint64_t>(gek)));
+    const int lc = static_cast<int>(popcount64(static_cast<std::uint64_t>(ltk)));
+    P::compressstore(a + ls, ltk, curr);
+    P::compressstore(a + rs - static_cast<std::size_t>(gc), gek, curr);
+    ls += static_cast<std::size_t>(lc);
+    rs -= static_cast<std::size_t>(gc);
+}
+
+template <class T, bool Strict>
+FYX_FORCE_INLINE void vpart_vec_lean_max(T* a, std::size_t& ls, std::size_t& rs,
+                                         typename VOps<T>::reg curr, typename VOps<T>::reg pivot,
+                                         typename VOps<T>::reg& vmax) {
+    using P = VOps<T>;
+    const typename P::mask gek = vhigh_mask<T, Strict>(curr, pivot);
+    const int gc = static_cast<int>(popcount64(static_cast<std::uint64_t>(gek)));
+    P::compressstore(a + ls, static_cast<typename P::mask>(~gek), curr);
+    P::compressstore(a + rs - static_cast<std::size_t>(gc), gek, curr);
+    ls += static_cast<std::size_t>(P::V - gc);
+    rs -= static_cast<std::size_t>(gc);
+    vmax = P::max(vmax, curr);
+}
+
+/// Lean partition for the serial recursion: like `vpartition`, but it tracks
+/// only the range maximum, not the minimum (one vector op per partitioned
+/// vector instead of two).  The minimum is redundant: `split == 0` already
+/// proves the pivot is the range minimum, for free.  The maximum pays for
+/// itself on duplicate-heavy inputs: `pivot == max` marks the whole range one
+/// value (return, no extra pass) and marks the high side all-pivot (its
+/// elements are in their final place; the recursion drops it without sorting
+/// it), which costs two full passes to discover structurally.
+template <class T, bool Strict = false, int U = 4, bool TrackMax = false>
+inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
+    using P   = VOps<T>;
+    using reg = typename P::reg;
+    constexpr int V = P::V;
+    constexpr std::size_t CH = static_cast<std::size_t>(U) * V;
+
+    if (n < 2 * CH) {
+        if constexpr (U > 1) return vpartition_lean<T, Strict, U / 2, TrackMax>(a, n, pivot, out_max);
+        T mn, mx;
+        if constexpr (U == 1) {
+            const std::size_t s = vpartition_scalar<T, Strict>(a, n, pivot, mn, mx);
+            if constexpr (TrackMax) out_max = mx;
+            return s;
+        }
+    }
+
+    const reg pv = P::set1(pivot);
+
+    std::size_t l = 0, r = n;
+    std::size_t ls = 0, rs = n;
+
+    reg vmax;
+    if constexpr (TrackMax) vmax = P::set1(pivot);
+
+    reg vl[U], vr[U];
+    for (int i = 0; i < U; ++i) vl[i] = P::loadu(a + static_cast<std::size_t>(i) * V);
+    for (int i = 0; i < U; ++i) vr[i] = P::loadu(a + n - static_cast<std::size_t>(i + 1) * V);
+    l += CH;
+    r -= CH;
+
+    while (r - l >= CH) {
+        const bool from_right = (rs - r) < (l - ls);
+        const std::size_t src = from_right ? (r - CH) : l;
+        reg cur[U];
+        for (int i = 0; i < U; ++i) cur[i] = P::loadu(a + src + static_cast<std::size_t>(i) * V);
+        r -= from_right ? CH : 0;
+        l += from_right ? 0 : CH;
+        if constexpr (TrackMax) {
+            for (int i = 0; i < U; ++i) vpart_vec_lean_max<T, Strict>(a, ls, rs, cur[i], pv, vmax);
+        } else {
+            for (int i = 0; i < U; ++i) vpart_vec_lean<T, Strict>(a, ls, rs, cur[i], pv);
+        }
+    }
+    while (r - l >= static_cast<std::size_t>(V)) {
+        const bool from_right = (rs - r) < (l - ls);
+        const std::size_t src = from_right ? (r - V) : l;
+        const reg cur = P::loadu(a + src);
+        r -= from_right ? V : 0;
+        l += from_right ? 0 : V;
+        if constexpr (TrackMax) vpart_vec_lean_max<T, Strict>(a, ls, rs, cur, pv, vmax);
+        else                    vpart_vec_lean<T, Strict>(a, ls, rs, cur, pv);
+    }
+    if (r != l) {
+        const unsigned m = static_cast<unsigned>(r - l);
+        const typename P::mask valid = static_cast<typename P::mask>((1ull << m) - 1ull);
+        const reg cur = P::maskz_loadu(valid, a + l);
+        // The masked variant keeps the junk lanes out of the counts and the
+        // stores; the max update runs separately over a copy whose junk lanes
+        // hold the pivot (<= every right-side value, and the pivot itself is
+        // in the range, so this cannot exceed the true maximum).
+        if constexpr (TrackMax) {
+            vpart_vec_lean_masked<T, Strict>(a, ls, rs, cur, pv, valid);
+            vmax = P::max(vmax, P::blend(valid, cur, pv));
+        } else {
+            vpart_vec_lean_masked<T, Strict>(a, ls, rs, cur, pv, valid);
+        }
+    }
+    for (int i = 0; i < U; ++i) {
+        if constexpr (TrackMax) vpart_vec_lean_max<T, Strict>(a, ls, rs, vl[i], pv, vmax);
+        else                    vpart_vec_lean<T, Strict>(a, ls, rs, vl[i], pv);
+    }
+    for (int i = 0; i < U; ++i) {
+        if constexpr (TrackMax) vpart_vec_lean_max<T, Strict>(a, ls, rs, vr[i], pv, vmax);
+        else                    vpart_vec_lean<T, Strict>(a, ls, rs, vr[i], pv);
+    }
+    if constexpr (TrackMax) out_max = P::reduce_max(vmax);
+    return ls;
+}
+
 /// Pivot: two vectors' worth of strided samples, sorted in registers.
 template <class T>
 inline T vpick_pivot(const T* a, std::size_t n) {
@@ -477,18 +607,27 @@ inline void vqsort_rec(T* a, std::size_t n, int budget) {
         }
         --budget;
         const T pivot = vpick_pivot<T>(a, n);
-        T lo, hi;
-        std::size_t split = vpartition<T>(a, n, pivot, lo, hi);
-        if (!(lo < pivot)) {
+        // Lean partition: the hot loop tracks only the range maximum (one
+        // vector op per partitioned vector, not the two that min+max cost).
+        // The minimum is redundant -- `split == 0` proves the pivot is the
+        // range minimum for free.  The maximum keeps the two cheap exits the
+        // tracked partition had: a range whose every element equals the pivot
+        // is finished, and a high side made entirely of pivot values is in
+        // its final place and is dropped without being recursed into.  On
+        // duplicate-heavy inputs those two cases are common, and discovering
+        // them structurally costs two extra passes each.
+        T hi;
+        std::size_t split = vpartition_lean<T, false, 4, true>(a, n, pivot, hi);
+        if (split == 0) {
             // The pivot is the range minimum, so the low side came out empty
-            // and splitting there again would not move.  Re-partition with the
-            // strict test instead: that puts the pivot-valued elements -- at
-            // least one, and they are already in their final place -- in front
-            // of everything else, so the range always shrinks.  Ranges where
-            // one value owns more than half the elements go this way.
-            if (!(pivot < hi)) return;          // the whole range is one value
-            T lo2, hi2;
-            const std::size_t eq = vpartition<T, true>(a, n, pivot, lo2, hi2);
+            // and splitting there again would not move.
+            if (!(pivot < hi)) return;            // the whole range is one value
+            // Re-partition with the strict test instead: that puts the
+            // pivot-valued elements -- at least one, and they are already in
+            // their final place -- in front of everything else, so the range
+            // always shrinks.
+            T hi2;
+            const std::size_t eq = vpartition_lean<T, true>(a, n, pivot, hi2);
             a += eq;
             n -= eq;
             continue;
@@ -667,22 +806,28 @@ template <class T> inline constexpr std::size_t vqsort_leaf() { return 0; }
 #endif // FYX_HAS_AVX512_CODE
 
 /// Which types the vector quicksort is actually *faster* on than the radix
-/// family, measured on this machine at 1M and 8M random elements, serial and
-/// parallel (see BENCHMARKS.md):
+/// family, decided by head-to-head kernel races on whole ranges (numbers in
+/// tools/dev/NOTES.md, tables in BENCHMARKS.md):
 ///
-///   int32   radix 0.0070 -> vq 0.0044 s (8M serial)   take it
-///   float   radix 0.147  -> vq 0.038  s (8M serial)   take it
-///   double  radix 0.114  -> vq 0.088  s (8M serial)   take it
-///   int64   radix 0.089  -> vq 0.096  s (8M serial)   keep radix
+///   int32   radix 0.0070 -> vq 0.0044 s (8M serial, old host)   take it
+///   float   radix 0.147  -> vq 0.038  s (8M serial, old host)   take it
+///   double  radix 0.114  -> vq 0.088  s (8M serial, old host)   take it
+///   int64   radix 0.089  -> vq 0.096  s (8M serial, old host)   was radix
 ///
-/// 64-bit integers are the one case where the radix family already wins: they
-/// have the high-prefix kernel, which sorts a 24-26 bit prefix in two passes
-/// and repairs the ties, so it pays for fewer passes than the quicksort pays
-/// for levels.  Floating point has no such shortcut (the prefix carries the
-/// exponent, so its groups are large), and neither does int32 at three passes.
+/// int64 was the lone "keep radix" row -- by 7% on the old host, serially at
+/// 8M.  On the current host the same race runs the other way by 2-3x (1M
+/// random full-range: 0.0061-0.0094 against 0.014-0.030), and the high-prefix
+/// kernel owns a pathological tie case: 8M values over a 40-bit span sort in
+/// 0.73 s against the vectorised quicksort's 0.083 -- nine times -- on the
+/// tie-repair pass it pays whenever the top prefix bits are not near-unique.
+/// A default whose worst measured case is -7% cannot stand against one whose
+/// worst measured case is -90%, so 64-bit integers now take the vectorised
+/// quicksort on every host; the radix family keeps the shapes only it can do
+/// (permutation ranges, prefix-guarded count sorts).
 template <class T>
 inline constexpr bool vqsort_preferred() {
     return std::is_same<T, std::int32_t>::value || std::is_same<T, std::uint32_t>::value ||
+           std::is_same<T, std::int64_t>::value || std::is_same<T, std::uint64_t>::value ||
            std::is_same<T, float>::value        || std::is_same<T, double>::value;
 }
 
