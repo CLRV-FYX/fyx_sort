@@ -6,6 +6,23 @@ Date: 2026-09-16
 
 ### Added
 
+- **GCC -O2 性能修复**：GCC 在 -O2 下用“very cheap”向量化代价模型且不做循环
+  unswitch/peel，库内无分支扫描比 -O3 慢 2–4 倍（200K i32 sorted 0.71 vs 0.15
+  ns/elem，rotated 1.8 vs 0.85）；vq 分区的寄存器数组循环不展开（200K i32 kernel
+  4.0 vs 3.0）。现于头文件内 `#pragma GCC push_options` 仅为库函数开启
+  `vect-cost-model=dynamic, unswitch-loops, peel-loops`（文件末 pop，不影响调用方；
+  `FYX_NO_OPTIMIZE_PRAGMA` 可关闭；Clang/MSVC 不受影响），分区循环加
+  `FYX_VQ_UNROLL`。-O2 下 sorted/organ/block_swap/sorted_tail 恢复到 -O3 水平。
+- **小规模快路径上限 16K→1M**（`FYX_SMALL_VQ_MAX_N`，且仅在不走并行池时）：一般路径
+  的探针栈（bounded insertion、local repair 等）在随机输入上 20K 时耗 ~30us，超过
+  排序本身。快路径新增 memcmp 全等退出、proof-structured（块置换）探针、
+  mid-bitonic 先验、窄整数域稠密计数（64 样本范围门控）、向量化 reverse；浮点
+  NaN/-0 扫描推迟到结构探针之后。-O2 串行（ns/elem，旧→新）：i32 20K random
+  4.8→2.4、few256 5.1→2.3、sorted_tail 11.2→3.5；f64 20K random 6.9→4.1；
+  i32 200K random 3.3→2.9、sorted_runs 5.9→3.3、reverse 0.41→0.19。
+  残余回退：f32 20K organ_pipe 1.34→1.48、rotated 1.23→1.30（约 +10%）。
+- **小 n 融合预扫描**（`vqsort_small_prescan`）：邻对升/降标志 + NaN/-0 一次向量
+  扫描。
 - **列式网络叶子**（`VColLeaf`，`parts/10b_vsort.hpp`；`FYX_VQ_COLUMN_LEAF=0` 可退回）：
   向量快排叶子由逐行 Batcher 网络（每个寄存器内级 = permute+min+max+blend）改为
   vqsort 式列布局：寄存器间最优网络（4/8/16 路 5/19/60 CE，16 路经 0-1 原则穷举

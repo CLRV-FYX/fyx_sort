@@ -258,6 +258,25 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// GCC at -O2 (the most common release flag) uses the "very cheap" vector cost
+// model and neither unswitches nor peels loops.  The library's branch-free
+// order / structure scans then run 2-4x slower than at -O3 (Ice Lake-SP,
+// GCC 12.2, 200K int32: sorted-input exit 0.71 vs 0.15 ns/elem, rotated 1.8
+// vs 0.85, block-swap 2.1 vs 1.2).  Enabling just those three optimisations
+// for the library's own functions recovers the -O3 numbers without changing
+// the caller's flags.  Clang (vectorises at -O2) and MSVC are unaffected;
+// define FYX_NO_OPTIMIZE_PRAGMA to opt out.  Popped at the end of the header.
+// ---------------------------------------------------------------------------
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER) && \
+    defined(__OPTIMIZE__) && !defined(__OPTIMIZE_SIZE__) && !defined(FYX_NO_OPTIMIZE_PRAGMA)
+#  define FYX_OPTIMIZE_PRAGMA_ACTIVE 1
+#  pragma GCC push_options
+#  pragma GCC optimize("vect-cost-model=dynamic", "unswitch-loops", "peel-loops")
+#else
+#  define FYX_OPTIMIZE_PRAGMA_ACTIVE 0
+#endif
+
+// ---------------------------------------------------------------------------
 // Attributes / builtins
 // ---------------------------------------------------------------------------
 #if FYX_GNUC_LIKE
@@ -462,8 +481,33 @@ inline constexpr std::size_t kVqsortMinN = 1u << 14;          // 16384
 #ifndef FYX_VQ_COMPRESS_TO_MEMORY
 #  define FYX_VQ_COMPRESS_TO_MEMORY 1
 #endif
+// Full unrolling of fixed-trip loops over register arrays / merge chains: GCC -O2 does
+// not unroll them on its own, which leaves the arrays in memory and cost the
+// partition ~30% at -O2 versus -O3 (Ice Lake-SP, GCC 12.2).
+#if defined(__clang__)
+#  define FYX_VQ_UNROLL _Pragma("unroll")
+#elif defined(__GNUC__)
+#  define FYX_VQ_UNROLL _Pragma("GCC unroll 16")
+#else
+#  define FYX_VQ_UNROLL
+#endif
+
+// Independent merge chains in the AVX-512 two-run merge (latency hiding).
+#ifndef FYX_VMERGE_CHAINS
+#  define FYX_VMERGE_CHAINS 2
+#endif
+
 // Lower bound of the small-range AVX-512 vector quicksort fast path.
 inline constexpr std::size_t kSmallVqsortMinN = 2;
+// Upper bound (exclusive) of that fast path.  It is the serial path for
+// every size the pool does not take (Auto mode parallelises from 1M); with
+// the column-network leaf the vector quicksort beats the probe stack of the
+// general path on random / duplicate-heavy input up to there (Ice Lake-SP,
+// GCC 12.2, int32 20K random 4.5 -> 2.3 ns/elem).
+#ifndef FYX_SMALL_VQ_MAX_N
+#  define FYX_SMALL_VQ_MAX_N (1u << 20)
+#endif
+inline constexpr std::size_t kSmallVqsortMaxN = FYX_SMALL_VQ_MAX_N;
 
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;
@@ -4012,6 +4056,7 @@ FYX_FORCE_INLINE std::uint64_t bzhi_mask(unsigned c) {
     return c >= 64 ? ~0ull : ((1ull << c) - 1ull);
 }
 
+
 template <class T>
 struct VOps;
 
@@ -4795,8 +4840,8 @@ inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
     if constexpr (TrackMax) vmax = P::set1(pivot);
 
     reg vl[U], vr[U];
-    for (int i = 0; i < U; ++i) vl[i] = P::loadu(a + static_cast<std::size_t>(i) * V);
-    for (int i = 0; i < U; ++i) vr[i] = P::loadu(a + n - static_cast<std::size_t>(i + 1) * V);
+    FYX_VQ_UNROLL for (int i = 0; i < U; ++i) vl[i] = P::loadu(a + static_cast<std::size_t>(i) * V);
+    FYX_VQ_UNROLL for (int i = 0; i < U; ++i) vr[i] = P::loadu(a + n - static_cast<std::size_t>(i + 1) * V);
     l += CH;
     r -= CH;
 
@@ -4804,13 +4849,13 @@ inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
         const bool from_right = (rs - r) < (l - ls);
         const std::size_t src = from_right ? (r - CH) : l;
         reg cur[U];
-        for (int i = 0; i < U; ++i) cur[i] = P::loadu(a + src + static_cast<std::size_t>(i) * V);
+        FYX_VQ_UNROLL for (int i = 0; i < U; ++i) cur[i] = P::loadu(a + src + static_cast<std::size_t>(i) * V);
         r -= from_right ? CH : 0;
         l += from_right ? 0 : CH;
         if constexpr (TrackMax) {
-            for (int i = 0; i < U; ++i) vpart_vec_lean_max<T, Strict>(a, ls, rs, cur[i], pv, vmax);
+            FYX_VQ_UNROLL for (int i = 0; i < U; ++i) vpart_vec_lean_max<T, Strict>(a, ls, rs, cur[i], pv, vmax);
         } else {
-            for (int i = 0; i < U; ++i) vpart_vec_lean<T, Strict>(a, ls, rs, cur[i], pv);
+            FYX_VQ_UNROLL for (int i = 0; i < U; ++i) vpart_vec_lean<T, Strict>(a, ls, rs, cur[i], pv);
         }
     }
     while (r - l >= static_cast<std::size_t>(V)) {
@@ -4837,11 +4882,11 @@ inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
             vpart_vec_lean_masked<T, Strict>(a, ls, rs, cur, pv, valid);
         }
     }
-    for (int i = 0; i < U; ++i) {
+    FYX_VQ_UNROLL for (int i = 0; i < U; ++i) {
         if constexpr (TrackMax) vpart_vec_lean_max<T, Strict>(a, ls, rs, vl[i], pv, vmax);
         else                    vpart_vec_lean<T, Strict>(a, ls, rs, vl[i], pv);
     }
-    for (int i = 0; i < U; ++i) {
+    FYX_VQ_UNROLL for (int i = 0; i < U; ++i) {
         if constexpr (TrackMax) vpart_vec_lean_max<T, Strict>(a, ls, rs, vr[i], pv, vmax);
         else                    vpart_vec_lean<T, Strict>(a, ls, rs, vr[i], pv);
     }
@@ -4969,6 +5014,264 @@ inline bool vrange_clean(const T* a, std::size_t n) {
     }
 }
 
+template <class T>
+FYX_FORCE_INLINE typename VOps<T>::mask vunclean_lanes(typename VOps<T>::reg v) {
+    using M = typename VOps<T>::mask;
+    if constexpr (std::is_same<T, float>::value) {
+        return static_cast<M>(_mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q) |
+                              _mm512_cmpeq_epi32_mask(_mm512_castps_si512(v),
+                                                      _mm512_set1_epi32(static_cast<int>(0x80000000u))));
+    } else if constexpr (std::is_same<T, double>::value) {
+        return static_cast<M>(_mm512_cmp_pd_mask(v, v, _CMP_UNORD_Q) |
+                              _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(v),
+                                                      _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ull))));
+    } else {
+        (void)v;
+        return 0;
+    }
+}
+
+template <class T>
+inline unsigned vsmall_prescan(const T* a, std::size_t n) {
+    using P = VOps<T>;
+    using M = typename P::mask;
+    constexpr std::size_t L = static_cast<std::size_t>(P::V);
+    constexpr bool fp = std::is_floating_point<T>::value;
+    M up = 0, dn = 0, bad = 0;
+    std::size_t i = 0;
+    if (n >= 2) {
+        for (; i + L + 1 <= n; i += L) {
+            const auto v = P::loadu(a + i);
+            const auto w = P::loadu(a + i + 1);
+            up  = static_cast<M>(up | P::gt(w, v));
+            dn  = static_cast<M>(dn | P::gt(v, w));
+            bad = static_cast<M>(bad | vunclean_lanes<T>(v));
+            if (up && dn) {
+                // Order is settled; what is left is the cleanliness scan.
+                // Floating point: the rest of the cleanliness scan is left to
+                // the caller (bit 3), which needs it only if the structural
+                // probes decline.
+                if constexpr (!fp) return 3u;
+                else return bad ? 7u : 11u;
+            }
+        }
+        // Remaining pairs (j, j+1) for j in [i, n-1): fewer than L + 1 keys.
+        const std::size_t k = n - 1 - i;            // pairs left, <= L
+        const M m = static_cast<M>(k >= L ? ~0ull : ((1ull << k) - 1ull));
+        const auto v = P::maskz_loadu(m, a + i);
+        const auto w = P::maskz_loadu(m, a + i + 1);
+        up  = static_cast<M>(up | (P::gt(w, v) & m));
+        dn  = static_cast<M>(dn | (P::gt(v, w) & m));
+        bad = static_cast<M>(bad | (vunclean_lanes<T>(v) & m));
+        i += k;                                      // a[n-1] not scanned yet
+    }
+    if constexpr (fp) {
+        if (n > 0 && i < n) {
+            const std::size_t r = n - i;             // 1 key (the last)
+            const M m = static_cast<M>((1ull << r) - 1ull);
+            bad = static_cast<M>(bad | (vunclean_lanes<T>(P::maskz_loadu(m, a + i)) & m));
+        }
+    }
+    return (up ? 1u : 0u) | (dn ? 2u : 0u) | (bad ? 4u : 0u);
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Two-run merge on radix keys: a 2V-element bitonic merge network per output
+// vector (one vector of carry against the next vector from whichever run has
+// the smaller head).  ~0.4 ns/key for int32 on Ice Lake-SP against ~1.5 for
+// the best scalar merge.  Works on encoded keys, so NaN / -0 / descending
+// follow the radix total order exactly.
+// ---------------------------------------------------------------------------
+template <class T>
+struct VMergeKeys {
+    static constexpr bool k64 = sizeof(T) == 8;
+    static constexpr int  V   = k64 ? 8 : 16;
+    using Key = typename std::conditional<k64, std::uint64_t, std::uint32_t>::type;
+    FYX_FORCE_INLINE static __m512i sign() {
+        return k64 ? _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ULL))
+                   : _mm512_set1_epi32(static_cast<int>(0x80000000u));
+    }
+    FYX_FORCE_INLINE static __m512i srai_top(__m512i x) {
+        if constexpr (k64) return _mm512_srai_epi64(x, 63); else return _mm512_srai_epi32(x, 31);
+    }
+    FYX_FORCE_INLINE static __m512i enc(__m512i x, __m512i flip) {
+        if constexpr (std::is_floating_point<T>::value)
+            x = _mm512_xor_si512(x, _mm512_or_si512(srai_top(x), sign()));
+        else if constexpr (std::is_signed<T>::value)
+            x = _mm512_xor_si512(x, sign());
+        return _mm512_xor_si512(x, flip);
+    }
+    FYX_FORCE_INLINE static __m512i dec(__m512i k, __m512i flip) {
+        k = _mm512_xor_si512(k, flip);
+        if constexpr (std::is_floating_point<T>::value)
+            k = _mm512_xor_si512(k, _mm512_or_si512(_mm512_andnot_si512(srai_top(k), _mm512_set1_epi32(-1)), sign()));
+        else if constexpr (std::is_signed<T>::value)
+            k = _mm512_xor_si512(k, sign());
+        return k;
+    }
+    FYX_FORCE_INLINE static __m512i vmin(__m512i a, __m512i b) {
+        if constexpr (k64) return _mm512_min_epu64(a, b); else return _mm512_min_epu32(a, b);
+    }
+    FYX_FORCE_INLINE static __m512i vmax(__m512i a, __m512i b) {
+        if constexpr (k64) return _mm512_max_epu64(a, b); else return _mm512_max_epu32(a, b);
+    }
+    FYX_FORCE_INLINE static __m512i stage(__m512i v, __m512i q, unsigned m) {
+        if constexpr (k64) return _mm512_mask_blend_epi64(static_cast<__mmask8>(m), vmin(v, q), vmax(v, q));
+        else return _mm512_mask_blend_epi32(static_cast<__mmask16>(m), vmin(v, q), vmax(v, q));
+    }
+    // sort one bitonic vector
+    FYX_FORCE_INLINE static __m512i bitonic(__m512i v) {
+        if constexpr (k64) {
+            v = stage(v, _mm512_shuffle_i64x2(v, v, 0x4E), 0xF0u);
+            v = stage(v, _mm512_permutex_epi64(v, 0x4E), 0xCCu);
+            v = stage(v, _mm512_shuffle_epi32(v, static_cast<_MM_PERM_ENUM>(0x4E)), 0xAAu);
+        } else {
+            v = stage(v, _mm512_shuffle_i32x4(v, v, 0x4E), 0xFF00u);
+            v = stage(v, _mm512_shuffle_i32x4(v, v, 0xB1), 0xF0F0u);
+            v = stage(v, _mm512_shuffle_epi32(v, static_cast<_MM_PERM_ENUM>(0x4E)), 0xCCCCu);
+            v = stage(v, _mm512_shuffle_epi32(v, static_cast<_MM_PERM_ENUM>(0xB1)), 0xAAAAu);
+        }
+        return v;
+    }
+    FYX_FORCE_INLINE static void merge2(__m512i a, __m512i b, __m512i& lo, __m512i& hi) {
+        const __m512i rev = k64 ? _mm512_set_epi64(0, 1, 2, 3, 4, 5, 6, 7)
+                                : _mm512_set_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        b  = k64 ? _mm512_permutexvar_epi64(rev, b) : _mm512_permutexvar_epi32(rev, b);
+        lo = bitonic(vmin(a, b));
+        hi = bitonic(vmax(a, b));
+    }
+};
+
+template <class T>
+struct VMergeChain {
+    const T* A; std::size_t na, ia;
+    const T* B; std::size_t nb, ib;
+    T* out; std::size_t o;
+    __m512i hi;
+};
+
+template <class T>
+FYX_FORCE_INLINE void vmerge_chain_init(VMergeChain<T>& c, __m512i flip) {
+    using M = VMergeKeys<T>;
+    constexpr std::size_t V = M::V;
+    __m512i lo;
+    M::merge2(M::enc(_mm512_loadu_si512(reinterpret_cast<const void*>(c.A)), flip),
+              M::enc(_mm512_loadu_si512(reinterpret_cast<const void*>(c.B)), flip), lo, c.hi);
+    _mm512_storeu_si512(reinterpret_cast<void*>(c.out), M::dec(lo, flip));
+    c.ia = V; c.ib = V; c.o = V;
+}
+
+template <class T, class KeyF>
+FYX_FORCE_INLINE bool vmerge_chain_live(const VMergeChain<T>& c, KeyF) {
+    constexpr std::size_t V = VMergeKeys<T>::V;
+    return c.ia + V <= c.na && c.ib + V <= c.nb;
+}
+
+template <class T, class KeyF>
+FYX_FORCE_INLINE void vmerge_chain_step(VMergeChain<T>& c, __m512i flip, KeyF key) {
+    using M = VMergeKeys<T>;
+    constexpr std::size_t V = M::V;
+    // Branch-free source select: which run feeds the next vector is a coin
+    // flip on interleaved data, so a branch here mispredicts every other step.
+    const bool fa = key(c.A[c.ia]) < key(c.B[c.ib]);
+    const std::uintptr_t msk = std::uintptr_t(0) - static_cast<std::uintptr_t>(fa);
+    const std::uintptr_t src = (reinterpret_cast<std::uintptr_t>(c.A + c.ia) & msk) |
+                               (reinterpret_cast<std::uintptr_t>(c.B + c.ib) & ~msk);
+    const __m512i nx = _mm512_loadu_si512(reinterpret_cast<const void*>(src));
+    c.ia += V & msk;
+    c.ib += V & ~msk;
+    __m512i lo;
+    M::merge2(c.hi, M::enc(nx, flip), lo, c.hi);
+    _mm512_storeu_si512(reinterpret_cast<void*>(c.out + c.o), M::dec(lo, flip));
+    c.o += V;
+}
+
+template <class T, class KeyF>
+inline void vmerge_chain_finish(VMergeChain<T>& c, __m512i flip, KeyF key) {
+    using M = VMergeKeys<T>;
+    constexpr std::size_t V = M::V;
+    while (vmerge_chain_live(c, key)) vmerge_chain_step(c, flip, key);
+    // carry (V keys) + the short rest -> S (< 2V keys); then S against the
+    // long rest by binary search and block copies.
+    alignas(64) T carry[V];
+    _mm512_store_si512(reinterpret_cast<void*>(carry), M::dec(c.hi, flip));
+    const bool a_short = c.ia + V > c.na;
+    const T* sh = a_short ? c.A + c.ia : c.B + c.ib;
+    const std::size_t nsh = a_short ? c.na - c.ia : c.nb - c.ib;
+    const T* lg = a_short ? c.B + c.ib : c.A + c.ia;
+    const std::size_t nlg = a_short ? c.nb - c.ib : c.na - c.ia;
+    T S[2 * V];
+    std::size_t ns = 0, ic = 0, is = 0;
+    while (ic < V && is < nsh) S[ns++] = key(sh[is]) < key(carry[ic]) ? sh[is++] : carry[ic++];
+    while (ic < V) S[ns++] = carry[ic++];
+    while (is < nsh) S[ns++] = sh[is++];
+    T* out = c.out;
+    std::size_t o = c.o, il = 0;
+    for (std::size_t j = 0; j < ns; ++j) {
+        const auto ks = key(S[j]);
+        std::size_t lo2 = il, hi2 = nlg;                // first long key > S[j]
+        while (lo2 < hi2) {
+            const std::size_t mid = lo2 + (hi2 - lo2) / 2;
+            if (ks < key(lg[mid])) hi2 = mid; else lo2 = mid + 1;
+        }
+        std::memcpy(static_cast<void*>(out + o), static_cast<const void*>(lg + il), (lo2 - il) * sizeof(T));
+        o += lo2 - il;
+        il = lo2;
+        out[o++] = S[j];
+    }
+    std::memcpy(static_cast<void*>(out + o), static_cast<const void*>(lg + il), (nlg - il) * sizeof(T));
+}
+
+// The network of one step is a ~20-cycle dependency chain on the carry, so
+// the output is cut at co-ranks into independent chains that are stepped
+// round-robin (the out-of-order core overlaps them).
+template <class T, class KeyF>
+inline void vmerge_runs_impl(const T* A, std::size_t na, const T* B, std::size_t nb, T* out,
+                             bool descending, KeyF key) {
+    using M = VMergeKeys<T>;
+    constexpr std::size_t V = M::V;
+    constexpr int C = FYX_VMERGE_CHAINS;
+    const __m512i flip = descending ? _mm512_set1_epi32(-1) : _mm512_setzero_si512();
+    const std::size_t N = na + nb;
+    VMergeChain<T> ch[C];
+    std::size_t sa_prev = 0, sb_prev = 0;
+    bool split_ok = true;
+    for (int c = 0; c < C; ++c) {
+        std::size_t sa = na, sb = nb;
+        if (c + 1 < C) {
+            const std::size_t sidx = N / C * static_cast<std::size_t>(c + 1);
+            std::size_t lo = sidx > nb ? sidx - nb : 0, hi = sidx < na ? sidx : na;
+            while (lo < hi) {                       // smallest i with B[s-i-1] < A[i]
+                const std::size_t i = lo + (hi - lo) / 2;
+                const std::size_t j = sidx - i;
+                if (j > 0 && !(key(B[j - 1]) < key(A[i]))) lo = i + 1; else hi = i;
+            }
+            sa = lo; sb = sidx - lo;
+        }
+        ch[c].A = A + sa_prev; ch[c].na = sa - sa_prev;
+        ch[c].B = B + sb_prev; ch[c].nb = sb - sb_prev;
+        ch[c].out = out + sa_prev + sb_prev;
+        if (ch[c].na < V || ch[c].nb < V) split_ok = false;
+        sa_prev = sa; sb_prev = sb;
+    }
+    if (!split_ok) {
+        VMergeChain<T> one{A, na, 0, B, nb, 0, out, 0, _mm512_setzero_si512()};
+        vmerge_chain_init(one, flip);
+        vmerge_chain_finish(one, flip, key);
+        return;
+    }
+    for (int c = 0; c < C; ++c) vmerge_chain_init(ch[c], flip);
+    for (;;) {
+        bool live = true;
+        for (int c = 0; c < C; ++c) live = live && vmerge_chain_live(ch[c], key);
+        if (!live) break;
+        FYX_VQ_UNROLL for (int c = 0; c < C; ++c) vmerge_chain_step(ch[c], flip, key);
+    }
+    for (int c = 0; c < C; ++c) vmerge_chain_finish(ch[c], flip, key);
+}
+
 } // namespace isa_avx512
 } // namespace detail
 } // namespace fyx
@@ -4978,6 +5281,31 @@ FYX_ISA_END
 
 namespace fyx {
 namespace detail {
+
+/// SIMD merge of two sorted runs (radix-key order, `descending` flips it)
+/// into out[0..na+nb).  Returns false when no vector kernel applies; the
+/// caller then merges itself.  Requires na, nb >= one vector.
+template <class T>
+inline bool vmerge_runs(const T* A, std::size_t na, const T* B, std::size_t nb, T* out,
+                        bool descending) {
+#if FYX_HAS_AVX512_CODE
+    if constexpr (radix_supported_v<T> && (sizeof(T) == 4 || sizeof(T) == 8)) {
+        if (!use_avx512() || na < 16 || nb < 16) return false;
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+        isa_avx512::vmerge_runs_impl(A, na, B, nb, out, descending,
+            [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); });
+        return true;
+    } else {
+        (void)A; (void)na; (void)B; (void)nb; (void)out; (void)descending;
+        return false;
+    }
+#else
+    (void)A; (void)na; (void)B; (void)nb; (void)out; (void)descending;
+    return false;
+#endif
+}
 
 /// Types the vectorised quicksort has a kernel for.
 template <class T>
@@ -5010,6 +5338,18 @@ template <class T>
 inline bool vqsort_range_clean(const T* p, std::size_t n) {
     if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; return false; }
     else return isa_avx512::vrange_clean<T>(p, n);
+}
+
+/// One fused pass for the small-n front door: neighbour order flags plus the
+/// NaN / -0 scan.  Bit 0 of the result: some a[j] < a[j+1]; bit 1: some
+/// a[j+1] < a[j]; bit 2: the range is NOT clean (then the order bits are
+/// meaningless -- hardware order differs from the library's total order);
+/// bit 3: cleanliness not established -- the scan stopped once both
+/// directions were seen (always with bits 0 and 1 set, bit 2 clear).
+template <class T>
+inline unsigned vqsort_small_prescan(const T* p, std::size_t n) {
+    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; return 4u; }
+    else return isa_avx512::vsmall_prescan<T>(p, n);
 }
 
 /// Depth budget: 2 log2(n) partitions is what a correct pivot stream needs;
@@ -5070,6 +5410,7 @@ inline constexpr std::size_t vqsort_leaf() {
 
 #else  // no AVX-512 kernel compiled in
 
+template <class T> inline unsigned vqsort_small_prescan(const T*, std::size_t) { return 4u; }
 template <class T> inline bool   vqsort_range_clean(const T*, std::size_t) { return false; }
 inline int                       vqsort_budget(std::size_t) { return 0; }
 template <class T> inline void   vqsort_serial(T*, std::size_t) {}
@@ -7341,6 +7682,322 @@ inline FastOrderKind blocked_radix_order_kind(const T* p, std::size_t n, bool de
     if (up && down) return FastOrderKind::None;
     const bool ascending_run = up != 0;
     return ascending_run != descending ? FastOrderKind::Sorted : FastOrderKind::Reverse;
+}
+
+// Merge two sorted runs A[0..na) and B[0..nb) into out[0..na+nb) as four
+// independent branch-free merges over co-ranked output quarters.  A single
+// branch-free merge is bound by its load -> compare -> index dependency
+// (~3 ns/key on Ice Lake-SP); four interleaved chains run at ~1.5 ns/key.
+// Reads A[na] and B[nb] (never uses them): both must be addressable.
+template <class T, class KeyF>
+inline void merge_runs_4way(const T* A, std::size_t na, const T* B, std::size_t nb, T* out, KeyF key) {
+    constexpr int C = 4;
+    using Key  = decltype(key(*A));
+    using Bits = typename std::conditional<sizeof(T) == 8, std::uint64_t,
+                 typename std::conditional<sizeof(T) == 4, std::uint32_t,
+                 typename std::conditional<sizeof(T) == 2, std::uint16_t, std::uint8_t>::type>::type>::type;
+    static_assert(sizeof(Bits) == sizeof(T) && std::is_trivially_copyable<T>::value, "raw-bit merge");
+    const std::size_t N = na + nb;
+    std::size_t sa[C + 1], sb[C + 1];
+    for (int c = 0; c <= C; ++c) {
+        const std::size_t s = N / C * static_cast<std::size_t>(c) + (c == C ? N % C : 0);
+        std::size_t lo = s > nb ? s - nb : 0, hi = s < na ? s : na;
+        while (lo < hi) {                  // smallest i with B[s-i-1] < A[i]
+            const std::size_t i = lo + (hi - lo) / 2;
+            const std::size_t j = s - i;
+            if (j > 0 && !(key(B[j - 1]) < key(A[i]))) lo = i + 1; else hi = i;
+        }
+        sa[c] = lo;
+        sb[c] = s - lo;
+    }
+    std::size_t a[C], ae[C], b[C], be[C], o[C];
+    std::size_t steps = N;
+    for (int c = 0; c < C; ++c) {
+        a[c] = sa[c]; ae[c] = sa[c + 1];
+        b[c] = sb[c]; be[c] = sb[c + 1];
+        o[c] = sa[c] + sb[c];
+        steps = std::min(steps, (sa[c + 1] + sb[c + 1]) - o[c]);
+    }
+    for (std::size_t t = 0; t < steps; ++t) {
+        FYX_VQ_UNROLL for (int c = 0; c < C; ++c) {
+            const Key ka = key(A[a[c]]);
+            const Key kb = key(B[b[c]]);
+            const bool ta = (a[c] < ae[c]) & ((b[c] >= be[c]) | !(kb < ka));
+            // Mask select on raw bits: GCC turns value selects on FP into
+            // branches, which mispredict on every interleaving.
+            if constexpr (std::is_integral<T>::value) {
+                out[o[c]++] = ta ? A[a[c]] : B[b[c]];
+            } else {
+            Bits va, vb;
+            std::memcpy(&va, A + a[c], sizeof(T));
+            std::memcpy(&vb, B + b[c], sizeof(T));
+            const Bits mk = static_cast<Bits>(Bits(0) - static_cast<Bits>(ta));
+            const Bits v = static_cast<Bits>((va & mk) | (vb & static_cast<Bits>(~mk)));
+            std::memcpy(out + o[c]++, &v, sizeof(T));
+            }
+            a[c] += static_cast<std::size_t>(ta);
+            b[c] += static_cast<std::size_t>(!ta);
+        }
+    }
+    for (int c = 0; c < C; ++c) {
+        while (a[c] < ae[c] && b[c] < be[c]) {
+            const bool ta = !(key(B[b[c]]) < key(A[a[c]]));
+            out[o[c]++] = ta ? A[a[c]] : B[b[c]];
+            a[c] += static_cast<std::size_t>(ta);
+            b[c] += static_cast<std::size_t>(!ta);
+        }
+        while (a[c] < ae[c]) out[o[c]++] = A[a[c]++];
+        while (b[c] < be[c]) out[o[c]++] = B[b[c]++];
+    }
+}
+
+template <class T>
+inline std::size_t radix_key_find_break(const T* p, std::size_t start, std::size_t hi,
+                                        typename RadixTraits<T>::Key prev_key,
+                                        const bool want_up, const bool descending);
+
+// Neighbour descents (in target order) over the whole range, counted in
+// branch-free 256-pair blocks; stops once the count exceeds `cap` and then
+// returns cap + 1.  `first` gets the start of the 256-pair block holding the
+// first descent (exact position: radix_key_find_break from there).
+template <class T>
+inline std::size_t count_descents_capped(const T* p, std::size_t n, bool descending,
+                                         std::size_t cap, std::size_t& first) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    std::size_t d = 0;
+    first = n;
+    for (std::size_t b = 1; b < n; b += 256) {
+        const std::size_t e = std::min(n, b + 256);
+        Key bd = 0;                        // same lane width as the keys: vectorizes
+        for (std::size_t j = b; j < e; ++j)
+            bd = static_cast<Key>(bd + static_cast<Key>(static_cast<Key>(RT::encode(p[j]) ^ flip) <
+                                                        static_cast<Key>(RT::encode(p[j - 1]) ^ flip)));
+        if (bd != 0 && first == n) first = b;       // block of the first descent
+        d += bd;
+        if (d > cap) return cap + 1;
+    }
+    return d;
+}
+
+// Exactly two ascending runs p[0..brk) and p[brk..n): rotate when the second
+// run lies entirely below the first, otherwise one four-way merge.
+template <class T>
+inline void merge_two_runs(T* p, std::size_t n, std::size_t brk, bool descending) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+    if (!(key(p[0]) < key(p[n - 1]))) {          // back <= front: a rotation
+        std::rotate(p, p + brk, p + n);
+        return;
+    }
+    const std::size_t nb = n - brk;
+    {
+        // The thread arena keeps the scratch mapped across calls (a fresh
+        // allocation of this size page-faults on every call).
+        ScratchLease<T> out(n);
+        if (out.valid() && vmerge_runs(p, brk, p + brk, nb, out.get(), descending)) {
+            std::memcpy(static_cast<void*>(p), static_cast<const void*>(out.get()), n * sizeof(T));
+            return;
+        }
+    }
+    std::unique_ptr<T[]> tmp(new T[nb + 1]);
+    std::memcpy(static_cast<void*>(tmp.get()), static_cast<const void*>(p + brk), nb * sizeof(T));
+    std::unique_ptr<T[]> out(new T[n]);
+    merge_runs_4way(p, brk, tmp.get(), nb, out.get(), key);   // reads p[brk], tmp[nb]
+    std::memcpy(static_cast<void*>(p), static_cast<const void*>(out.get()), n * sizeof(T));
+}
+
+// A handful of monotone runs (organ pipe, block swaps, concatenations, a
+// rotation, mixed ascending / descending stretches): split into maximal runs
+// (descending ones reversed), then pairwise merges ping-ponging through one
+// leased buffer, each through the SIMD two-run merge when it applies.
+// Detection is read-only and gives up past `max_runs` runs, so a declined
+// range is untouched; random data declines within a few dozen keys.
+template <class T>
+inline bool try_few_runs_merge(T* p, std::size_t n, bool descending) {
+    constexpr std::size_t kMaxRuns = 8;
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+    std::size_t bnd[kMaxRuns + 1];
+    bool rev[kMaxRuns];
+    const std::size_t min_run = std::max<std::size_t>(32, n / 64);
+    std::size_t R = 0, i = 0;
+    while (i < n) {
+        if (R == kMaxRuns) return false;
+        const std::size_t start = i;
+        std::size_t j = i + 1;
+        const Key k0 = key(p[i]);
+        while (j < n && key(p[j]) == k0) ++j;
+        const bool down = j < n && key(p[j]) < k0;
+        // vectorised run end (non-strict in the run's own direction)
+        if (j < n) j = radix_key_find_break(p, j, n, RT::encode(p[j - 1]), !down, descending);
+        // Short runs mean local disorder (insertion's job) or noise.
+        if (j - start < min_run) return false;
+        bnd[R] = start;
+        rev[R] = down;
+        ++R;
+        i = j;
+    }
+    bnd[R] = n;
+    if (R < 2) return false;
+    for (std::size_t r = 0; r < R; ++r)
+        if (rev[r]) std::reverse(p + bnd[r], p + bnd[r + 1]);
+    ScratchLease<T> lease(n);
+    std::unique_ptr<T[]> priv;
+    if (!lease.valid()) priv.reset(new T[n]);
+    T* buf = lease.valid() ? lease.get() : priv.get();
+    T* src = p;
+    T* dst = buf;
+    auto less = [&](const T& a, const T& b) { return key(a) < key(b); };
+    while (R > 1) {
+        std::size_t w = 0;
+        for (std::size_t r = 0; r < R; r += 2) {
+            const std::size_t lo = bnd[r];
+            if (r + 1 == R) {
+                std::memcpy(static_cast<void*>(dst + lo), static_cast<const void*>(src + lo),
+                            (bnd[r + 1] - lo) * sizeof(T));
+            } else {
+                const std::size_t mid = bnd[r + 1], hi = bnd[r + 2];
+                if (!vmerge_runs(src + lo, mid - lo, src + mid, hi - mid, dst + lo, descending))
+                    std::merge(src + lo, src + mid, src + mid, src + hi, dst + lo, less);
+            }
+            bnd[w++] = lo;
+        }
+        bnd[w] = n;
+        R = w;
+        std::swap(src, dst);
+    }
+    if (src != p) std::memcpy(static_cast<void*>(p), static_cast<const void*>(src), n * sizeof(T));
+    return true;
+}
+
+// Extract-and-merge repair for "sorted with a minority out of place": a
+// sorted range with a few far displacements, a sorted prefix followed by an
+// unsorted tail, two (or a few) concatenated sorted runs.  One pass keeps a
+// non-decreasing subsequence in place (compacted to the front) and moves the
+// rest to a side buffer: on a descent either the new key or the previous kept
+// key -- whichever breaks the order -- is set aside.  The side buffer is then
+// sorted (if it is not already) and merged back from the right, branch-free.
+// Cost on success: one scan + sort(side) + one merge, against a full sort.
+//
+// Random-like input is rejected after a few hundred keys: the abort tests are
+// (a) the kept subsequence falls below half of what was scanned, (b) the side
+// buffer turns disordered (descents inside it beyond i/8 + 64 or n/16 + 64),
+// (c) the side buffer exceeds n/2.  On abort the side keys are written back
+// behind the kept ones, so the range is still a permutation of the input.
+template <class T, class SideSort>
+inline bool try_extract_merge_repair(T* p, std::size_t n, bool descending, SideSort&& side_sort) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    if (n < 2048) return false;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+
+    const std::size_t cap = n / 2 + 1;
+    // One leased block holds the side buffer and the merge output; the side
+    // sort below nests and so allocates privately if it needs scratch.
+    ScratchLease<T> lease(cap + n);
+    std::unique_ptr<T[]> priv;
+    if (!lease.valid()) priv.reset(new T[cap + n]);
+    T* const sd  = lease.valid() ? lease.get() : priv.get();
+    T* const obuf = sd + cap;
+    std::size_t m = 0;
+    std::size_t k = 1, side_desc = 0;
+    Key klast = key(p[0]);
+    Key sidelast = 0;
+    bool ok = true;
+    bool kept_last = true;                 // retry the block skip only after a keep
+    std::size_t i = 1;
+    for (; i < n; ++i) {
+        // Ordered stretches move 16 keys at a time (branch-free test, then a
+        // block copy -- nothing to copy at all before the first extraction).
+        while (kept_last && i + 16 <= n) {
+            unsigned bad = static_cast<unsigned>(key(p[i]) < klast);
+            for (std::size_t j = 1; j < 16; ++j)
+                bad |= static_cast<unsigned>(key(p[i + j]) < key(p[i + j - 1]));
+            if (bad) break;
+            if (k != i) std::memmove(static_cast<void*>(p + k), static_cast<const void*>(p + i), 16 * sizeof(T));
+            k += 16;
+            i += 16;
+            klast = key(p[k - 1]);
+        }
+        if (i >= n) break;
+        const T x = p[i];
+        const Key kx = key(x);
+        if (!(kx < klast)) {               // in order: keep
+            p[k++] = x;
+            klast = kx;
+            kept_last = true;
+            continue;
+        }
+        kept_last = false;
+        // Descent.  If at most 8 kept keys exceed x (and at least one kept
+        // key does not), those are the outliers: move them aside and keep x.
+        // Otherwise x is the outlier.
+        std::size_t j = 1;
+        while (j < 8 && j < k && kx < key(p[k - 1 - j])) ++j;
+        if (j < k && !(kx < key(p[k - 1 - j]))) {
+            for (std::size_t q = k - j; q < k; ++q) {
+                const Key kq = key(p[q]);
+                if (m != 0 && kq < sidelast) ++side_desc;
+                sidelast = kq;
+                sd[m++] = p[q];
+            }
+            k -= j;
+            p[k++] = x;
+            klast = kx;
+        } else {
+            if (m != 0 && kx < sidelast) ++side_desc;
+            sidelast = kx;
+            sd[m++] = x;
+        }
+        if ((i & 255u) == 0 || m + 8 >= cap) {
+            if (2 * k + 64 < i || m + 8 >= cap ||
+                side_desc > (i >> 3) + 64 || side_desc > (n >> 4) + 64) {
+                ok = false;
+                ++i;
+                break;
+            }
+        }
+    }
+    if (ok && side_desc > (n >> 4) + 64) ok = false;
+    if (!ok) {
+        // p[0..k) kept, side holds the rest of [0, i), p[i..n) untouched.
+        std::copy(sd, sd + m, p + k);
+        return false;
+    }
+    if (m == 0) return true;
+    if (side_desc != 0) side_sort(sd, m);
+    // Backward merge: kept run in p[0..k), side run in side[0..m), k + m == n.
+    if (m * 32 < k) {
+        // Few side keys: binary-search each one's slot and shift whole kept
+        // blocks (memmove bandwidth instead of a compare per key).
+        std::size_t hi = k;                // kept keys [0, hi) not yet placed
+        for (std::size_t b = m; b-- > 0;) {
+            const Key kb = key(sd[b]);
+            std::size_t lo = 0, h = hi;    // first kept index with key > kb
+            while (lo < h) {
+                const std::size_t mid = lo + (h - lo) / 2;
+                if (kb < key(p[mid])) h = mid; else lo = mid + 1;
+            }
+            const std::size_t cnt = hi - lo;
+            if (cnt) std::memmove(static_cast<void*>(p + lo + b + 1), static_cast<const void*>(p + lo), cnt * sizeof(T));
+            p[lo + b] = sd[b];
+            hi = lo;
+        }
+        return true;
+    }
+    // Large side: four-way merge into a scratch buffer, then copy back.
+    // (A[k] = p[k] is addressable since m >= 1; sd has cap >= m + 1.)
+    if (!vmerge_runs(p, k, sd, m, obuf, descending))
+        merge_runs_4way(p, k, sd, m, obuf, key);
+    std::memcpy(static_cast<void*>(p), static_cast<const void*>(obuf), n * sizeof(T));
+    return true;
 }
 
 // Insertion repair over radix keys (the library's total order, so NaN / -0
@@ -15059,7 +15716,9 @@ inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp) {
             if (!lease->valid()) return false;
             buf = lease->get();
         }
-        sort_st(p + head, tail - head, comp, false);
+        // `descending` must follow comp: radix-key kernels sort ascending and
+        // reverse for a ">" comparator (with NaN the order differs from comp).
+        sort_st(p + head, tail - head, comp, is_descending_v<Comp, T>);
         if (tail < n) merge_adjacent_runs(p, head, tail, n, buf, before);
         merge_adjacent_runs(p, 0, head, n, buf, before);
         return true;
@@ -15993,7 +16652,6 @@ template <class T, class Comp>
 inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options& o) {
     (void)o;   // consumed only by the parallel branches (compiled out otherwise)
     if (n == 0) return;
-    const detail::VqCleanMemoScope vq_clean_scope;
 #if FYX_ENABLE_GPU
     // If the caller asked for the GPU and a backend is present, try it; on any
     // failure (no device, compile error, ...) it returns false and we fall
@@ -16010,9 +16668,34 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
     // inputs.  One branch-free order scan keeps sorted / reverse / all-equal
     // inputs O(n); random input leaves that scan after a single block.
     if constexpr (detail::vqsort_kernel_supported_v<T> && detail::vqsort_preferred<T>()) {
-        if (radix_ok && n >= detail::kSmallVqsortMinN && n < detail::kVqsortMinN &&
-            detail::use_avx512()) {
-            const detail::FastOrderKind k = detail::blocked_radix_order_kind(p, n, descending);
+#if FYX_ENABLE_PARALLEL
+        const bool small_vq_serial = !detail::dynamic_parallel_allowed<T>(n, o);
+#else
+        const bool small_vq_serial = true;
+#endif
+        if (radix_ok && n >= detail::kSmallVqsortMinN && n < detail::kSmallVqsortMaxN &&
+            small_vq_serial && detail::use_avx512()) {
+            // One fused vector pass: neighbour order + NaN / -0 scan.  When
+            // the range is clean hardware order is the library's order; else
+            // the radix-key scan decides.
+            // Bitwise all-equal first: random input differs in the first
+            // bytes, and an all-equal range costs one memcmp.
+            if (std::memcmp(p, p + 1, (n - 1) * sizeof(T)) == 0) {
+                detail::record_dispatch(detail::DispatchDecision::ProfileAllEqual);
+                return;
+            }
+            const unsigned pre = detail::vqsort_small_prescan(p, n);
+            const bool clean = (pre & 4u) == 0;   // as far as scanned
+            detail::FastOrderKind k;
+            if (clean) {
+                const bool up = (pre & 1u) != 0, dn = (pre & 2u) != 0;
+                k = (!up && !dn) ? detail::FastOrderKind::AllEqual
+                  : (up && dn)   ? detail::FastOrderKind::None
+                  : (up != descending) ? detail::FastOrderKind::Sorted
+                                       : detail::FastOrderKind::Reverse;
+            } else {
+                k = detail::blocked_radix_order_kind(p, n, descending);
+            }
             if (k == detail::FastOrderKind::AllEqual) {
                 detail::record_dispatch(detail::DispatchDecision::ProfileAllEqual);
                 return;
@@ -16022,45 +16705,100 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                 return;
             }
             if (k == detail::FastOrderKind::Reverse) {
-                std::reverse(p, p + n);
+                detail::reverse_range_adaptive(p, n);
                 detail::record_dispatch(detail::DispatchDecision::ProfileReverse);
                 return;
             }
-            // Few-run shapes (rotated, organ pipe, bitonic) are O(n) for the
-            // structural kernels; each rejects random data within a few
-            // hundred elements.
-            // Up to one leaf the column network sorts any shape in a few
-            // hundred vector ops; the structural probes would cost as much.
+            // Few-run shapes (rotated, organ pipe, bitonic, permuted blocks)
+            // are O(n) for the structural kernels; each rejects random data
+            // within a short scan.  Up to one leaf the column network sorts
+            // any shape in a few hundred vector ops, so they are skipped.
             if (n > detail::vqsort_leaf<T>()) {
-                if (detail::try_one_break_rotate(p, n, descending)) {
-                    detail::record_dispatch(detail::DispatchDecision::ProfileSorted);
-                    return;
-                }
-                if (detail::try_zigzag_organ_pipe_sort(p, n, comp) ||
-                    detail::try_numeric_half_organ_fill(p, n, comp) ||
-                    detail::try_bitonic_runs_sort(p, n, comp)) {
+                // Route by the number of descents (counted up to n/16).
+                std::size_t brk = n;
+                const std::size_t D = detail::count_descents_capped(p, n, descending, n / 16, brk);
+                if (D == 1) {
+                    // Two runs (concatenated sorted halves, a rotation).
+                    brk = detail::radix_key_find_break(p, brk, n, detail::RadixTraits<T>::encode(p[brk - 1]),
+                                                       true, descending);
+                    detail::merge_two_runs(p, n, brk, descending);
                     detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                     return;
                 }
-                // Near-sorted (a few local displacements): the head block has
-                // almost no inverted neighbours.  Bounded insertion rehearses
-                // and declines within its budget otherwise.
-                const std::size_t head = std::min<std::size_t>(n - 1, 256);
-                if (detail::head_inversions_within(p, n, descending, head, head / 32) &&
-                    detail::budgeted_insertion_repair(p, n, descending, n / 4 + 64)) {
+                // A few monotone runs either way (organ pipe, block swaps).
+                if (detail::try_few_runs_merge(p, n, descending)) {
                     detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                    return;
+                }
+                if (D > n / 16) {
+                    // Dense descents: organ pipe / bitonic / zigzag families.
+                    if (detail::try_zigzag_organ_pipe_sort(p, n, comp) ||
+                        (detail::likely_mid_bitonic_runs(p, n, comp) &&
+                         detail::try_bitonic_runs_sort(p, n, comp)) ||
+                        detail::try_numeric_half_organ_fill(p, n, comp) ||
+                        detail::try_bitonic_runs_sort(p, n, comp)) {
+                        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                        return;
+                    }
+                } else if (D > 1) {
+                    // Sparse descents: mostly sorted.  Local displacements go
+                    // to bounded insertion, permuted blocks to the structural
+                    // proof, a minority of far / tail keys to extract-merge.
+                    const std::size_t head = std::min<std::size_t>(n - 1, 256);
+                    if (D <= n / 128 &&
+                        detail::head_inversions_within(p, n, descending, head, head / 32) &&
+                        detail::budgeted_insertion_repair(p, n, descending, n / 4 + 64)) {
+                        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                        return;
+                    }
+                    if (detail::try_proof_structured_sort(p, n, descending)) {
+                        detail::record_dispatch(detail::DispatchDecision::ProfileSorted);
+                        return;
+                    }
+                    if (detail::try_extract_merge_repair(p, n, descending, [&](T* q, std::size_t m) {
+                            sort_pointer_core_impl(q, m, comp, o);
+                        })) {
+                        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                        return;
+                    }
+                }
+            }
+            // Narrow integer domains: dense counting is O(n + range) and beats
+            // any comparison sort there; the probe samples and declines fast.
+            // A 64-key strided sample bounds the range from below; only a
+            // range small beside n gets the (heavier) counting probe.
+            if constexpr (std::is_integral<T>::value) {
+                bool narrow = false;
+                if (n >= detail::kCountingMinN) {
+                    using UK = typename std::make_unsigned<T>::type;
+                    T lo = p[0], hi = p[0];
+                    for (std::size_t j = 1; j < 64; ++j) {
+                        const T x = p[(j * n) >> 6];
+                        lo = x < lo ? x : lo;
+                        hi = hi < x ? x : hi;
+                    }
+                    const UK span = static_cast<UK>(static_cast<UK>(hi) - static_cast<UK>(lo));
+                    narrow = static_cast<unsigned long long>(span) <=
+                             static_cast<unsigned long long>(std::max<std::size_t>(4096, n / 8));
+                }
+                if (narrow && detail::try_integer_range_count_sort<T>(p, n, descending, nullptr)) {
+                    detail::record_dispatch(detail::DispatchDecision::LowCardinality);
                     return;
                 }
             }
             // NaN / unclean ranges take the general path below.
-            if (detail::vq_range_clean_memo(p, n)) {
+            if (clean && ((pre & 8u) == 0 || detail::vqsort_range_clean(p, n))) {
                 detail::vqsort_serial(p, n);
-                if (descending) std::reverse(p, p + n);
+                if (descending) detail::reverse_range_adaptive(p, n);
                 detail::record_dispatch(detail::DispatchDecision::VectorQuick);
                 return;
             }
         }
     }
+
+    // The NaN / -0 scan is memoised per top-level call from here on (the
+    // large-n probes may ask several times about the same range).
+    const detail::VqCleanMemoScope vq_clean_scope;
 
 #if FYX_ENABLE_FAST_PATHS
     if (n > detail::kNetworkMax && detail::try_parallel_all_equal_exit(p, n, comp)) return;
@@ -16904,12 +17642,19 @@ inline int fyx_sort_double(double* d, std::size_t n) noexcept { FYX_C_ABI_BODY(f
 // ===========================================================================
 
 #if FYX_ENABLE_GPU
+#if FYX_OPTIMIZE_PRAGMA_ACTIVE
+#  pragma GCC pop_options
+#endif
 #include <dlfcn.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
+#if FYX_OPTIMIZE_PRAGMA_ACTIVE
+#  pragma GCC push_options
+#  pragma GCC optimize("vect-cost-model=dynamic", "unswitch-loops", "peel-loops")
+#endif
 
 namespace fyx {
 namespace detail {
@@ -17123,5 +17868,12 @@ inline bool gpu_sort_dispatch(T* p, std::size_t n, Comp, const Options&) {
 } // namespace fyx
 
 #endif // FYX_ENABLE_GPU
+
+// ===========================================================================
+//  Section 99 -- epilogue: restore the caller's optimisation options.
+// ===========================================================================
+#if FYX_OPTIMIZE_PRAGMA_ACTIVE
+#  pragma GCC pop_options
+#endif
 
 #endif // FYX_SORT_HPP_INCLUDED

@@ -17,12 +17,19 @@
 // ===========================================================================
 
 #if FYX_ENABLE_GPU
+#if FYX_OPTIMIZE_PRAGMA_ACTIVE
+#  pragma GCC pop_options
+#endif
 #include <dlfcn.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
+#if FYX_OPTIMIZE_PRAGMA_ACTIVE
+#  pragma GCC push_options
+#  pragma GCC optimize("vect-cost-model=dynamic", "unswitch-loops", "peel-loops")
+#endif
 
 namespace fyx {
 namespace detail {

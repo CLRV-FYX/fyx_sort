@@ -107,7 +107,8 @@ static std::vector<T> make(Shape s, std::size_t n) {
 template <class T>
 static void run_type(const char* tname) {
     static const std::size_t sizes[] = {
-        0, 1, 2, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1000,
+        0, 1, 2, 3, 15, 17, 31, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+        300, 511, 512, 513, 1000,
         16383, 16384, 16385, 70000
     };
     static const Shape shapes[] = {
@@ -192,7 +193,9 @@ static void run_float_edge(const char* tname) {
     {
         std::vector<T> v(70000);
         for (auto& x : v) x = from_u64<T>(rng());
-        CHECK(fd::vqsort_range_clean(v.data(), v.size()), "clean range accepted");
+        // (a build without the kernel refuses everything, which is safe)
+        CHECK(!fd::vqsort_usable<T>(v.size()) || fd::vqsort_range_clean(v.data(), v.size()),
+              "clean range accepted");
 
         std::vector<T> with_nan = v;
         with_nan[with_nan.size() / 3] = qnan;
@@ -245,6 +248,158 @@ static void run_float_edge(const char* tname) {
     std::printf("  %-8s NaN / -0 edge cases ok\n", tname);
 }
 
+// ---------------------------------------------------------------------------
+// 4: the leaf network on every size it serves, and the small-n prescan
+// ---------------------------------------------------------------------------
+template <class T>
+static void run_leaf_and_prescan(const char* tname) {
+#if FYX_HAS_AVX512_CODE
+    if (!fd::use_avx512() || !fd::vqsort_kernel_supported_v<T>) return;
+    for (std::size_t n = 1; n <= 520; ++n) {
+        for (int rep = 0; rep < 6; ++rep) {
+            std::vector<T> v(n + 16);
+            for (auto& x : v) x = from_u64<T>(rep % 3 == 0 ? rng() % 5 : rng());
+            std::vector<T> want(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(n));
+            std::sort(want.begin(), want.end());
+            const std::vector<T> guard(v.begin() + static_cast<std::ptrdiff_t>(n), v.end());
+            fd::isa_avx512::vnet_sort<T>(v.data(), n);
+            const bool ok = std::equal(want.begin(), want.end(), v.begin()) &&
+                            std::equal(guard.begin(), guard.end(), v.begin() + static_cast<std::ptrdiff_t>(n));
+            if (!ok) {
+                std::printf("  FAIL: %s leaf n=%zu rep=%d\n", tname, n, rep);
+                ++failures;
+            }
+            ++checks;
+        }
+    }
+    for (std::size_t n = 1; n <= 300; n += (n < 80 ? 1 : 37)) {
+        for (int rep = 0; rep < 8; ++rep) {
+            std::vector<T> v(n);
+            for (auto& x : v) x = from_u64<T>(rep < 2 ? 7 : rng() % 1000);
+            if (rep == 2 || rep == 4) std::sort(v.begin(), v.end());
+            if (rep == 3 || rep == 5) std::sort(v.begin(), v.end(), std::greater<T>());
+            if constexpr (std::is_floating_point<T>::value) {
+                if (rep == 4) v[rng() % n] = std::numeric_limits<T>::quiet_NaN();
+                if (rep == 5) v[rng() % n] = T(-0.0);
+            }
+            unsigned up = 0, dn = 0;
+            for (std::size_t j = 0; j + 1 < n; ++j) { up |= v[j] < v[j + 1]; dn |= v[j + 1] < v[j]; }
+            bool bad = false;
+            if constexpr (std::is_floating_point<T>::value)
+                for (T x : v) bad |= (x != x) || (x == T(0) && std::signbit(x));
+            const unsigned got = fd::vqsort_small_prescan(v.data(), n);
+            // Bit 3 (cleanliness left unchecked) only after both directions
+            // were seen in a clean prefix.
+            const bool ok = (got & 8u)
+                ? ((got & 7u) == 3u && up && dn)
+                : (((got & 4u) != 0) == bad && (bad || (got & 3u) == (up | (dn << 1))));
+            if (!ok) {
+                std::printf("  FAIL: %s prescan n=%zu rep=%d got=%u\n", tname, n, rep, got);
+                ++failures;
+            }
+            ++checks;
+        }
+    }
+    std::printf("  %-8s leaf + prescan ok\n", tname);
+#else
+    (void)tname;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 5: sparse-descent repairs (also a regression test: the sorted-affix weapon
+//    once sorted its middle ascending under std::greater when NaN was present) of the small path (two-run merge, rotation,
+//    extract-merge with outlier popping, bounded insertion), ascending and
+//    descending, with NaN / -0 mixed into float keys.  Checked against the
+//    radix total order and the bit-exact multiset.
+// ---------------------------------------------------------------------------
+template <class T>
+static void run_sparse_descent_shapes(const char* tname) {
+    using RT  = fd::RadixTraits<T>;
+    using Key = typename RT::Key;
+    auto gen = [&](std::size_t i) -> T {
+        if (std::is_floating_point<T>::value && i % 97 == 5) {
+            switch (rng() % 3) {
+                case 0:  return std::numeric_limits<T>::quiet_NaN();
+                case 1:  return -T(0);
+                default: return T(0);
+            }
+        }
+        if (i % 13 == 0) return from_u64<T>(rng() % 8);         // duplicates
+        return from_u64<T>(rng());
+    };
+    auto asc = [](std::vector<T>& v, std::size_t lo, std::size_t hi) {
+        std::sort(v.begin() + lo, v.begin() + hi,
+                  [](const T& a, const T& b) { return RT::encode(a) < RT::encode(b); });
+    };
+    int shapes_run = 0;
+    for (std::size_t n : {std::size_t(600), std::size_t(1500), std::size_t(5000),
+                          std::size_t(20000), std::size_t(100000)}) {
+        for (int shape = 0; shape < 12; ++shape) {
+            std::vector<T> v(n);
+            for (std::size_t i = 0; i < n; ++i) v[i] = gen(i);
+            switch (shape) {
+                case 0: asc(v, 0, n / 2); asc(v, n / 2, n); break;               // concat2
+                case 1: asc(v, 0, n / 3); asc(v, n / 3, n); break;               // uneven two runs
+                case 2: asc(v, 0, n); std::rotate(v.begin(), v.begin() + n / 3, v.end()); break;
+                case 3: asc(v, 0, n - n / 20); break;                            // 5% tail
+                case 4: asc(v, 0, n - n / 3); break;                             // 33% tail
+                case 5: asc(v, 0, n);                                            // far swaps
+                        for (int k = 0; k < 8; ++k) std::swap(v[rng() % n], v[rng() % n]);
+                        break;
+                case 6: asc(v, 0, n);                                            // adjacent outlier pairs
+                        for (std::size_t k = 0; k + 2 < n; k += n / 7 + 1) {
+                            v[k] = v[n - 1]; v[k + 1] = v[n - 1];
+                        }
+                        break;
+                case 7: asc(v, 0, n);                                            // local swaps
+                        for (std::size_t k = 0; k + 9 < n; k += 61) std::swap(v[k], v[k + 9]);
+                        break;
+                case 9: asc(v, 0, n / 2); asc(v, n / 2, n);                      // organ pipe
+                        std::reverse(v.begin() + n / 2, v.end());
+                        break;
+                case 10: asc(v, 0, n);                                           // block swap
+                        std::swap_ranges(v.begin() + n / 10, v.begin() + 2 * n / 10, v.begin() + 7 * n / 10);
+                        break;
+                case 11: asc(v, 0, n / 4); asc(v, n / 4, n / 2); asc(v, n / 2, n); // 3 runs, middle down
+                        std::reverse(v.begin() + n / 4, v.begin() + n / 2);
+                        break;
+                default: asc(v, 0, n);                                           // near-equal halves
+                        for (std::size_t i = 0; i < n; ++i) v[i] = from_u64<T>(i % (n / 2) / 4);
+                        break;
+            }
+            for (int dir = 0; dir < 2; ++dir) {
+                std::vector<T> s = v;
+                if (dir) std::reverse(s.begin(), s.end());                       // mirrored shape
+                if (dir) fyx::sort(s.begin(), s.end(), std::greater<T>());
+                else     fyx::sort(s.begin(), s.end());
+                bool ordered = true;
+                for (std::size_t i = 1; i < n; ++i) {
+                    const Key a = RT::encode(s[i - 1]), b = RT::encode(s[i]);
+                    if (std::is_floating_point<T>::value) {
+                        // with NaN only the non-NaN subsequence order is defined
+                        if (s[i - 1] != s[i - 1] || s[i] != s[i]) continue;
+                        if (a != b && s[i - 1] == s[i]) continue;                // -0 / +0
+                    }
+                    if (dir ? (a < b) : (b < a)) {
+                        if (ordered) std::printf("    bad at %zu: %.17g %.17g\n", i, double(s[i - 1]), double(s[i]));
+                        ordered = false;
+                    }
+                }
+                if (!ordered) std::printf("    [%s n=%zu shape=%d dir=%d dispatch=%d]\n", tname, n, shape, dir, int(fd::test_last_dispatch()));
+                CHECK(ordered, "sparse-descent shape ordered");
+                std::vector<Key> ka(n), kb(n);
+                for (std::size_t i = 0; i < n; ++i) { ka[i] = RT::encode(v[i]); kb[i] = RT::encode(s[i]); }
+                std::sort(ka.begin(), ka.end());
+                std::sort(kb.begin(), kb.end());
+                CHECK(ka == kb, "sparse-descent multiset preserved");
+                ++shapes_run;
+            }
+        }
+    }
+    std::printf("  %-8s sparse-descent repairs ok (%d cases)\n", tname, shapes_run);
+}
+
 int main() {
     std::printf("t_vsort: AVX-512 vectorised quicksort\n");
     std::printf("  kernel present for int32=%d, usable at 70000=%d\n",
@@ -260,6 +415,18 @@ int main() {
 
     run_float_edge<float>("float");
     run_float_edge<double>("double");
+
+    run_leaf_and_prescan<std::int32_t>("int32");
+    run_leaf_and_prescan<std::uint32_t>("uint32");
+    run_leaf_and_prescan<std::int64_t>("int64");
+    run_leaf_and_prescan<std::uint64_t>("uint64");
+    run_leaf_and_prescan<float>("float");
+    run_leaf_and_prescan<double>("double");
+
+    run_sparse_descent_shapes<std::int32_t>("int32");
+    run_sparse_descent_shapes<std::uint64_t>("uint64");
+    run_sparse_descent_shapes<float>("float");
+    run_sparse_descent_shapes<double>("double");
 
     std::printf("checks=%d failures=%d\n", checks, failures);
     if (failures) { std::printf("VSORT TEST FAILURES=%d\n", failures); return 1; }

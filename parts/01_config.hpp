@@ -258,6 +258,25 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// GCC at -O2 (the most common release flag) uses the "very cheap" vector cost
+// model and neither unswitches nor peels loops.  The library's branch-free
+// order / structure scans then run 2-4x slower than at -O3 (Ice Lake-SP,
+// GCC 12.2, 200K int32: sorted-input exit 0.71 vs 0.15 ns/elem, rotated 1.8
+// vs 0.85, block-swap 2.1 vs 1.2).  Enabling just those three optimisations
+// for the library's own functions recovers the -O3 numbers without changing
+// the caller's flags.  Clang (vectorises at -O2) and MSVC are unaffected;
+// define FYX_NO_OPTIMIZE_PRAGMA to opt out.  Popped at the end of the header.
+// ---------------------------------------------------------------------------
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER) && \
+    defined(__OPTIMIZE__) && !defined(__OPTIMIZE_SIZE__) && !defined(FYX_NO_OPTIMIZE_PRAGMA)
+#  define FYX_OPTIMIZE_PRAGMA_ACTIVE 1
+#  pragma GCC push_options
+#  pragma GCC optimize("vect-cost-model=dynamic", "unswitch-loops", "peel-loops")
+#else
+#  define FYX_OPTIMIZE_PRAGMA_ACTIVE 0
+#endif
+
+// ---------------------------------------------------------------------------
 // Attributes / builtins
 // ---------------------------------------------------------------------------
 #if FYX_GNUC_LIKE
@@ -462,8 +481,33 @@ inline constexpr std::size_t kVqsortMinN = 1u << 14;          // 16384
 #ifndef FYX_VQ_COMPRESS_TO_MEMORY
 #  define FYX_VQ_COMPRESS_TO_MEMORY 1
 #endif
+// Full unrolling of fixed-trip loops over register arrays / merge chains: GCC -O2 does
+// not unroll them on its own, which leaves the arrays in memory and cost the
+// partition ~30% at -O2 versus -O3 (Ice Lake-SP, GCC 12.2).
+#if defined(__clang__)
+#  define FYX_VQ_UNROLL _Pragma("unroll")
+#elif defined(__GNUC__)
+#  define FYX_VQ_UNROLL _Pragma("GCC unroll 16")
+#else
+#  define FYX_VQ_UNROLL
+#endif
+
+// Independent merge chains in the AVX-512 two-run merge (latency hiding).
+#ifndef FYX_VMERGE_CHAINS
+#  define FYX_VMERGE_CHAINS 2
+#endif
+
 // Lower bound of the small-range AVX-512 vector quicksort fast path.
 inline constexpr std::size_t kSmallVqsortMinN = 2;
+// Upper bound (exclusive) of that fast path.  It is the serial path for
+// every size the pool does not take (Auto mode parallelises from 1M); with
+// the column-network leaf the vector quicksort beats the probe stack of the
+// general path on random / duplicate-heavy input up to there (Ice Lake-SP,
+// GCC 12.2, int32 20K random 4.5 -> 2.3 ns/elem).
+#ifndef FYX_SMALL_VQ_MAX_N
+#  define FYX_SMALL_VQ_MAX_N (1u << 20)
+#endif
+inline constexpr std::size_t kSmallVqsortMaxN = FYX_SMALL_VQ_MAX_N;
 
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;
