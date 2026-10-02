@@ -58,6 +58,28 @@ def load(path):
     return rows
 
 
+def measurement_note(path):
+    footer = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("# merge_runs:"):
+                return line.strip()[len("# merge_runs:"):].strip()
+            if line.startswith("# bench_matrix:"):
+                footer.append(line.strip()[2:].strip())
+    return "single process run" + (f" ({footer[0]})" if footer else "")
+
+
+def pinned_revisions():
+    revisions = []
+    script = os.path.join(os.path.dirname(__file__), "vqsort.sh")
+    with open(script, encoding="utf-8") as f:
+        for line in f:
+            fields = line.split()
+            if len(fields) == 3 and fields[0] == "pin_commit":
+                revisions.append((fields[1].rsplit("/", 1)[-1], fields[2]))
+    return revisions
+
+
 def opponents(row):
     return [(k, row[k]) for k, _ in OPP if row.get(k) is not None]
 
@@ -72,30 +94,41 @@ def best_other(row):
 
 def main(paths):
     tables = {}
+    protocols = {}
     for p in paths:
-        n = os.path.basename(p).replace('vqsort_', '').replace('.txt', '')
+        stem = os.path.basename(p)
+        if stem.startswith('vqsort_'):
+            stem = stem[len('vqsort_'):]
+        if stem.endswith('.txt'):
+            stem = stem[:-4]
+        n = stem.split('_', 1)[0]
         tables[n] = load(p)
+        protocols[n] = measurement_note(p)
     out = []
     w = out.append
     w("# BENCHMARKS — 本机实测")
     w("")
-    w("> 下面每一个数字都是在这台机器上跑出来的，包含输的格子。")
-    w("> 这个文件由 `tools/dev/mkbench_md.py` 从 `build/vqsort_<n>.txt` 生成，没有手写的数字。")
+    w("> 表格对应传入的本机实测矩阵，包含输格；数据仅代表记录的主机与构建配置，不外推到未测平台。")
+    w("> 由 `tools/dev/mkbench_md.py` 生成；比较对象为 `fyx::sort`，不代表 stable_sort 专项性能。")
     w("")
     w("## 环境")
     w("")
     w("- CPU：Intel Xeon Ice Lake-SP，**2 个硬件线程**（L1d 48 KiB / L2 1.3 MiB / L3 54 MiB，AVX-512）")
     w("- 编译器：g++ 12.2.0，`-O3 -march=native -pthread`")
-    w("- 方法：每轮先复制一份输入，只对被测对象计时（复制不计），取多次运行的最好一次。")
+    w("- 输入复制不计时；单个进程内部报告 best-of-repetitions。独立进程聚合口径如下：")
+    for n in tables:
+        w(f"  - {n}: {protocols[n]}")
     w("- 对手：`std::sort`（libstdc++）、`pdqsort`（orlp/pdqsort）、**`vqsort`（Google Highway 1.4.0）**、")
     w("  **`IPS4o` 串行与并行（oneTBB 12.x）**、**`x86-simd-sort`（intel/x86-simd-sort，header-only 构建）**。")
+    revisions = pinned_revisions()
+    if revisions:
+        w("- 对手源码固定版本：" + "; ".join(f"{name} `{rev}`" for name, rev in revisions) + "。")
     w("  比值 = 所有对手里最好的那个 / 并行 `fyx::sort`；1.00x 是打平，小于 1 是输。")
     w("- `n/a` 表示该对手不适用：vqsort / x86-simd-sort 只处理算术类型，`std::string` 行没有它们的数字。")
-    w("- **逐轮波动**：这台机器同一格重复跑会有 20–60% 的摆动。下面每个比值都请当作一个区间，")
-    w("  不是小数点后两位的精度；要比较两个版本，请像 CHANGELOG 里那样做背靠背配对测量。")
+    w("- 近 1.00x 的差异可能落在测量波动内；精细比较两个提交时，应在同一净窗口做背靠背交错测量。")
     w("")
     # headline: random data
-    w("## 一、随机数据（最难的一类）")
+    w("## 一、随机数据")
     w("")
     hdr = "| 类型 | 规模 | 串行 | 并行 | std::sort | pdqsort | vqsort | IPS4o 串行 | IPS4o 并行 | x86-simd-sort | 并行 vs 最强对手 |"
     w(hdr)
@@ -184,30 +217,35 @@ def main(paths):
     w("")
     w("## 四、怎么读这些数字")
     w("")
-    w("- **结构化数据全面领先**：已排序、逆序、近似有序、拼接、旋转、锯齿、低基数……")
-    w("  领先来自「先识别结构」——这些形状都是 O(n)，而不是 O(n log n)。")
-    w("- **随机均匀键不再是落后的家族**。它曾经是：LSD radix 在 int32 上至少要三趟，")
-    w("  一趟约 3.1 ns/elem，这是 tools/dev/NOTES.md 里算死的下界。现在这类输入走")
-    w("  AVX-512 向量快排（compress-store 分区 + 寄存器内双调网络叶子），不再按位分趟。")
-    w("- **剩下的输的格子集中在两类**：一是「值很少但周期性」的输入（mod8 / 16 个不同值 /")
-    w("  全部相等），我们的计数内核比 vqsort 的分区多一趟；二是块交换 double，pdqsort")
-    w("  的比较分支预测在这个形状上便宜过我们的补丁归并。两类都在 0.66x–0.99x 之间。")    w("- **2 个硬件线程跑不出多核内存带宽**。计算密集的核（直方图、散射、分区）吃得到第二个核，")
+    w("- 结构化输入可能命中已有序、旋转、计数或归并路径；是否胜出以本轮逐格数据为准，")
+    w("  不从某一种分布推断到其它类型、比较器或硬件。")
+    w("- 随机数据也单独列出。AVX-512 是本机 native 构建可选用的路径，不是库的运行要求；")
+    w("  其它机器上的派发与成绩须另外测量。")
+    w("- 所有输格均在上一节完整列出；不能用汇总胜率掩盖最弱输入。")
+    w("- **2 个硬件线程跑不出多核内存带宽**。计算密集的核（直方图、散射、分区）吃得到第二个核，")
     w("  纯流式的活（扫描、拷贝）两线程约等于一线程。")
     w("")
     w("## 五、没有测、也不能在本机验证的")
     w("")
     w("- **4 核以上的并行带宽**：本机只有 2 个硬件线程，IPS4o 并行也只拿到 2 个线程。")
     w("- **GPU 路径**：无 GPU，代码是骨架 + CPU 回退。")
-    w("- **其它第三方库**：本表只对比 Highway 的 vqsort。开发向量快排时另外用")
-    w("  `tools/dev/vqs.cpp` 与 intel/x86-simd-sort 做过单线程对拍（1M 随机 int32：")
-    w("  本库内核 0.0042 s / x86-simd-sort 0.0040 s / vqsort 0.0034 s），那份对拍不进本表。")    w("")
+    w("- **其它第三方库**：本表只覆盖上方列出的六个对手；未测其它第三方库、其它架构或 GPU。")
+    w("")
     w("## 复现")
     w("")
     w("```bash")
     w("./build.sh")
-    w("bash tools/dev/vqsort.sh 1000000     # 克隆对手并跑全矩阵 -> build/vqsort_1000000.txt")
-    w("bash tools/dev/vqsort.sh 8000000")
-    w("python3 tools/dev/mkbench_md.py      # 重新生成这个文件")
+    w("for n in 1000000 8000000; do")
+    w("  reps=7; [ $n -eq 8000000 ] && reps=5")
+    w("  for r in 1 2 3; do")
+    w("    bash tools/dev/vqsort.sh $n $reps > /dev/null")
+    w("    cp build/vqsort_${n}.txt build/vqsort_${n}_r${r}.txt")
+    w("  done")
+    w("done")
+    w("# merge_runs.py 对 3 份结果逐格取中位数；带 ! 的正确性失败会拒绝合并")
+    w("python3 tools/dev/merge_runs.py --out build/vqsort_1000000_canonical.txt build/vqsort_1000000_r{1,2,3}.txt")
+    w("python3 tools/dev/merge_runs.py --out build/vqsort_8000000_canonical.txt build/vqsort_8000000_r{1,2,3}.txt")
+    w("python3 tools/dev/mkbench_md.py build/vqsort_1000000_canonical.txt build/vqsort_8000000_canonical.txt > BENCHMARKS.md")
     w("python3 tools/fyx_test.py            # 正确性检查")
     w("```")
     w("")

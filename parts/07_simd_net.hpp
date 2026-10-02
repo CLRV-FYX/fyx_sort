@@ -75,7 +75,7 @@ namespace detail {
 #elif FYX_COMPILER_CLANG
 #  define FYX_ISA_BEGIN(isa)                                       \
       FYX_DIAG_PUSH_SIMD                                           \
-      _Pragma("clang attribute push (__attribute__((target(isa))), apply_to = function)")
+      _Pragma(FYX_STRINGIFY(clang attribute push (__attribute__((target(isa))), apply_to = function)))
 #  define FYX_ISA_END                                              \
       _Pragma("clang attribute pop")                               \
       FYX_DIAG_POP_SIMD

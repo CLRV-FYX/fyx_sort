@@ -6,6 +6,32 @@ Date: 2026-09-16
 
 ### Added
 
+- **小规模数值快路径**（AVX-512 主机，`n < kVqsortMinN`=16384，int32/uint32/
+  int64/uint64/float/double，`<`/`>`）：一次分块无分支有序扫描（sorted /
+  reverse / all-equal 直接 O(n) 退出）+ 旋转 / 风琴管 / 双调结构探针，其余直接
+  进入内置向量快排，跳过原先为大 n 设计的整套探针与 pdq/radix。Ice Lake-SP、
+  GCC 12.2、串行、随机数据：i32 n=1000 19.3→2.1 ns/elem，n=10000 22→2.9；
+  f64 n=1000 55→4.4；含 NaN/-0 的范围仍走原路径（文档全序不变）。
+  无 AVX-512 的主机行为不变（**该类主机上的小 n 短板未改善**）。
+- **整数 `stable_sort` 委托不稳定引擎**：整数在标准 `<`/`>` 下相等即逐位相同，
+  稳定性不可观测，输出与 `std::stable_sort` 逐元素一致（`test/t_small.cpp` 校验）。
+  i32 200K：nearly 2.3ms→0.15ms，reverse 2.3ms→0.09ms，random 2.3ms→0.75ms。
+- **分块无分支有序检测**（`blocked_radix_order_kind`、`try_radix_monotonic_sort`
+  预检）：sorted 输入 i32 200K `sort` 59→29us，`stable_sort` 118→26us。
+- `FYX_VQ_COMPRESS_TO_MEMORY`（默认 1）：0 改用寄存器 compress + 掩码存储，为
+  AMD Zen 4 预留（Ice Lake-SP 上慢约 15%，故不作默认；Zen 4 上未实测）。
+- **少量不同值改走向量快排**（`vq_beats_sparse_count`）：AVX-512 可用且范围
+  无 NaN/-0 时，跳过哈希探测的稀疏计数排序（密集 O(n+range) 计数不受影响）。
+  Ice Lake-SP 串行 200K：int32 16 值 728→147us，256 值 564→289us，float 16 值
+  （小整数键）218→182us。NaN/-0 屏蔽扫描每次顶层调用对同一范围只做一次
+  （`VqCleanMemo`，置换不变量；200K double 省 2 次全量读取）。
+- **小 n 近有序修复**（`budgeted_insertion_repair`）：小规模快路径中，首块相邻逆序
+  ≤1/32 时先做带移动预算（n/4+64）的插入修复，16 元无分支跳过有序段；随机输入
+  不进入或很快超预算放弃。n=1000 近有序（n/1000+1 次 ≤64 距离交换）：i32
+  2.1→0.65 ns/elem，f64 5.5→1.1，u64 5.4→0.85。
+- `test/t_small.cpp`：6 种类型 × 7 种形状 × 0..20000 规模，`<`/`>`/`fyx::less`
+  对照 `std::sort`，整数 `stable_sort` 对照 `std::stable_sort`，含 NaN 计数守恒。
+
 - **封顶自然归并前门（`try_proof_structured_sort`，工程名仍叫 PSS）**——
   **不是新排序范式**，而是自然归并 / Timsort 家族的受限制特化：一次封顶扫描
   （≤7 个违例位，第 8 个立刻放弃）找目标方向单调 run，然后标准稳定归并

@@ -48,6 +48,13 @@ namespace isa_avx512 {
 // ---------------------------------------------------------------------------
 // Per-type policies.  Everything is expressed in the native type: no encode.
 // ---------------------------------------------------------------------------
+// FYX_VQ_COMPRESS_TO_MEMORY=0 selects register-form compress + masked store:
+// the memory form is microcoded on AMD Zen 4, but on Ice Lake-SP the register
+// form measured ~15% slower, so the memory form stays the default.
+FYX_FORCE_INLINE std::uint64_t bzhi_mask(unsigned c) {
+    return c >= 64 ? ~0ull : ((1ull << c) - 1ull);
+}
+
 template <class T>
 struct VOps;
 
@@ -62,7 +69,13 @@ struct VOps<std::int32_t> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi32(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi32(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi32(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi32(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
+#if FYX_VQ_COMPRESS_TO_MEMORY
+        _mm512_mask_compressstoreu_epi32(p, k, v);
+#else
+        _mm512_mask_storeu_epi32(p, static_cast<__mmask16>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_epi32(k, v));
+#endif
+    }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epi32_mask(a, b, _MM_CMPINT_NLT); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epi32_mask(a, b, _MM_CMPINT_NLE); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epi32(a, b); }
@@ -97,7 +110,13 @@ struct VOps<std::uint32_t> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi32(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi32(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi32(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi32(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
+#if FYX_VQ_COMPRESS_TO_MEMORY
+        _mm512_mask_compressstoreu_epi32(p, k, v);
+#else
+        _mm512_mask_storeu_epi32(p, static_cast<__mmask16>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_epi32(k, v));
+#endif
+    }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epu32_mask(a, b, _MM_CMPINT_NLT); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epu32_mask(a, b, _MM_CMPINT_NLE); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epu32(a, b); }
@@ -125,7 +144,13 @@ struct VOps<std::int64_t> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi64(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi64(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi64(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi64(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
+#if FYX_VQ_COMPRESS_TO_MEMORY
+        _mm512_mask_compressstoreu_epi64(p, k, v);
+#else
+        _mm512_mask_storeu_epi64(p, static_cast<__mmask8>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_epi64(k, v));
+#endif
+    }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_NLT); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_NLE); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epi64(a, b); }
@@ -160,7 +185,13 @@ struct VOps<std::uint64_t> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi64(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi64(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi64(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi64(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
+#if FYX_VQ_COMPRESS_TO_MEMORY
+        _mm512_mask_compressstoreu_epi64(p, k, v);
+#else
+        _mm512_mask_storeu_epi64(p, static_cast<__mmask8>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_epi64(k, v));
+#endif
+    }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epu64_mask(a, b, _MM_CMPINT_NLT); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epu64_mask(a, b, _MM_CMPINT_NLE); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epu64(a, b); }
@@ -188,7 +219,13 @@ struct VOps<float> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_ps(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_ps(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_ps(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_ps(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
+#if FYX_VQ_COMPRESS_TO_MEMORY
+        _mm512_mask_compressstoreu_ps(p, k, v);
+#else
+        _mm512_mask_storeu_ps(p, static_cast<__mmask16>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_ps(k, v));
+#endif
+    }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_ps_mask(a, b, _CMP_GE_OQ); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_ps_mask(a, b, _CMP_GT_OQ); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_ps(a, b); }
@@ -223,7 +260,13 @@ struct VOps<double> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_pd(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_pd(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_pd(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_pd(p, k, v); }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
+#if FYX_VQ_COMPRESS_TO_MEMORY
+        _mm512_mask_compressstoreu_pd(p, k, v);
+#else
+        _mm512_mask_storeu_pd(p, static_cast<__mmask8>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_pd(k, v));
+#endif
+    }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_pd_mask(a, b, _CMP_GE_OQ); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_pd_mask(a, b, _CMP_GT_OQ); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_pd(a, b); }

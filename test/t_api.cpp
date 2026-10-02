@@ -24,6 +24,20 @@ static int checks   = 0;
     if (!(cond)) { printf("  FAIL: %s\n", msg); ++failures; }          \
 } while (0)
 
+struct NonDefaultMoveOnly {
+    inline static int live = 0;
+    int key;
+    int index;
+    NonDefaultMoveOnly() = delete;
+    NonDefaultMoveOnly(int k, int i) : key(k), index(i) { ++live; }
+    NonDefaultMoveOnly(const NonDefaultMoveOnly&) = delete;
+    NonDefaultMoveOnly& operator=(const NonDefaultMoveOnly&) = delete;
+    NonDefaultMoveOnly(NonDefaultMoveOnly&& other) noexcept
+        : key(other.key), index(other.index) { ++live; }
+    NonDefaultMoveOnly& operator=(NonDefaultMoveOnly&&) noexcept = default;
+    ~NonDefaultMoveOnly() { --live; }
+};
+
 // --------------------------------------------------------------------------
 // Generic sort-correctness harness.
 //   gen(i, rng)       -> value for position i
@@ -219,32 +233,163 @@ int main() {
             fyx::stable_sort(a, gcmp);
             CHECK(a == ref, "stable pairs descending");
         }
+        {
+            std::vector<P> a = {{3, 0}, {2, 1}, {2, 2}, {1, 3}};
+            std::vector<P> ref = a;
+            std::stable_sort(ref.begin(), ref.end(), cmp);
+            fyx::stable_sort(a, cmp);
+            CHECK(a == ref, "strict-reverse fast path does not reverse equal keys");
+        }
     }
 
+    // stable_sort's fallback must support move-only, non-default-constructible
+    // values when a custom comparator selects the generic merge path.
+    printf("  stable_sort move-only/non-default type\n");
+    CHECK(NonDefaultMoveOnly::live == 0, "move-only test starts without live objects");
+    {
+        std::vector<NonDefaultMoveOnly> values;
+        for (int i = 0; i < 1000; ++i) values.emplace_back((i * 37) % 19, i);
+        fyx::stable_sort(values.begin(), values.end(),
+                         [](const auto& a, const auto& b) { return a.key < b.key; });
+        bool ok = true;
+        for (std::size_t i = 1; i < values.size(); ++i) {
+            if (values[i].key < values[i - 1].key ||
+                (values[i].key == values[i - 1].key && values[i].index < values[i - 1].index)) {
+                ok = false;
+                break;
+            }
+        }
+        CHECK(ok, "stable_sort move-only/non-default values");
+        CHECK(NonDefaultMoveOnly::live == static_cast<int>(values.size()),
+              "stable_sort releases scratch objects after successful merge");
+    }
+    CHECK(NonDefaultMoveOnly::live == 0, "successful stable_sort destroys each object once");
+    {
+        // Two individually sorted, overlapping runs exercise a large stable
+        // merge and verify that equal keys retain their original order.
+        std::vector<NonDefaultMoveOnly> values;
+        constexpr int half = 4096;
+        for (int i = 0; i < half; ++i) values.emplace_back(1000 + i, i);
+        for (int i = 0; i < half; ++i) values.emplace_back(i, half + i);
+        fyx::stable_sort(values.begin(), values.end(),
+                         [](const auto& a, const auto& b) { return a.key < b.key; });
+        bool ok = true;
+        for (std::size_t i = 1; i < values.size(); ++i) {
+            if (values[i].key < values[i - 1].key ||
+                (values[i].key == values[i - 1].key && values[i].index < values[i - 1].index)) {
+                ok = false;
+                break;
+            }
+        }
+        CHECK(ok, "stable merge preserves stability for move-only values");
+        CHECK(NonDefaultMoveOnly::live == static_cast<int>(values.size()),
+              "stable merge releases scratch objects");
+    }
+    CHECK(NonDefaultMoveOnly::live == 0, "stable merge destroys each object once");
+    {
+        // Many overlapping natural runs cross several recursive partition levels.
+        constexpr int count = 8192;
+        constexpr int run_count = 65;
+        std::vector<NonDefaultMoveOnly> values;
+        for (int run = 0; run < run_count; ++run) {
+            const int begin = count * run / run_count;
+            const int end = count * (run + 1) / run_count;
+            const int key_base = (run_count - run - 1) * (count / run_count) / 2;
+            for (int i = begin; i < end; ++i)
+                values.emplace_back(key_base + i - begin, i);
+        }
+        fyx::stable_sort(values.begin(), values.end(),
+                         [](const auto& a, const auto& b) { return a.key < b.key; });
+        bool ok = true;
+        for (std::size_t i = 1; i < values.size(); ++i) {
+            if (values[i].key < values[i - 1].key ||
+                (values[i].key == values[i - 1].key && values[i].index < values[i - 1].index)) {
+                ok = false;
+                break;
+            }
+        }
+        CHECK(ok, "stable merge preserves order across many natural runs");
+        CHECK(NonDefaultMoveOnly::live == static_cast<int>(values.size()),
+              "many-run stable merge releases scratch objects");
+    }
+    CHECK(NonDefaultMoveOnly::live == 0, "many-run stable merge destroys each object once");
+    {
+        std::vector<NonDefaultMoveOnly> values;
+        for (int i = 0; i < 8192; ++i) values.emplace_back(8191 - i, i);
+        fyx::stable_sort(values.begin(), values.end(),
+                         [](const auto& a, const auto& b) { return a.key < b.key; });
+        bool sorted = true;
+        for (std::size_t i = 1; i < values.size(); ++i)
+            if (values[i].key < values[i - 1].key) sorted = false;
+        CHECK(sorted, "stable_sort orders a strict descending move-only range");
+        CHECK(NonDefaultMoveOnly::live == static_cast<int>(values.size()),
+              "descending move-only range releases scratch objects");
+    }
+    CHECK(NonDefaultMoveOnly::live == 0, "descending move-only range destroys each object once");
+    {
+        std::vector<NonDefaultMoveOnly> values;
+        constexpr int half = 4096;
+        for (int i = 0; i < half; ++i) values.emplace_back(1000 + i, i);
+        for (int i = 0; i < half; ++i) values.emplace_back(i, half + i);
+        bool caught = false;
+        try {
+            fyx::stable_sort(values.begin(), values.end(), [](const auto& a, const auto& b) {
+                if (a.key == 5 && b.key == 1000) throw 11; // a merge-only comparison
+                return a.key < b.key;
+            });
+        } catch (int) {
+            caught = true;
+        }
+        CHECK(caught, "stable merge propagates comparator exceptions");
+        CHECK(NonDefaultMoveOnly::live == static_cast<int>(values.size()),
+              "stable merge releases partially constructed scratch on exception");
+    }
+    CHECK(NonDefaultMoveOnly::live == 0, "stable merge exception path destroys each object once");
+    {
+        std::vector<NonDefaultMoveOnly> values;
+        for (int i = 0; i < 128; ++i) values.emplace_back((i * 37) % 19, i);
+        int calls = 0;
+        bool caught = false;
+        try {
+            fyx::stable_sort(values.begin(), values.end(), [&](const auto& a, const auto& b) {
+                if (++calls == 5) throw 7; // during the first merge, after scratch construction
+                return a.key < b.key;
+            });
+        } catch (int) {
+            caught = true;
+        }
+        CHECK(caught, "stable_sort propagates comparator exceptions");
+        CHECK(NonDefaultMoveOnly::live == static_cast<int>(values.size()),
+              "stable_sort releases partially constructed scratch on exception");
+    }
+    CHECK(NonDefaultMoveOnly::live == 0, "exception path destroys each object once");
+
     // ---- partial_sort ----
-    // Validates the partial_sort CONTRACT (first k smallest, sorted, rest >=)
-    // and -- for the well-defined 0 < k < n case -- exact agreement with
-    // std::partial_sort.  k == 0 is contract-satisfied-vacuously and libstdc++
-    // leaves the range in an unspecified (non-sorted) order, so we check only
-    // the contract there.
+    // Validate the contract, including permutation preservation at k==0 and
+    // k==n. The tail order is unspecified, so only the sorted smallest prefix
+    // is compared with a fully sorted reference.
     printf("  partial_sort\n");
     {
         auto check_partial = [&](const std::vector<int>& got, const std::vector<int>& orig,
-                                 std::size_t k, const char* tag) {
+                                 const std::vector<int>& sorted, std::size_t k,
+                                 const char* tag) {
             const std::size_t nn = got.size();
-            if (k > nn) return;
-            // multiset preserved
+            CHECK(orig.size() == nn, (std::string(tag) + " size preserved").c_str());
+            if (k > nn || orig.size() != nn) return;
+            // The output must be a permutation, including the k==0 and k==n
+            // boundaries; the tail's order is deliberately unspecified.
             std::vector<int> g = got, o = orig;
             std::sort(g.begin(), g.end()); std::sort(o.begin(), o.end());
             CHECK(g == o, (std::string(tag) + " multiset preserved").c_str());
-            // first k sorted ascending
-            for (std::size_t i = 1; i < k; ++i)
-                if (got[i] < got[i-1]) { CHECK(false, (std::string(tag)+" first k sorted").c_str()); return; }
-            // every element in [0,k) <= every element in [k,n)
+            CHECK(std::is_sorted(got.begin(), got.begin() + static_cast<std::ptrdiff_t>(k)),
+                  (std::string(tag) + " first k sorted").c_str());
+            CHECK(std::equal(got.begin(), got.begin() + static_cast<std::ptrdiff_t>(k), sorted.begin()),
+                  (std::string(tag) + " first k are smallest").c_str());
             if (k > 0 && k < nn) {
-                int mx = got[k-1];
+                bool partition = true;
                 for (std::size_t i = k; i < nn; ++i)
-                    if (got[i] < mx) { CHECK(false, (std::string(tag)+" partition").c_str()); return; }
+                    if (got[i] < got[k - 1]) { partition = false; break; }
+                CHECK(partition, (std::string(tag) + " partition").c_str());
             }
         };
         std::mt19937_64 rng(17);
@@ -253,19 +398,18 @@ int main() {
                                                   (n ? n-1 : std::size_t(0)), n};
             for (std::size_t k : ks) {
                 if (k > n) continue;
-                std::vector<int> a(n);
-                for (std::size_t i = 0; i < n; ++i) a[i] = static_cast<int>(rng() % 100000);
-                std::vector<int> ref = a; std::partial_sort(ref.begin(), ref.begin()+k, ref.end());
-                fyx::partial_sort(a.begin(), a.begin()+k, a.end());
-                check_partial(a, a, k, (std::string("partial_sort n=") + std::to_string(n) +
-                                        " k=" + std::to_string(k)).c_str());
-                if (k > 0 && k < n)
-                    CHECK(a == ref, (std::string("partial_sort n=") + std::to_string(n) +
-                                     " k=" + std::to_string(k) + " matches std").c_str());
-                // container + count form
-                std::vector<int> b = a;
+                std::vector<int> orig(n);
+                for (std::size_t i = 0; i < n; ++i) orig[i] = static_cast<int>(rng() % 100000);
+                std::vector<int> sorted = orig; std::sort(sorted.begin(), sorted.end());
+                std::vector<int> a = orig;
+                fyx::partial_sort(a.begin(), a.begin()+static_cast<std::ptrdiff_t>(k), a.end());
+                const std::string tag = std::string("partial_sort n=") + std::to_string(n) +
+                                        " k=" + std::to_string(k);
+                check_partial(a, orig, sorted, k, tag.c_str());
+                // container + count form, starting from the same original input
+                std::vector<int> b = orig;
                 fyx::partial_sort(b, k);
-                check_partial(b, b, k, "partial_sort container+count");
+                check_partial(b, orig, sorted, k, "partial_sort container+count");
             }
         }
     }
@@ -273,29 +417,32 @@ int main() {
     // ---- nth_element ----
     printf("  nth_element\n");
     {
+        auto check_nth = [&](const std::vector<int>& got, const std::vector<int>& orig,
+                             const std::vector<int>& sorted, std::size_t m, const char* tag) {
+            std::vector<int> g = got, o = orig;
+            std::sort(g.begin(), g.end()); std::sort(o.begin(), o.end());
+            CHECK(g == o, (std::string(tag) + " multiset preserved").c_str());
+            CHECK(got[m] == sorted[m], (std::string(tag) + " nth value").c_str());
+            bool partition = true;
+            for (std::size_t i = 0; i < m; ++i) if (got[i] > got[m]) partition = false;
+            for (std::size_t i = m + 1; i < got.size(); ++i) if (got[i] < got[m]) partition = false;
+            CHECK(partition, (std::string(tag) + " partition").c_str());
+        };
         std::mt19937_64 rng(19);
         for (std::size_t n : {0u,1u,2u,3u,10u,77u,1000u,20000u}) {
             const std::vector<std::size_t> ms = {std::size_t(0), std::size_t(1), n/2,
                                                   (n ? n-1 : std::size_t(0))};
             for (std::size_t m : ms) {
                 if (m >= n) continue;
-                std::vector<int> a(n);
-                for (std::size_t i = 0; i < n; ++i) a[i] = static_cast<int>(rng() % 100000);
-                std::vector<int> ref = a; std::nth_element(ref.begin(), ref.begin()+m, ref.end());
-                std::vector<int> got = a; fyx::nth_element(got.begin(), got.begin()+m, got.end());
-                // The m-th element must equal the one in a fully sorted array.
-                std::vector<int> sa = a; std::sort(sa.begin(), sa.end());
-                CHECK(got[m] == sa[m], (std::string("nth_element value n=") + std::to_string(n) +
-                                        " m=" + std::to_string(m)).c_str());
-                // Partition property: everything before <= got[m] <= everything after.
-                bool part = true;
-                for (std::size_t i = 0; i < m; ++i) if (got[i] > got[m]) part = false;
-                for (std::size_t i = m+1; i < n; ++i) if (got[i] < got[m]) part = false;
-                CHECK(part, "nth_element partition property");
-                (void)ref;
+                std::vector<int> orig(n);
+                for (std::size_t i = 0; i < n; ++i) orig[i] = static_cast<int>(rng() % 100000);
+                std::vector<int> sorted = orig; std::sort(sorted.begin(), sorted.end());
+                std::vector<int> got = orig;
+                fyx::nth_element(got.begin(), got.begin()+static_cast<std::ptrdiff_t>(m), got.end());
+                check_nth(got, orig, sorted, m, "nth_element iterator");
                 // container + count form
-                std::vector<int> gc = a; fyx::nth_element(gc, m);
-                CHECK(gc[m] == sa[m], "nth_element container+count");
+                std::vector<int> gc = orig; fyx::nth_element(gc, m);
+                check_nth(gc, orig, sorted, m, "nth_element container+count");
             }
         }
     }

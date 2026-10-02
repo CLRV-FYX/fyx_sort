@@ -18,10 +18,17 @@ Chase-Lev 工作窃取线程池、自适应算法调度、稳定排序接口、�
   `-O2 -march=native -pthread -Wall -Wextra -Werror`。
   既有内核测试（t_scalar / t_net / t_radix / t_pdq / t_pool / t_deque_race）全绿，
   公开 API、sample sort 与 counting/string/IPS4o 对比相关测试全绿。
-- **性能数字只看 `BENCHMARKS.md`**（本机实测）。旧文档里那些「1 亿 int 2.5~4 秒」之类的
-  营销数字**没有在本环境实测过**，请当作未经证实的参考，不要照搬到你的机器上。
-- **我们能站得住脚的承诺**：在本机上，对测试过的分布，`fyx::sort` **不会比 `std::sort` 慢**，
-  对数值类型则明显更快（见 `BENCHMARKS.md`）。这是可以复现、可以验证的。
+- **2026-10-01 当前代码验证**：GCC 12.2、C++17、`-O2 -march=native -pthread -Wall -Wextra -Werror`，
+  12 项测试套件全部通过（含 `t_api` 1134 checks、`t_vsort` 7044 checks）；另以不带 `-march` 构建并通过完整 `t_api`，
+  focused stable-merge 对象生命周期与 comparator 异常探针通过 ASan/UBSan/leak detection。未运行完整 sanitizer 套件；Clang、MSVC、ARM 与 GPU 硬件未实测。
+- **通用 `stable_sort` 本轮优化**：通用归并改为自顶向下递归，复用一个容量 n/2 的左段 scratch buffer；≤32 个元素用稳定插入排序，合并前检查边界并跳过已就序区间；公共稳定排序路径仅反转已验证的严格降序范围。
+  基准 `tools/dev/stable_runs_bench.cpp` 已改为轮换算法顺序、每算法先 warmup、复用同一工作缓冲，复制和正确性检查不计时，并输出中位数及四分位范围。GCC 12.2 `-O3 -DNDEBUG -pthread`（无 `-march`），1M 个 8-byte 自定义记录、两个 seed 各 21 次：两段拼接约 3.9–4.6 ms，64/65 runs 约 6.8–9.8 ms，严格逆序约 1.0–1.3 ms；随机 fyx 约 90.3–91.4 ms，`std::stable_sort` 约 90.2–93.0 ms，两个 seed 结果一胜一近乎打平，**尚未稳定领先**。单机数据不能证明跨平台无回退。
+- **六对手矩阵是历史快照，不是当前 HEAD 验证**：`BENCHMARKS.md` 保留 2026-09-30 的 `fyx::sort` 对
+  `std::sort`、pdqsort、vqsort、IPS4o 串行/并行及 x86-simd-sort 矩阵。其 native 配置启用了适用对手的 ISA/并行能力，
+  但本轮以来代码已有变化，未重跑矩阵，且普通 `fyx::sort` 结果不是本轮 `stable_sort` 优化的证据。
+  这些单机两线程数据不代表其它 CPU/系统。旧文档「1 亿 int 2.5~4 秒」等数字仍未经本环境实测。
+- **性能目标而非承诺**：按类型、比较器、输入分布和硬件分别测量，先守住正确性与可移植性，再以可复现
+  的基准逐步优化；不存在可由当前有限测试证明的「任何场景都最快」保证。
 - **已知限制**：
   - 多核 ≥30 GB/s、A100 上含传输 ≤10 ms 等目标**无法在本沙箱验证**（仅 2 个硬件线程、无 GPU）。
   - 编译配置矩阵已逐个验证可编译**并跑通测试**：默认、`FYX_DISABLE_PARALLEL`、
@@ -100,7 +107,9 @@ adjacent-swap zigzag 先用 in-place pair repair 验证并直接交换相邻逆�
 | 自定义比较器但采样等价于自然升/降序的数值或 `std::string` | guarded radix/count/MSD recovery（采样确认 + 最终 `is_sorted(comp)` 校验；高熵 64-bit/`double` comparator 串行路径也可用自适应 high-prefix radix；失败则继续比较排序） |
 | trivial struct + 比较器等价于整数 key 字段 | guarded comparator-key count/radix sort（采样确认语义 + 最终 `is_sorted` 校验） |
 | 结构体 / 自定义比较器大输入 | 256 路 sample sort（cheap/trivial payload 使用 unrolled Eytzinger 分类；并行 arithmetic comparator fallback 顶层用 64 路 partition + 256 路采样预算以减少 random 数值分类比较；`std::string` fallback 保持 looped classifier + 128K handoff + block scatter；非字符串串行路径单趟 prefix scatter，并行路径分 chunk 计数/散射；低 distinct 算术样本先走 rank16/sparse exact value counting，float/double 256-way comparator 低基数也优先尝试该 exact counter） |
-| `stable_sort` 非低基数通用类型 | 自底向上归并排序（稳定） |
+| `stable_sort` 非低基数通用类型 | 已排序路径早退，严格逆序时稳定反转；其余使用自顶向下稳定归并、单个 n/2 scratch buffer；≤32 元素稳定插入排序；归并前检查相邻边界 |
+
+该 `stable_sort` 分支的微基准见上方当前状态与 `tools/dev/stable_runs_bench.cpp`；它只覆盖一个自定义记录类型和单机配置。
 | `partial_sort` / `nth_element` | 堆 + 内省选择（quickselect） |
 
 并行：当 `Options.parallel == On`（或 `Auto` 且问题规模够大且线程池可用）时，`Auto` 默认从约 1,000,000 元素开始启用线程池，并同时检查每个线程至少约 128 KiB 数据；可用环境变量 `FYX_MIN_PARALLEL_SIZE` 覆写最小并行规模。
@@ -142,7 +151,7 @@ fyx::sort(v, o);              // 或 fyx::sort(v.begin(), v.end(), o)
 
 ```bash
 ./build.sh
-for t in t_scalar t_net t_radix t_pdq t_pool t_deque_race t_api t_sample t_counting t_adaptive t_vsort; do
+for t in t_scalar t_net t_radix t_pdq t_pool t_deque_race t_api t_sample t_counting t_adaptive t_vsort t_pss t_small; do
   g++ -std=c++17 -O2 -march=native -pthread -Wall -Wextra -Werror test/$t.cpp -o /tmp/$t && /tmp/$t
 done
 ```
@@ -159,19 +168,17 @@ done
 
 ## 性能
 
-完整表格、每一格的数字和生成脚本见 [`BENCHMARKS.md`](./BENCHMARKS.md)（由 `tools/dev/mkbench_md.py` 从 `build/vqsort_<n>.txt` 生成，没有手写数字）。
+`BENCHMARKS.md` 保留 2026-09-30 的六对手 native 矩阵快照（不是当前 HEAD 复测）；生成脚本为 `tools/dev/mkbench_md.py`。
+对手是 `std::sort`、pdqsort、Google Highway vqsort、IPS4o 串行/并行（oneTBB）和 Intel x86-simd-sort。
+数据是 4 种类型 × 14 种分布；`string` 只在 1M 测试，vqsort/x86-simd-sort 不适用于字符串。
+该历史矩阵每格用 3 个独立进程的中位数，每个进程内部取 1M best-of-7、8M best-of-5；比值为最快对手 / 并行 `fyx::sort`。
 
-**矩阵里有六个对手**：`std::sort`、`pdqsort`、**`vqsort`（Google Highway 1.4.0）**、
-**`IPS4o` 串行与并行（oneTBB）**、**`x86-simd-sort`（Intel 的 AVX-512 排序库）**。
-`bash tools/dev/vqsort.sh <n>` 会把这一整套拉取、构建、跑完并写入 `build/vqsort_<n>.txt`
-（缺 oneTBB 时会构建「IPS4o 仅串行」的缩减矩阵，而不是伪造并行列）。
-每格是「六者中最快的那个 / 并行 `fyx::sort`」，1.00x 打平，小于 1 是输。
-覆盖 4 种类型 × 14 种分布，`string` 只在 100 万规模跑（vqsort / x86-simd-sort 不吃字符串）。
-
-| 规模 | 胜 | 负 | 说明 |
+| 历史快照规模 | 胜 | 负 | 快照中最弱格 |
 |---|---:|---:|---|
-| 100 万 | 33 | 9 | 输的格子：周期为 8（0.66x/0.68x/0.99x）、16 个不同值与全等（0.91x–0.99x）、块交换 double（0.82x） |
-| 800 万 | 36 | 6 | 输的格子：块交换 double（0.71x）、块交换 int32（0.92x）、周期为 8 int32（0.93x）、锯齿波 int32（0.92x）、全等 int64 与锯齿 double（0.97x–0.98x） |
+| 100 万 | 54 | 2 | int64 farswap 对 pdqsort 0.97x；string sorted 对 IPS4o 并行 0.98x |
+| 800 万 | 42 | 0 | 最弱对手比值 1.07x（int64 sorted 对 IPS4o 并行） |
+
+> 下文保留的是截至 2026-09-16 的优化过程记录，包含旧测量与旧“剩余优化前沿”；不要当作当前成绩。`BENCHMARKS.md` 的 2026-09-30 矩阵本身也只是历史快照，未在当前 HEAD 重跑，且只测 `fyx::sort`，不衡量本轮通用 `stable_sort` 自然-run 优化。
 
 **随机均匀键这一族已经翻过来了**：1M 随机 int32 从 0.0048 s 降到 0.0025 s（vqsort 0.0033 s，
 1.32x），随机 double 0.0068 → 0.0054 s（1.22x），随机 int64 1.47x；800 万上三种类型分别是
@@ -263,10 +270,8 @@ double 1.90x，8M 是 1.85x / 1.87x / 2.18x；mod8 全家族 1.40–2.02x。
 结构化数据（已排序、逆序、近似有序、拼接、旋转、锯齿、低基数、字符串）在六个对手面前
 依然全线领先，多数在 2–25 倍。
 
-**没有输格了**。两个规模、四种类型、十四种分布，对六个对手的 98 个格子全部高于
-1.00x——最弱的几格是 int32 全等 1.01x（vqsort）、int64 远距离交换 1.02x（pdqsort）、
-int64 8M 已排序 1.07x 与 string 已排序 1.03x（IPS4o 并行；2026-09-16 净窗口
-3 进程中位复测）。把最后一批 0.9x 格子清零靠的是两项本轮落地的向量化改造：**有序性证明扫描**（浮点每元素
+**历史净窗口（2026-09-16）曾记录零输格**：两个规模、四种类型、十四种分布的 98 个格子均高于
+1.00x；这是 PSS 等后续改动前的一轮 3 进程中位结果，不能代表当前 HEAD。把当时最后一批 0.9x 格子清零靠的是两项向量化改造：**有序性证明扫描**（浮点每元素
 要重推编码键，标量循环 ~6 ops/元素；现在每 8/16 元素一次加载 + 三条编码指令 +
 `alignr` 移位自比较 + 一次掩码测试，违例早退，位精确键保持 NaN/-0 总序）和
 **全等扫掠**（全等判定 = 每元素与 p[0] 比较，免三向分类免接缝簿记；全掩码按通道宽

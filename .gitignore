@@ -11,3 +11,10 @@ fyx_sort.hpp.backup.*
 
 # third-party sources cloned by tools/dev/vqsort.sh
 /third_party/
+
+# benchmark suite outputs
+/bench/suite/build/
+/bench/suite/third_party/
+/bench/suite/results/
+/bench/suite/packages/
+/packages/

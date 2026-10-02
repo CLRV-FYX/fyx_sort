@@ -1,8 +1,8 @@
 # Measurements that are expensive to repeat
 
-Everything here was measured on the sandbox: 2 vCPU Xeon Ice Lake-SP (AVX-512),
-GCC 12.2, `-O3 -march=native`, ~2.5 GHz.  Absolute numbers will differ on other
-machines; the structural conclusions should not.
+Unless a section says otherwise, measurements here were taken on the sandbox: 2 vCPU Xeon Ice Lake-SP (AVX-512),
+GCC 12.2, `-O3 -march=native`, ~2.5 GHz. Absolute numbers may differ on other
+machines; do not generalize performance without cross-platform measurements.
 
 ## What the machine can do
 
@@ -1169,3 +1169,73 @@ direct 变换三语义、套件 743/0、ASan+UBSan 743/0、-Werror 干净。
 **明确未达成**：六对手净窗口 3 进程中位（本环境无 highway/ips4o/xss 构建产物；仅 clone 了 pdqsort）。BENCHMARKS.md 不得用此表覆盖。
 
 备份：`/home/user/backups/fyx_sort_superiter.tar.gz`
+## 2026-09-30（十六）— 通用 stable merge scratch：去掉逐元素 vector 容量分支
+
+**改动**。`stable_merge_sort` 原先把每趟归并结果写入 `std::vector<T>::emplace_back`；虽然预留了 `n` 个槽，
+每个元素仍要走 `size < capacity` 的容量检查。改为两个 `std::allocator<T>` 原始存储缓冲，借助
+`allocator_traits::construct/destroy` 精确跟踪已构造对象；每趟先销毁已 move-from 的源对象再交换缓冲。
+输入搬移前先分配两个缓冲，保留 move-only / non-default-constructible 能力；比较器或 move 抛异常时，
+RAII 清理两边已构造对象。实现是普通 C++ allocator 路径，不依赖 ISA、CPU 型号或特定编译器调度。
+
+**局部性能证据（不是跨平台结论）**。临时 microbench 用同一底层稳定归并算法、同一百万个 16-byte record、
+自定义 key 比较器，旧的 vector-emplace 与新 raw-buffer 交错 7 次，比较中位数：GCC 12，C++20，
+`-O3 -DNDEBUG`，本机 Ice Lake-SP 2 vCPU：106.082 ms → 97.491 ms（1.088x）。这是单环境路径级测量，
+不是六对手排序矩阵，不证明其它类型/平台都提升；当前 `BENCHMARKS.md` 仍保持“未复测”标记。
+
+**回归验证（2026-10-01 当前实现）**。
+- 12 个 C++ 测试（`t_scalar`、`t_net`、`t_radix`、`t_pdq`、`t_pool`、`t_deque_race`、
+  `t_api`、`t_sample`、`t_counting`、`t_adaptive`、`t_vsort`、`t_pss`）均以 C++17、`-O2 -march=native`
+  `-Wall -Wextra -Werror` 编译运行通过；`t_api` **1130/0**、`t_vsort` **7044/0**、`t_pss` **96/0**。
+- 不带 `-march` 的严格 GCC 构建：完整 `t_api` **1130/0**。
+- 针对自然-run 稳定性及比较器抛异常生命周期的窄化探针通过 ASan+UBSan+leak detection。
+- 完整 `t_api` 的 ASan 构建曾超时（900s），不计为通过；本轮没有重试完整 sanitizer 套件。
+
+## 2026-09-30（十七）— 六对手 canonical 历史快照 + baseline 编译探针
+
+稳定归并缓冲改动后，当时重新构建并跑过比较矩阵：`std::sort`、pdqsort、Highway vqsort、IPS4o 串行/并行、
+x86-simd-sort；GCC 12.2 `-O3 -march=native`，1M best-of-7、8M best-of-5，每个规模 3 个独立进程逐格取中位数。
+全部 98 个表格单元无 `!` 正确性标记；`merge_runs.py` 已增强为遇到 `!` 就拒绝合并。该矩阵是 2026-09-30 快照，之后代码有变化，**不是当前 HEAD 的验证**；它只测 `fyx::sort`。
+
+- **该历史快照对每格最强对手**：1M **54 胜 / 2 负**；8M **42 胜 / 0 负**。
+- **全部输格**：1M int64 farswap 对 pdqsort **0.97x**（0.005914 / 0.006111 s）；string sorted 对 IPS4o 并行
+  **0.98x**（0.004216 / 0.004291 s）。8M 最弱格 int64 sorted 对 IPS4o 并行 **1.07x**。
+- **逐对手**：1M std 56/0、pdqsort 55/1、vqsort 42/0、IPS4o serial 56/0、IPS4o parallel 55/1、xss 42/0；
+  8M 分别 42/0、42/0、42/0、42/0、42/0、42/0。vqsort/xss 仅有 42 个数值格，不包括 string。
+- 当时该次全量结果写入 `BENCHMARKS.md`（现标记为历史快照）；原始三进程输入、合并文件和第三方构建产物当时在 gitignored 的 `build/` / `third_party/`，当前 workspace 中不可读取。
+- 对手源码 revision（现已固定进 `tools/dev/vqsort.sh`）：IPS4o `08a5b926ee65cef19139057c6bde02bb5542c1cb`、pdqsort `b1ef26a55cdb60d236a5cb199c4234c704f46726`、Highway `2607d3b5b0113992fe84d3848859eae13b3b52c1`、x86-simd-sort `fa944efbea1a33426b3f8a9a21e23794ab8aa300`、oneTBB `9f554635c39c3897fadc52d13f94c06db17517a5`。
+
+另以不带 `-march` 编译 benchmark matrix 做过编译/运行探针，但 x86-simd-sort 的 static-incl 头要求 AVX2/AVX-512 编译标志，故该探针**故意不作为任何竞技结论或胜负证据**，不进入 `BENCHMARKS.md`。它仍运行在支持 AVX-512 的 Ice Lake 主机上，只能检查默认目标编译及运行时派发，不能代表非 AVX 硬件。当前真实的最不利/跨 ISA 比较矩阵还没有完成；本轮 full-six native 矩阵只覆盖本机这一种配置。
+
+## 2026-10-01 — stable-sort benchmark refresh and generic merge tuning
+
+### Benchmark harness
+
+`tools/dev/stable_runs_bench.cpp` now runs eight shapes (concat2, 64/65 runs, sorted, strict reverse, all equal, random 8-key, full-range random). It uses one reusable work vector: restore input before each run and validate against a precomputed `std::stable_sort` reference outside timing. Each implementation gets one warmup; a three-way rotating schedule avoids always timing one implementation first or last. It reports the median and Q1/Q3, accepts size / repetition / seed arguments, and validates argument ranges. Run with the same compiler flags shown in the file header; do two separate processes with different seeds for a more useful comparison.
+
+### Implementation
+
+The generic `stable_sort` fallback is top-down stable merge sort with one raw scratch buffer of `floor(n/2)` elements, buffering the smaller (left) run at each balanced merge. Ranges of at most 32 elements use stable insertion sort; a comparator boundary check skips already-ordered merges. The public stable path first retains the existing monotonic early exit, then uses an out-of-line strict-descending check and reverses only if every adjacent pair is strictly descending (reversing ties would break stability).
+
+### Focused measurement
+
+Ice Lake-SP, 2 vCPU, GCC 12.2, C++17 `-O3 -DNDEBUG -pthread` without `-march`; 1M 8-byte custom-key records. Two seeds, 21 measured repetitions each. Values below are medians in milliseconds, seed order 20261001 / 20261002:
+
+| workload | old bottom-up | current fyx | `std::stable_sort` |
+|---|---:|---:|---:|
+| concat2 | 21.499 / 25.380 | 3.868 / 4.600 | 12.091 / 15.097 |
+| 64 runs | 21.644 / 26.175 | 7.196 / 8.283 | 13.315 / 14.706 |
+| 65 runs | 21.903 / 23.496 | 8.818 / 9.750 | 13.294 / 14.044 |
+| sorted | 0.422 / 0.429 | 0.420 / 0.392 | 12.980 / 12.784 |
+| strict reverse | 22.502 / 23.095 | 1.228 / 1.317 | 17.433 / 17.988 |
+| all equal | 0.479 / 0.532 | 0.485 / 0.531 | 12.397 / 13.135 |
+| random 8-key | 20.723 / 21.197 | 20.799 / 21.087 | 34.196 / 34.432 |
+| full-range random | 101.931 / 98.462 | 91.370 / 90.302 | 92.991 / 90.187 |
+
+The full-range random result is still essentially tied with libstdc++ `std::stable_sort`: one seed fyx is faster, the other is marginally slower. This is not evidence of stable domination, and it covers only one type / size / CPU / compiler. The historical 2026-09-30 `fyx::sort` competitor matrix is not a current stable-sort comparison.
+
+### Tests and scope
+
+- All 12 C++ test programs passed with C++17 `-O2 -march=native -pthread -Wall -Wextra -Werror`; `t_api` 1134/0.
+- `t_api` also passed without `-march` (1134/0).
+- Focused move-only stability, strict-reverse stability, and comparator-exception lifetime probes passed with ASan, UBSan and leak detection. The full sanitizer suite was not run.
+- Current six-opponent matrix and cross-platform/compiler/OS/payload validation remain outstanding.
