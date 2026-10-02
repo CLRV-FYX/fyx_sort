@@ -5402,6 +5402,32 @@ inline void vfill(T* p, std::size_t n, T x) {
     for (; i < n; ++i) p[i] = x;
 }
 
+// Vector helpers as plain functions: a lambda returning __m512i gets no
+// target attribute from the ISA pragma and trips -Wpsabi in generic builds.
+template <class U>
+FYX_FORCE_INLINE __m512i vbcast_bits(U b) {
+    if constexpr (sizeof(U) == 8) return _mm512_set1_epi64(static_cast<long long>(b));
+    else return _mm512_set1_epi32(static_cast<int>(b));
+}
+template <class T>
+FYX_FORCE_INLINE __m512i vencode_radix(__m512i v) {
+    constexpr bool k64 = sizeof(T) == 8;
+    if constexpr (std::is_floating_point<T>::value) {
+        if constexpr (k64) {
+            const __m512i m = _mm512_or_si512(_mm512_srai_epi64(v, 63), _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
+            return _mm512_xor_si512(v, m);
+        } else {
+            const __m512i m = _mm512_or_si512(_mm512_srai_epi32(v, 31), _mm512_set1_epi32(static_cast<int>(0x80000000u)));
+            return _mm512_xor_si512(v, m);
+        }
+    } else if constexpr (std::is_signed<T>::value) {
+        if constexpr (k64) return _mm512_xor_si512(v, _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
+        else return _mm512_xor_si512(v, _mm512_set1_epi32(static_cast<int>(0x80000000u)));
+    } else {
+        return v;
+    }
+}
+
 // Distinct-key table from strided samples: returns K, or 0 when the first 64
 // samples already show more than `cap1` distinct keys or all samples more
 // than 32.  The table lives in vector registers (padded with entry 0).
@@ -5413,15 +5439,11 @@ inline unsigned vfew_sample(const T* p, std::size_t n, unsigned cap1, std::size_
     alignas(64) U tb[32];
     unsigned K = 0;
     __m512i tv[NV];
-    auto bcast = [](U b) {
-        if constexpr (k64) return _mm512_set1_epi64(static_cast<long long>(b));
-        else return _mm512_set1_epi32(static_cast<int>(b));
-    };
     auto probe = [&](std::size_t idx, unsigned cap) -> bool {
         U b;
         std::memcpy(&b, p + idx, sizeof(U));
         if (K != 0) {
-            const __m512i x = bcast(b);
+            const __m512i x = vbcast_bits<U>(b);
             bool hit = false;
             for (int v = 0; v < NV; ++v) {
                 if constexpr (k64) hit |= _mm512_cmpeq_epi64_mask(tv[v], x) != 0;
@@ -5478,25 +5500,9 @@ inline std::size_t vdescent_positions(const T* p, std::size_t from, std::size_t 
                                       std::uint32_t* pos, std::size_t maxd) {
     constexpr bool k64 = sizeof(T) == 8;
     constexpr std::size_t V = 64 / sizeof(T);
-    auto enc = [](__m512i v) -> __m512i {
-        if constexpr (std::is_floating_point<T>::value) {
-            if constexpr (k64) {
-                const __m512i m = _mm512_or_si512(_mm512_srai_epi64(v, 63), _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
-                return _mm512_xor_si512(v, m);
-            } else {
-                const __m512i m = _mm512_or_si512(_mm512_srai_epi32(v, 31), _mm512_set1_epi32(static_cast<int>(0x80000000u)));
-                return _mm512_xor_si512(v, m);
-            }
-        } else if constexpr (std::is_signed<T>::value) {
-            if constexpr (k64) return _mm512_xor_si512(v, _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
-            else return _mm512_xor_si512(v, _mm512_set1_epi32(static_cast<int>(0x80000000u)));
-        } else {
-            return v;
-        }
-    };
     auto desc_mask = [&](std::size_t j) -> std::uint64_t {     // lanes j .. j+V-1
-        const __m512i c = enc(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j)));
-        const __m512i q = enc(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j - 1)));
+        const __m512i c = vencode_radix<T>(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j)));
+        const __m512i q = vencode_radix<T>(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j - 1)));
         if constexpr (k64) return descending ? _mm512_cmpgt_epu64_mask(c, q) : _mm512_cmplt_epu64_mask(c, q);
         else return descending ? _mm512_cmpgt_epu32_mask(c, q) : _mm512_cmplt_epu32_mask(c, q);
     };
@@ -8159,6 +8165,30 @@ inline bool descents_look_local(const T* p, std::size_t n, std::size_t from, boo
     return true;
 }
 
+// True when the first `samples` descents (from `from`) look like boundaries
+// between sorted runs: spaced at least `gap` apart and not explained by one
+// misplaced key (dropping neither neighbour restores the order).  Far swaps,
+// sparse outliers and dense random stretches all fail it.
+template <class T>
+inline bool descents_look_like_runs(const T* p, std::size_t n, std::size_t from, bool descending,
+                                    std::size_t gap, int samples) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+    std::size_t i = from < 1 ? 1 : from, last = 0;
+    for (int s = 0; s < samples; ++s) {
+        if (i >= n) return false;
+        i = radix_key_find_break(p, i, n, RT::encode(p[i - 1]), true, descending);
+        if (i + 1 >= n || i < 2) return false;
+        if (s != 0 && i - last < gap) return false;
+        if (!(key(p[i]) < key(p[i - 2])) || !(key(p[i + 1]) < key(p[i - 1]))) return false;
+        last = i;
+        ++i;
+    }
+    return true;
+}
+
 // Exactly two ascending runs p[0..brk) and p[brk..n): rotate when the second
 // run lies entirely below the first, otherwise one four-way merge.
 template <class T>
@@ -8186,6 +8216,74 @@ inline void merge_two_runs(T* p, std::size_t n, std::size_t brk, bool descending
     std::unique_ptr<T[]> out(new T[n]);
     merge_runs_4way(p, brk, tmp.get(), nb, out.get(), key);   // reads p[brk], tmp[nb]
     std::memcpy(static_cast<void*>(p), static_cast<const void*>(out.get()), n * sizeof(T));
+}
+
+// p[0..cnt) -> p[s..s+cnt), s >= 1: backward 64-byte chunks through
+// registers.  Short overlapping shifts are where a libc memmove call per
+// outlier dominated (~100 cycles each on 1000-key inputs).
+template <class T>
+FYX_FORCE_INLINE void shift_up_small(T* p, std::size_t cnt, std::size_t s) {
+    constexpr std::size_t C = 64 / sizeof(T) ? 64 / sizeof(T) : 1;
+    std::size_t e = cnt;
+    while (e >= C) {
+        unsigned char tmp[C * sizeof(T)];
+        std::memcpy(tmp, static_cast<const void*>(p + e - C), sizeof(tmp));
+        std::memcpy(static_cast<void*>(p + e - C + s), tmp, sizeof(tmp));
+        e -= C;
+    }
+    while (e > 0) { --e; p[e + s] = p[e]; }
+}
+
+// Merge of two sorted runs that first tries block moves: while the runs
+// interleave in long stretches (block swaps, rotations, concatenations of
+// disjoint ranges) each stretch is found by a galloping search and copied
+// whole; after a few short stretches the rest goes through the SIMD merge
+// (or std::merge).  Radix-key order, so NaN / -0 / descending agree with
+// the other run kernels.
+template <class T>
+inline void merge_runs_galloping(const T* A, std::size_t na, const T* B, std::size_t nb, T* out,
+                                 bool descending) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+    // Count of leading x in R[0..m) with key(x) < kv (strict) or <= kv.
+    auto gallop = [&](const T* R, std::size_t m, Key kv, bool strict) -> std::size_t {
+        auto before = [&](std::size_t t) { const Key kr = key(R[t]); return strict ? kr < kv : !(kv < kr); };
+        std::size_t hi = 1;
+        while (hi < m && before(hi)) hi = 2 * hi + 1;
+        std::size_t lo = (hi - 1) / 2 + (hi > 1 ? 1 : 0);
+        if (hi > m) hi = m;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (before(mid)) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    };
+    std::size_t i = 0, j = 0, o = 0;
+    int shorts = 0;
+    while (i < na && j < nb) {
+        std::size_t len;
+        if (key(B[j]) < key(A[i])) {
+            len = gallop(B + j, nb - j, key(A[i]), true);
+            std::memcpy(static_cast<void*>(out + o), static_cast<const void*>(B + j), len * sizeof(T));
+            j += len;
+        } else {
+            len = gallop(A + i, na - i, key(B[j]), false);
+            std::memcpy(static_cast<void*>(out + o), static_cast<const void*>(A + i), len * sizeof(T));
+            i += len;
+        }
+        o += len;
+        if (len < 32 && ++shorts > 3) break;
+    }
+    if (i < na && j < nb) {
+        auto less = [&](const T& a, const T& b) { return key(a) < key(b); };
+        if (!vmerge_runs(A + i, na - i, B + j, nb - j, out + o, descending))
+            std::merge(A + i, A + na, B + j, B + nb, out + o, less);
+        return;
+    }
+    if (i < na) std::memcpy(static_cast<void*>(out + o), static_cast<const void*>(A + i), (na - i) * sizeof(T));
+    if (j < nb) std::memcpy(static_cast<void*>(out + o), static_cast<const void*>(B + j), (nb - j) * sizeof(T));
 }
 
 // A handful of monotone runs (organ pipe, block swaps, concatenations, a
@@ -8231,7 +8329,6 @@ inline bool try_few_runs_merge(T* p, std::size_t n, bool descending) {
     T* buf = lease.valid() ? lease.get() : priv.get();
     T* src = p;
     T* dst = buf;
-    auto less = [&](const T& a, const T& b) { return key(a) < key(b); };
     while (R > 1) {
         std::size_t w = 0;
         for (std::size_t r = 0; r < R; r += 2) {
@@ -8241,8 +8338,7 @@ inline bool try_few_runs_merge(T* p, std::size_t n, bool descending) {
                             (bnd[r + 1] - lo) * sizeof(T));
             } else {
                 const std::size_t mid = bnd[r + 1], hi = bnd[r + 2];
-                if (!vmerge_runs(src + lo, mid - lo, src + mid, hi - mid, dst + lo, descending))
-                    std::merge(src + lo, src + mid, src + mid, src + hi, dst + lo, less);
+                merge_runs_galloping(src + lo, mid - lo, src + mid, hi - mid, dst + lo, descending);
             }
             bnd[w++] = lo;
         }
@@ -8396,21 +8492,6 @@ inline bool try_extract_merge_repair(T* p, std::size_t n, bool descending, SideS
     return true;
 }
 
-// p[0..cnt) -> p[s..s+cnt), s >= 1: backward 64-byte chunks through
-// registers.  Short overlapping shifts are where a libc memmove call per
-// outlier dominated (~100 cycles each on 1000-key inputs).
-template <class T>
-FYX_FORCE_INLINE void shift_up_small(T* p, std::size_t cnt, std::size_t s) {
-    constexpr std::size_t C = 64 / sizeof(T) ? 64 / sizeof(T) : 1;
-    std::size_t e = cnt;
-    while (e >= C) {
-        unsigned char tmp[C * sizeof(T)];
-        std::memcpy(tmp, static_cast<const void*>(p + e - C), sizeof(tmp));
-        std::memcpy(static_cast<void*>(p + e - C + s), tmp, sizeof(tmp));
-        e -= C;
-    }
-    while (e > 0) { --e; p[e + s] = p[e]; }
-}
 
 // Few isolated outliers in an otherwise sorted range (far swaps, a handful
 // of misplaced keys): locate every descent with a vectorized block test,
@@ -17225,7 +17306,16 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             // are O(n) for the structural kernels; each rejects random data
             // within a short scan.  Up to one leaf the column network sorts
             // any shape in a few hundred vector ops, so they are skipped.
-            if (n > detail::vqsort_leaf<T>()) {
+            // Many sorted runs (four deep, well-spaced drops at the front):
+            // only the few-run merge can use that; skipping the descent
+            // count and the repairs saves a full pass before the quicksort.
+            const bool runs_like = n > detail::vqsort_leaf<T>() &&
+                                   detail::descents_look_like_runs(p, n, 1, descending, 16, 4);
+            if (runs_like && detail::try_few_runs_merge(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                return;
+            }
+            if (!runs_like && n > detail::vqsort_leaf<T>()) {
                 // Route by the number of descents (counted up to n/16).
                 std::size_t brk = n;
                 // Up to 4096 keys one pass records the descent positions
@@ -17291,11 +17381,27 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                         return;
                     }
+                    // Sorted prefix of at least half the range, disorder only
+                    // behind it (appended keys): sort the tail, merge once.
+                    {
+                        const std::size_t cut = detail::radix_key_find_break(
+                            p, brk, n, detail::RadixTraits<T>::encode(p[brk - 1]), true, descending);
+                        // (Below 2048 int32 keys the vq sorts the whole range
+                        // faster than tail sort + merge network; measured.)
+                        if (cut >= n / 2 && cut < n && (n >= 2048 || sizeof(T) == 8)) {
+                            sort_pointer_core_impl(p + cut, n - cut, comp, o);
+                            detail::merge_two_runs(p, n, cut, descending);
+                            detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                            return;
+                        }
+                    }
                     // Below 2048 keys extraction costs about what the sort
                     // does (measured: a 10% random tail of 1000 keys runs
                     // 2x slower through it); the outlier repair above already
                     // took the few-descent cases.
-                    if (n >= 2048 &&
+                    // Many sorted runs (each boundary a deep drop) defeat the
+                    // extractor only after it has scanned most of the range.
+                    if (n >= 2048 && !detail::descents_look_like_runs(p, n, brk, descending, 16, 4) &&
                         detail::try_extract_merge_repair(p, n, descending, [&](T* q, std::size_t m) {
                             sort_pointer_core_impl(q, m, comp, o);
                         })) {

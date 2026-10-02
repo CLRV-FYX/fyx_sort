@@ -539,6 +539,46 @@ static void run_new_small_paths(const char* tname) {
             }
         }
     }
+    // 5. few monotone runs (galloping merges): 2..9 runs of uneven lengths,
+    //    disjoint or interleaved value ranges, ties, descending runs, specials;
+    //    and many well-spaced runs (the runs-like gate in front of the vq).
+    for (std::size_t n : {std::size_t(700), std::size_t(1000), std::size_t(3000), std::size_t(20000),
+                          std::size_t(70000)}) {
+        for (int R = 2; R <= 9; ++R) {
+            for (int kind = 0; kind < 4; ++kind) {
+                std::vector<T> v(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    const int sp = (kind == 3 && i % 41 == 7) ? 1 + int(i % 3) : 0;
+                    v[i] = special_or<T>(kind == 1 ? rng() % 7 : rng(), sp);
+                }
+                std::vector<std::size_t> cut{0, n};
+                for (int r = 1; r < R; ++r) cut.push_back(40 + rng() % (n - 80));
+                std::sort(cut.begin(), cut.end());
+                if (kind == 2) asc(v);                      // disjoint ranges, runs then permuted
+                for (int r = 0; r < R; ++r) {
+                    auto b0 = v.begin() + cut[r], b1 = v.begin() + cut[r + 1];
+                    std::sort(b0, b1, [](const T& x, const T& y) {
+                        return fd::RadixTraits<T>::encode(x) < fd::RadixTraits<T>::encode(y); });
+                    if (r % 3 == 2) std::reverse(b0, b1);
+                }
+                if (kind == 2 && R >= 3)                     // block swap of two runs
+                    std::rotate(v.begin() + cut[1], v.begin() + cut[2], v.begin() + cut[3]);
+                check_both_dirs(v, tname, "few-runs", n, R * 10 + kind);
+                ++cases;
+            }
+        }
+        for (std::size_t run : {std::size_t(16), std::size_t(17), std::size_t(31), std::size_t(64), std::size_t(300)}) {
+            std::vector<T> v(n);
+            for (std::size_t i = 0; i < n; ++i) v[i] = from_u64<T>(rng());
+            for (std::size_t b0 = 0; b0 < n; b0 += run) {
+                auto e = v.begin() + std::min(n, b0 + run);
+                std::sort(v.begin() + b0, e, [](const T& x, const T& y) {
+                    return fd::RadixTraits<T>::encode(x) < fd::RadixTraits<T>::encode(y); });
+            }
+            check_both_dirs(v, tname, "sorted-runs", n, int(run));
+            ++cases;
+        }
+    }
     std::printf("  %-8s new small-n paths ok (%d cases)\n", tname, cases);
 }
 

@@ -8,7 +8,7 @@
 typedef TY T;
 int main(int, char** v) {
     const std::size_t n = std::strtoull(v[1], 0, 10); const int d = std::atoi(v[2]);
-    const int S = 64, R = 40;   // 64 distinct inputs, 40 passes
+    const int S = n > 50000 ? 8 : 64, R = n > 50000 ? 12 : 40;   // distinct inputs, passes
     std::vector<std::vector<T>> src(S);
     for (int i = 0; i < S; ++i) src[i] = fb::make_input<T>(n, (fb::Dist)d, 500 + i);
     std::vector<T> w(n);

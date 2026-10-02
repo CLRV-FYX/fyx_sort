@@ -1401,6 +1401,32 @@ inline void vfill(T* p, std::size_t n, T x) {
     for (; i < n; ++i) p[i] = x;
 }
 
+// Vector helpers as plain functions: a lambda returning __m512i gets no
+// target attribute from the ISA pragma and trips -Wpsabi in generic builds.
+template <class U>
+FYX_FORCE_INLINE __m512i vbcast_bits(U b) {
+    if constexpr (sizeof(U) == 8) return _mm512_set1_epi64(static_cast<long long>(b));
+    else return _mm512_set1_epi32(static_cast<int>(b));
+}
+template <class T>
+FYX_FORCE_INLINE __m512i vencode_radix(__m512i v) {
+    constexpr bool k64 = sizeof(T) == 8;
+    if constexpr (std::is_floating_point<T>::value) {
+        if constexpr (k64) {
+            const __m512i m = _mm512_or_si512(_mm512_srai_epi64(v, 63), _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
+            return _mm512_xor_si512(v, m);
+        } else {
+            const __m512i m = _mm512_or_si512(_mm512_srai_epi32(v, 31), _mm512_set1_epi32(static_cast<int>(0x80000000u)));
+            return _mm512_xor_si512(v, m);
+        }
+    } else if constexpr (std::is_signed<T>::value) {
+        if constexpr (k64) return _mm512_xor_si512(v, _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
+        else return _mm512_xor_si512(v, _mm512_set1_epi32(static_cast<int>(0x80000000u)));
+    } else {
+        return v;
+    }
+}
+
 // Distinct-key table from strided samples: returns K, or 0 when the first 64
 // samples already show more than `cap1` distinct keys or all samples more
 // than 32.  The table lives in vector registers (padded with entry 0).
@@ -1412,15 +1438,11 @@ inline unsigned vfew_sample(const T* p, std::size_t n, unsigned cap1, std::size_
     alignas(64) U tb[32];
     unsigned K = 0;
     __m512i tv[NV];
-    auto bcast = [](U b) {
-        if constexpr (k64) return _mm512_set1_epi64(static_cast<long long>(b));
-        else return _mm512_set1_epi32(static_cast<int>(b));
-    };
     auto probe = [&](std::size_t idx, unsigned cap) -> bool {
         U b;
         std::memcpy(&b, p + idx, sizeof(U));
         if (K != 0) {
-            const __m512i x = bcast(b);
+            const __m512i x = vbcast_bits<U>(b);
             bool hit = false;
             for (int v = 0; v < NV; ++v) {
                 if constexpr (k64) hit |= _mm512_cmpeq_epi64_mask(tv[v], x) != 0;
@@ -1477,25 +1499,9 @@ inline std::size_t vdescent_positions(const T* p, std::size_t from, std::size_t 
                                       std::uint32_t* pos, std::size_t maxd) {
     constexpr bool k64 = sizeof(T) == 8;
     constexpr std::size_t V = 64 / sizeof(T);
-    auto enc = [](__m512i v) -> __m512i {
-        if constexpr (std::is_floating_point<T>::value) {
-            if constexpr (k64) {
-                const __m512i m = _mm512_or_si512(_mm512_srai_epi64(v, 63), _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
-                return _mm512_xor_si512(v, m);
-            } else {
-                const __m512i m = _mm512_or_si512(_mm512_srai_epi32(v, 31), _mm512_set1_epi32(static_cast<int>(0x80000000u)));
-                return _mm512_xor_si512(v, m);
-            }
-        } else if constexpr (std::is_signed<T>::value) {
-            if constexpr (k64) return _mm512_xor_si512(v, _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
-            else return _mm512_xor_si512(v, _mm512_set1_epi32(static_cast<int>(0x80000000u)));
-        } else {
-            return v;
-        }
-    };
     auto desc_mask = [&](std::size_t j) -> std::uint64_t {     // lanes j .. j+V-1
-        const __m512i c = enc(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j)));
-        const __m512i q = enc(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j - 1)));
+        const __m512i c = vencode_radix<T>(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j)));
+        const __m512i q = vencode_radix<T>(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j - 1)));
         if constexpr (k64) return descending ? _mm512_cmpgt_epu64_mask(c, q) : _mm512_cmplt_epu64_mask(c, q);
         else return descending ? _mm512_cmpgt_epu32_mask(c, q) : _mm512_cmplt_epu32_mask(c, q);
     };

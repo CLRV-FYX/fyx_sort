@@ -6,6 +6,26 @@ Date: 2026-09-16
 
 ### Added
 
+- **小 n 快路径新增（2026-10-02，Ice Lake-SP / GCC 12.2 单机，与 x86-simd-sort 进程内交替 A/B，
+  中位数 ns/elem；`tools/dev/shape_bench/ab_all.sh`）**：
+  - 稀疏离群修复 `sparse_outlier_repair_at`：AVX-512 压缩存储一次取得全部 descent 位置
+    （`descent_positions`），每个 descent 归咎一个键并验证，离群键排序后用锁步无分支
+    二分插入。far_swaps i32 1000 2.43→1.1（xss 1.29）。
+  - 少数单调段的归并改为“先跳跃（galloping）整块拷贝，块短再转 SIMD 归并”
+    （`merge_runs_galloping`）：block_swap/organ_pipe 在 1K–200K 为 xss 的 3–4.8 倍。
+  - 多段有序（runs-like：前 4 个 descent 间距 ≥16 且都是深跌）门控：跳过 descent 计数与
+    修复探针直接 vq；sorted_runs 20K/200K 由 0.91–0.94 变为约持平（0.98–1.02）。
+  - 有序前缀 ≥ n/2 + 无序尾：先排尾再一次归并。sorted_tail 20K/200K 为 xss 的 1.6–2.3 倍。
+  - 少值（≤32 distinct，AVX-512 计数+填充）、位级全等单流扫描、vq 首次分区融合 NaN/-0
+    筛查（f64 random 200K 省去单独一遍扫描）、局部 descent 门控 insertion repair。
+  - extract-merge 块跳过改为同宽求和（可向量化）+ 有序前缀一次搬移。
+- **可移植性修复**：通用 `-march`（运行时分派 AVX-512）构建下，返回 `__m512i` 的 lambda
+  触发 `-Wpsabi`（`-Werror` 下编译失败），改为普通内联函数。
+- **测试**：`t_vsort` 新增 few-distinct（K=1..40、样本漏值、±0/NaN）、全等边界、带 NaN/-0
+  的 vq 筛查、稀疏离群（相邻/簇/重复/特殊值）、少段/多段有序共约 1100 个用例 × 6 类型 × 升降序。
+- **修复（开发期发现）**：insertion repair 失败后数组已被置换，旧的 descent 位置不可复用
+  （新路径曾因此产生未排序输出，已由新测试捕获并修复）。
+
 - **GCC -O2 性能修复**：GCC 在 -O2 下用“very cheap”向量化代价模型且不做循环
   unswitch/peel，库内无分支扫描比 -O3 慢 2–4 倍（200K i32 sorted 0.71 vs 0.15
   ns/elem，rotated 1.8 vs 0.85）；vq 分区的寄存器数组循环不展开（200K i32 kernel
