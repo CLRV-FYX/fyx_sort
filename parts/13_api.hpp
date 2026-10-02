@@ -401,6 +401,28 @@ inline std::size_t count_descents_capped(const T* p, std::size_t n, bool descend
     return d;
 }
 
+// True when the first few descents (from `from`) are local: the key after
+// each drop still sits at or above the key `reach` places back.  Near-sorted
+// input (short displacements) passes; sorted runs, far swaps and random
+// tails, whose drops fall far, fail on the first descent.
+template <class T>
+inline bool descents_look_local(const T* p, std::size_t n, std::size_t from, bool descending,
+                                std::size_t reach, int samples) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+    std::size_t i = from < 1 ? 1 : from;
+    for (int s = 0; s < samples && i < n; ++s) {
+        i = radix_key_find_break(p, i, n, RT::encode(p[i - 1]), true, descending);
+        if (i >= n) break;
+        const std::size_t back = i > reach ? i - reach : 0;
+        if (key(p[i]) < key(p[back])) return false;
+        ++i;
+    }
+    return true;
+}
+
 // Exactly two ascending runs p[0..brk) and p[brk..n): rotate when the second
 // run lies entirely below the first, otherwise one four-way merge.
 template <class T>
@@ -514,7 +536,7 @@ template <class T, class SideSort>
 inline bool try_extract_merge_repair(T* p, std::size_t n, bool descending, SideSort&& side_sort) {
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
-    if (n < 2048) return false;
+    if (n < 256) return false;
     const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
     auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
 
@@ -532,19 +554,37 @@ inline bool try_extract_merge_repair(T* p, std::size_t n, bool descending, SideS
     Key sidelast = 0;
     bool ok = true;
     bool kept_last = true;                 // retry the block skip only after a keep
+    constexpr std::size_t kBlk = 16;
     std::size_t i = 1;
     for (; i < n; ++i) {
         // Ordered stretches move 16 keys at a time (branch-free test, then a
         // block copy -- nothing to copy at all before the first extraction).
-        while (kept_last && i + 16 <= n) {
-            unsigned bad = static_cast<unsigned>(key(p[i]) < klast);
-            for (std::size_t j = 1; j < 16; ++j)
-                bad |= static_cast<unsigned>(key(p[i + j]) < key(p[i + j - 1]));
-            if (bad) break;
-            if (k != i) std::memmove(static_cast<void*>(p + k), static_cast<const void*>(p + i), 16 * sizeof(T));
-            k += 16;
-            i += 16;
-            klast = key(p[k - 1]);
+        while (kept_last && i + kBlk <= n) {
+            // Same-width lane sum: vectorizes (a shifted OR mask does not).
+            Key bd = static_cast<Key>(key(p[i]) < klast);
+            for (std::size_t j = 1; j < kBlk; ++j)
+                bd = static_cast<Key>(bd + static_cast<Key>(key(p[i + j]) < key(p[i + j - 1])));
+            std::size_t f = kBlk;
+            if (bd != 0) {
+                // Keep the ordered prefix in one go and hand the first
+                // descent to the scalar step (re-testing the same block
+                // key by key cost ~16x near every outlier).
+                f = 0;
+                if (!(key(p[i]) < klast)) {
+                    f = 1;
+                    while (!(key(p[i + f]) < key(p[i + f - 1]))) ++f;
+                }
+            }
+            if (f != 0) {
+                if (k != i) {
+                    // k < i (may overlap): forward element copy, no libc call.
+                    for (std::size_t j = 0; j < f; ++j) p[k + j] = p[i + j];
+                }
+                k += f;
+                i += f;
+                klast = key(p[k - 1]);
+            }
+            if (f != kBlk) break;
         }
         if (i >= n) break;
         const T x = p[i];
@@ -618,6 +658,116 @@ inline bool try_extract_merge_repair(T* p, std::size_t n, bool descending, SideS
         merge_runs_4way(p, k, sd, m, obuf, key);
     std::memcpy(static_cast<void*>(p), static_cast<const void*>(obuf), n * sizeof(T));
     return true;
+}
+
+// p[0..cnt) -> p[s..s+cnt), s >= 1: backward 64-byte chunks through
+// registers.  Short overlapping shifts are where a libc memmove call per
+// outlier dominated (~100 cycles each on 1000-key inputs).
+template <class T>
+FYX_FORCE_INLINE void shift_up_small(T* p, std::size_t cnt, std::size_t s) {
+    constexpr std::size_t C = 64 / sizeof(T) ? 64 / sizeof(T) : 1;
+    std::size_t e = cnt;
+    while (e >= C) {
+        unsigned char tmp[C * sizeof(T)];
+        std::memcpy(tmp, static_cast<const void*>(p + e - C), sizeof(tmp));
+        std::memcpy(static_cast<void*>(p + e - C + s), tmp, sizeof(tmp));
+        e -= C;
+    }
+    while (e > 0) { --e; p[e + s] = p[e]; }
+}
+
+// Few isolated outliers in an otherwise sorted range (far swaps, a handful
+// of misplaced keys): locate every descent with a vectorized block test,
+// blame one key per descent, verify the remainder is ordered, then compact,
+// sort the (<= 2 * kMaxD) outliers and insert them.  Only a constant number of
+// data-dependent branches per descent, so it stays fast on cold predictors
+// where the streaming extractor pays several mispredictions per outlier.
+// Returns false (range untouched) when the blame/verify step does not hold.
+template <class T>
+inline bool sparse_outlier_repair_at(T* p, std::size_t n, const std::uint32_t* pos, std::size_t D,
+                                     bool descending) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    constexpr std::size_t kMaxD = 32;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+    if (n < 64 || D > kMaxD) return false;
+    if (D == 0) return true;
+    // Blame: p[i-1] when dropping it leaves p[i-2] <= p[i], else p[i] when
+    // dropping it leaves p[i-1] <= p[i+1].  rem[] stays ascending.
+    std::size_t rem[kMaxD];
+    std::size_t r = 0;
+    for (std::size_t d = 0; d < D; ++d) {
+        const std::size_t i = pos[d];
+        const bool prev_removed = r != 0 && rem[r - 1] == i - 1;
+        if (!prev_removed && (i < 2 || !(key(p[i]) < key(p[i - 2])))) {
+            rem[r++] = i - 1;
+        } else if (i + 1 >= n || !(key(p[i + 1]) < key(p[i - 1]))) {
+            rem[r++] = i;
+        } else {
+            return false;
+        }
+    }
+    // Verify: every kept neighbour pair spanning a removed index is ordered
+    // (pairs not touching one were not descents).
+    for (std::size_t q = 0; q < r;) {
+        std::size_t q2 = q;
+        while (q2 + 1 < r && rem[q2 + 1] == rem[q2] + 1) ++q2;    // consecutive
+        const std::size_t lo = rem[q], hi = rem[q2];
+        if (lo > 0 && hi + 1 < n && key(p[hi + 1]) < key(p[lo - 1])) return false;
+        q = q2 + 1;
+    }
+    // Compact the kept keys to the front, outliers to a small buffer.
+    T out[kMaxD];
+    std::size_t w = rem[0];
+    for (std::size_t q = 0; q < r; ++q) {
+        out[q] = p[rem[q]];
+        const std::size_t s0 = rem[q] + 1;
+        const std::size_t s1 = q + 1 < r ? rem[q + 1] : n;
+        if (s1 > s0) std::memmove(static_cast<void*>(p + w), static_cast<const void*>(p + s0), (s1 - s0) * sizeof(T));
+        w += s1 - s0;
+    }
+    // Insertion-sort the outliers by key.
+    for (std::size_t a = 1; a < r; ++a) {
+        const T x = out[a];
+        const Key kx = key(x);
+        std::size_t b = a;
+        while (b > 0 && kx < key(out[b - 1])) { out[b] = out[b - 1]; --b; }
+        out[b] = x;
+    }
+    // Insertion slots (first kept index with key > outlier), all searches
+    // in lockstep: independent branch-free searches overlap their load
+    // latency instead of paying ~log2(n) dependent loads one after another.
+    const std::size_t kept = n - r;
+    std::size_t slot[kMaxD];
+    Key okey[kMaxD];
+    for (std::size_t b = 0; b < r; ++b) { slot[b] = 0; okey[b] = key(out[b]); }
+    std::size_t len = kept;
+    while (len > 1) {
+        const std::size_t half = len / 2;
+        for (std::size_t b = 0; b < r; ++b)
+            slot[b] += (std::size_t(0) - static_cast<std::size_t>(!(okey[b] < key(p[slot[b] + half])))) & half;
+        len -= half;
+    }
+    if (len == 1)
+        for (std::size_t b = 0; b < r; ++b) slot[b] += static_cast<std::size_t>(!(okey[b] < key(p[slot[b]])));
+    // Insert from the back: each kept key moves once.
+    std::size_t hi = kept;
+    for (std::size_t b = r; b-- > 0;) {
+        const std::size_t lo = slot[b];
+        shift_up_small(p + lo, hi - lo, b + 1);
+        p[lo + b] = out[b];
+        hi = lo;
+    }
+    return true;
+}
+
+template <class T>
+inline bool try_sparse_outlier_repair(T* p, std::size_t n, std::size_t from, bool descending) {
+    if (n > 0xFFFFFFFFull) return false;
+    std::uint32_t pos[32];
+    const std::size_t D = descent_positions(p, from, n, descending, pos, 32);
+    return D <= 32 && sparse_outlier_repair_at(p, n, pos, D, descending);
 }
 
 // Insertion repair over radix keys (the library's total order, so NaN / -0
@@ -9342,7 +9492,22 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             if (n > detail::vqsort_leaf<T>()) {
                 // Route by the number of descents (counted up to n/16).
                 std::size_t brk = n;
-                const std::size_t D = detail::count_descents_capped(p, n, descending, n / 16, brk);
+                // Up to 4096 keys one pass records the descent positions
+                // themselves (the sparse-outlier repair reuses them).
+                constexpr std::size_t kPosCap = 256;
+                std::uint32_t dpos[kPosCap];
+                const bool have_pos = n <= 16 * kPosCap;
+                std::size_t D;
+                if (have_pos) {
+                    // Below 2048 keys only the few-descent repairs use an
+                    // exact count; a dense head (> 8 drops in 32 pairs)
+                    // already routes the range to the dense branch.
+                    D = n < 2048 ? detail::descent_positions(p, 1, 33, descending, dpos, 8) : 0;
+                    D = D > 8 ? n / 16 + 1 : detail::descent_positions(p, 1, n, descending, dpos, n / 16);
+                    if (D != 0) brk = dpos[0];
+                } else {
+                    D = detail::count_descents_capped(p, n, descending, n / 16, brk);
+                }
                 if (D == 1) {
                     // Two runs (concatenated sorted halves, a rotation).
                     brk = detail::radix_key_find_break(p, brk, n, detail::RadixTraits<T>::encode(p[brk - 1]),
@@ -9371,17 +9536,31 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                     // to bounded insertion, permuted blocks to the structural
                     // proof, a minority of far / tail keys to extract-merge.
                     const std::size_t head = std::min<std::size_t>(n - 1, 256);
+                    bool pos_fresh = have_pos;
                     if (D <= n / 128 &&
                         detail::head_inversions_within(p, n, descending, head, head / 32) &&
-                        detail::budgeted_insertion_repair(p, n, descending, n / 4 + 64)) {
-                        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
-                        return;
+                        detail::descents_look_local(p, n, brk, descending, 96, 4)) {
+                        if (detail::budgeted_insertion_repair(p, n, descending, n / 4 + 64)) {
+                            detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                            return;
+                        }
+                        pos_fresh = false;     // a declined repair leaves a permutation
                     }
                     if (detail::try_proof_structured_sort(p, n, descending)) {
                         detail::record_dispatch(detail::DispatchDecision::ProfileSorted);
                         return;
                     }
-                    if (detail::try_extract_merge_repair(p, n, descending, [&](T* q, std::size_t m) {
+                    if (D <= 32 && (pos_fresh ? detail::sparse_outlier_repair_at(p, n, dpos, D, descending)
+                                              : detail::try_sparse_outlier_repair(p, n, 1, descending))) {
+                        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                        return;
+                    }
+                    // Below 2048 keys extraction costs about what the sort
+                    // does (measured: a 10% random tail of 1000 keys runs
+                    // 2x slower through it); the outlier repair above already
+                    // took the few-descent cases.
+                    if (n >= 2048 &&
+                        detail::try_extract_merge_repair(p, n, descending, [&](T* q, std::size_t m) {
                             sort_pointer_core_impl(q, m, comp, o);
                         })) {
                         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
@@ -9413,8 +9592,16 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                 }
             }
             // NaN / unclean ranges take the general path below.
-            if (clean && ((pre & 8u) == 0 || detail::vqsort_range_clean(p, n))) {
+            if (clean && (pre & 8u) == 0) {
                 detail::vqsort_serial(p, n);
+                if (descending) detail::reverse_range_adaptive(p, n);
+                detail::record_dispatch(detail::DispatchDecision::VectorQuick);
+                return;
+            }
+            // Cleanliness not yet established (floats): the first partition
+            // screens for NaN / -0 as it goes; on a hit the (permuted) range
+            // continues down the general path.
+            if (clean && detail::vqsort_serial_checked(p, n)) {
                 if (descending) detail::reverse_range_adaptive(p, n);
                 detail::record_dispatch(detail::DispatchDecision::VectorQuick);
                 return;

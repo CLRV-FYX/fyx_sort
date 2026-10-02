@@ -400,6 +400,148 @@ static void run_sparse_descent_shapes(const char* tname) {
     std::printf("  %-8s sparse-descent repairs ok (%d cases)\n", tname, shapes_run);
 }
 
+// ---------------------------------------------------------------------------
+// Newer small-n paths: few-distinct counting, bitwise all-equal, the NaN/-0
+// screening fused into the first vq partition, and the sparse-outlier repair.
+// Every case is checked for order (radix total order; loose around NaN and
+// signed zeros exactly as above) and for an unchanged multiset.
+// ---------------------------------------------------------------------------
+template <class T>
+static bool sorted_ok(const std::vector<T>& orig, const std::vector<T>& s, bool dir) {
+    using RT  = fd::RadixTraits<T>;
+    using Key = typename RT::Key;
+    const std::size_t n = s.size();
+    for (std::size_t i = 1; i < n; ++i) {
+        const Key a = RT::encode(s[i - 1]), b = RT::encode(s[i]);
+        if (std::is_floating_point<T>::value) {
+            if (s[i - 1] != s[i - 1] || s[i] != s[i]) continue;
+            if (a != b && s[i - 1] == s[i]) continue;
+        }
+        if (dir ? (a < b) : (b < a)) return false;
+    }
+    std::vector<Key> ka(n), kb(n);
+    for (std::size_t i = 0; i < n; ++i) { ka[i] = RT::encode(orig[i]); kb[i] = RT::encode(s[i]); }
+    std::sort(ka.begin(), ka.end());
+    std::sort(kb.begin(), kb.end());
+    return ka == kb;
+}
+
+template <class T>
+static void check_both_dirs(const std::vector<T>& v, const char* tname, const char* what, std::size_t n, int k) {
+    for (int dir = 0; dir < 2; ++dir) {
+        std::vector<T> s = v;
+        if (dir) fyx::sort(s.begin(), s.end(), std::greater<T>());
+        else     fyx::sort(s.begin(), s.end());
+        const bool ok = sorted_ok(v, s, dir != 0);
+        if (!ok) std::printf("    [%s %s n=%zu k=%d dir=%d dispatch=%d]\n", tname, what, n, k, dir, int(fd::test_last_dispatch()));
+        CHECK(ok, what);
+    }
+}
+
+template <class T>
+static T special_or(std::uint64_t u, int which) {
+    if (std::is_floating_point<T>::value) {
+        if (which == 1) return std::numeric_limits<T>::quiet_NaN();
+        if (which == 2) return -T(0);
+        if (which == 3) return T(0);
+    }
+    return from_u64<T>(u);
+}
+
+template <class T>
+static void run_new_small_paths(const char* tname) {
+    int cases = 0;
+    // 1. few distinct keys (<= 32 counts; 33+ must decline), rare extra key.
+    for (std::size_t n : {std::size_t(1000), std::size_t(1023), std::size_t(1024), std::size_t(1500),
+                          std::size_t(5000), std::size_t(70000)}) {
+        for (int K : {1, 2, 3, 5, 16, 17, 31, 32, 33, 40}) {
+            for (int variant = 0; variant < 4; ++variant) {
+                std::vector<T> vals(K);
+                for (int j = 0; j < K; ++j) vals[j] = from_u64<T>(rng());
+                if (std::is_floating_point<T>::value && variant >= 2 && K >= 3) {
+                    vals[0] = -T(0); vals[1] = T(0);
+                    if (variant == 3) vals[2] = std::numeric_limits<T>::quiet_NaN();
+                }
+                std::vector<T> v(n);
+                for (std::size_t i = 0; i < n; ++i) v[i] = vals[rng() % K];
+                if (variant == 1) v[rng() % n] = from_u64<T>(rng());         // one key the sample misses
+                check_both_dirs(v, tname, "few-distinct", n, K);
+                ++cases;
+            }
+        }
+    }
+    // 2. bitwise all-equal and near misses (one key off at head / middle / tail).
+    for (std::size_t n = 1; n <= 70; ++n) {
+        for (int where = 0; where < 4; ++where) {
+            std::vector<T> v(n, from_u64<T>(12345));
+            if (where == 1) v[0] = from_u64<T>(7);
+            if (where == 2) v[n / 2] = from_u64<T>(7);
+            if (where == 3) v[n - 1] = from_u64<T>(7);
+            check_both_dirs(v, tname, "all-equal", n, where);
+            ++cases;
+        }
+    }
+    for (std::size_t n : {std::size_t(1000), std::size_t(4097), std::size_t(100003)}) {
+        for (int where = 0; where < 5; ++where) {
+            std::vector<T> v(n, special_or<T>(99, where == 4 ? 2 : 0));       // all -0 (float)
+            if (where == 1) v[0] = from_u64<T>(7);
+            if (where == 2) v[n / 2 + 1] = from_u64<T>(7);
+            if (where == 3) v[n - 2] = from_u64<T>(7);
+            check_both_dirs(v, tname, "all-equal", n, where);
+            ++cases;
+        }
+    }
+    // 3. random keys with one / a few NaN, -0, +0 (the fused screening path,
+    //    on both sides of the leaf size and past the first partition).
+    for (std::size_t n : {std::size_t(300), std::size_t(600), std::size_t(1000), std::size_t(5000),
+                          std::size_t(20000), std::size_t(100000), std::size_t(300000)}) {
+        for (int mix = 0; mix < 6; ++mix) {
+            std::vector<T> v(n);
+            for (std::size_t i = 0; i < n; ++i) v[i] = from_u64<T>(rng());
+            switch (mix) {
+                case 1: v[rng() % n] = special_or<T>(0, 1); break;
+                case 2: v[rng() % n] = special_or<T>(0, 2); break;
+                case 3: v[n - 1] = special_or<T>(0, 2); v[0] = special_or<T>(0, 1); break;
+                case 4: for (int j = 0; j < 9; ++j) v[rng() % n] = special_or<T>(0, 1 + j % 3); break;
+                case 5: v[n / 2] = special_or<T>(0, 3); break;
+                default: break;
+            }
+            check_both_dirs(v, tname, "screened-vq", n, mix);
+            ++cases;
+        }
+    }
+    // 4. sparse outliers: far swaps, adjacent pairs, clustered outliers,
+    //    heavy duplicates, special keys among the outliers.
+    auto asc = [](std::vector<T>& v) {
+        std::sort(v.begin(), v.end(), [](const T& a, const T& b) {
+            return fd::RadixTraits<T>::encode(a) < fd::RadixTraits<T>::encode(b); });
+    };
+    for (std::size_t n : {std::size_t(300), std::size_t(513), std::size_t(1000), std::size_t(1500),
+                          std::size_t(2047), std::size_t(3000), std::size_t(4096), std::size_t(5000),
+                          std::size_t(20000)}) {
+        for (int k : {1, 2, 4, 8, 15, 16, 17, 31, 40}) {
+            for (int kind = 0; kind < 5; ++kind) {
+                std::vector<T> v(n);
+                for (std::size_t i = 0; i < n; ++i)
+                    v[i] = kind == 3 ? from_u64<T>(rng() % 5) : from_u64<T>(rng());
+                asc(v);
+                for (int j = 0; j < k; ++j) {
+                    const std::size_t a = rng() % n, b = rng() % n;
+                    switch (kind) {
+                        case 1: if (a + 1 < n) std::swap(v[a], v[a + 1]); break;            // adjacent
+                        case 2: if (a + 3 < n) { v[a] = v[n - 1]; v[a + 1] = v[n - 1]; v[a + 2] = v[0]; } break;
+                        case 4: v[a] = special_or<T>(rng(), 1 + j % 3); break;               // NaN / -0 / +0
+                        default: std::swap(v[a], v[b]); break;
+                    }
+                }
+                check_both_dirs(v, tname, "sparse-outliers", n, k * 10 + kind);
+                ++cases;
+            }
+        }
+    }
+    std::printf("  %-8s new small-n paths ok (%d cases)\n", tname, cases);
+}
+
 int main() {
     std::printf("t_vsort: AVX-512 vectorised quicksort\n");
     std::printf("  kernel present for int32=%d, usable at 70000=%d\n",
@@ -427,6 +569,13 @@ int main() {
     run_sparse_descent_shapes<std::uint64_t>("uint64");
     run_sparse_descent_shapes<float>("float");
     run_sparse_descent_shapes<double>("double");
+
+    run_new_small_paths<std::int32_t>("int32");
+    run_new_small_paths<std::uint32_t>("uint32");
+    run_new_small_paths<std::int64_t>("int64");
+    run_new_small_paths<std::uint64_t>("uint64");
+    run_new_small_paths<float>("float");
+    run_new_small_paths<double>("double");
 
     std::printf("checks=%d failures=%d\n", checks, failures);
     if (failures) { std::printf("VSORT TEST FAILURES=%d\n", failures); return 1; }

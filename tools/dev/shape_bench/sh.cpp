@@ -17,22 +17,26 @@ int main(int argc, char** argv) {
     for (int d = 0; d < 16; ++d) {
         if (only >= 0 && d != only) continue;
         double best = 1e30;
-        const int rounds = n >= 1000000 ? 7 : n >= 100000 ? 41 : 15;
+        const int rounds = n >= 1000000 ? 7 : n >= 100000 ? 41 : 61;
         for (int r = 0; r < rounds; ++r) {
-            std::vector<std::vector<T>> v(B);
-            for (std::size_t b = 0; b < B; ++b) v[b] = fb::make_input<T>(n, (fb::Dist)d, 1000 + r * 131 + b);
+            // one contiguous buffer: allocator placement must not differ by shape
+            std::vector<T> buf(n * B);
+            for (std::size_t b = 0; b < B; ++b) {
+                const auto x = fb::make_input<T>(n, (fb::Dist)d, 1000 + r * 131 + b);
+                std::copy(x.begin(), x.end(), buf.begin() + b * n);
+            }
             auto t0 = std::chrono::steady_clock::now();
             for (std::size_t b = 0; b < B; ++b) {
 #ifdef XSS
-                x86simdsortStatic::qsort(v[b].data(), n, false, false);
+                x86simdsortStatic::qsort(buf.data() + b * n, n, false, false);
 #else
-                fyx::sort(v[b].begin(), v[b].end());
+                fyx::sort(buf.data() + b * n, buf.data() + (b + 1) * n);
 #endif
             }
             double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / double(n * B);
             best = std::min(best, ns);
             for (std::size_t b = 0; b < B; ++b)
-                if (!std::is_sorted(v[b].begin(), v[b].end(), [](T a, T c){ return a < c; })) { std::printf("UNSORTED %d\n", d); return 1; }
+                if (!std::is_sorted(buf.data() + b * n, buf.data() + (b + 1) * n, [](T a, T c){ return a < c; })) { std::printf("UNSORTED %d\n", d); return 1; }
         }
         std::printf("%-14s %.3f\n", fb::dist_name((fb::Dist)d), best);
     }

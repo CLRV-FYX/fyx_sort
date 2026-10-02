@@ -813,17 +813,38 @@ FYX_FORCE_INLINE void vpart_vec_lean_max(T* a, std::size_t& ls, std::size_t& rs,
 /// value (return, no extra pass) and marks the high side all-pivot (its
 /// elements are in their final place; the recursion drops it without sorting
 /// it), which costs two full passes to discover structurally.
-template <class T, bool Strict = false, int U = 4, bool TrackMax = false>
-inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
+/// NaN or -0 lanes of a vector (the values whose hardware order differs from
+/// the library's radix total order); always 0 for integers.
+template <class T>
+FYX_FORCE_INLINE std::uint64_t vbad_lanes(typename VOps<T>::reg v) {
+    if constexpr (!std::is_floating_point<T>::value) {
+        (void)v;
+        return 0;
+    } else if constexpr (sizeof(T) == 4) {
+        return static_cast<std::uint64_t>(_mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q) |
+            _mm512_cmpeq_epi32_mask(_mm512_castps_si512(v), _mm512_set1_epi32(static_cast<int>(0x80000000u))));
+    } else {
+        return static_cast<std::uint64_t>(_mm512_cmp_pd_mask(v, v, _CMP_UNORD_Q) |
+            _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(v), _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ull))));
+    }
+}
+
+template <class T>
+inline bool vrange_clean(const T* a, std::size_t n);
+
+template <class T, bool Strict = false, int U = 4, bool TrackMax = false, bool CC = false>
+inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max,
+                                   std::uint64_t* bad_out = nullptr) {
     using P   = VOps<T>;
     using reg = typename P::reg;
     constexpr int V = P::V;
     constexpr std::size_t CH = static_cast<std::size_t>(U) * V;
 
     if (n < 2 * CH) {
-        if constexpr (U > 1) return vpartition_lean<T, Strict, U / 2, TrackMax>(a, n, pivot, out_max);
+        if constexpr (U > 1) return vpartition_lean<T, Strict, U / 2, TrackMax, CC>(a, n, pivot, out_max, bad_out);
         T mn, mx;
         if constexpr (U == 1) {
+            if constexpr (CC) *bad_out |= vrange_clean(a, n) ? 0u : 1u;
             const std::size_t s = vpartition_scalar<T, Strict>(a, n, pivot, mn, mx);
             if constexpr (TrackMax) out_max = mx;
             return s;
@@ -837,6 +858,7 @@ inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
 
     reg vmax;
     if constexpr (TrackMax) vmax = P::set1(pivot);
+    std::uint64_t bad = 0;                 // CC: NaN / -0 lanes seen
 
     reg vl[U], vr[U];
     FYX_VQ_UNROLL for (int i = 0; i < U; ++i) vl[i] = P::loadu(a + static_cast<std::size_t>(i) * V);
@@ -851,6 +873,7 @@ inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
         FYX_VQ_UNROLL for (int i = 0; i < U; ++i) cur[i] = P::loadu(a + src + static_cast<std::size_t>(i) * V);
         r -= from_right ? CH : 0;
         l += from_right ? 0 : CH;
+        if constexpr (CC) { FYX_VQ_UNROLL for (int i = 0; i < U; ++i) bad |= vbad_lanes<T>(cur[i]); }
         if constexpr (TrackMax) {
             FYX_VQ_UNROLL for (int i = 0; i < U; ++i) vpart_vec_lean_max<T, Strict>(a, ls, rs, cur[i], pv, vmax);
         } else {
@@ -863,13 +886,15 @@ inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
         const reg cur = P::loadu(a + src);
         r -= from_right ? V : 0;
         l += from_right ? 0 : V;
+        if constexpr (CC) bad |= vbad_lanes<T>(cur);
         if constexpr (TrackMax) vpart_vec_lean_max<T, Strict>(a, ls, rs, cur, pv, vmax);
         else                    vpart_vec_lean<T, Strict>(a, ls, rs, cur, pv);
     }
     if (r != l) {
         const unsigned m = static_cast<unsigned>(r - l);
         const typename P::mask valid = static_cast<typename P::mask>((1ull << m) - 1ull);
-        const reg cur = P::maskz_loadu(valid, a + l);
+        const reg cur = P::maskz_loadu(valid, a + l);   // zero lanes are +0: clean
+        if constexpr (CC) bad |= vbad_lanes<T>(cur);
         // The masked variant keeps the junk lanes out of the counts and the
         // stores; the max update runs separately over a copy whose junk lanes
         // hold the pivot (<= every right-side value, and the pivot itself is
@@ -888,6 +913,10 @@ inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
     FYX_VQ_UNROLL for (int i = 0; i < U; ++i) {
         if constexpr (TrackMax) vpart_vec_lean_max<T, Strict>(a, ls, rs, vr[i], pv, vmax);
         else                    vpart_vec_lean<T, Strict>(a, ls, rs, vr[i], pv);
+    }
+    if constexpr (CC) {
+        FYX_VQ_UNROLL for (int i = 0; i < U; ++i) bad |= vbad_lanes<T>(vl[i]) | vbad_lanes<T>(vr[i]);
+        *bad_out |= bad;
     }
     if constexpr (TrackMax) out_max = P::reduce_max(vmax);
     return ls;
@@ -968,6 +997,35 @@ inline void vqsort_rec(T* a, std::size_t n, int budget) {
         }
     }
     vnet_sort<T>(a, n);
+}
+
+/// vqsort_rec whose first partition also screens for NaN / -0 (the screen
+/// rides on loads the partition makes anyway, instead of a separate pass).
+/// Returns false -- the range then holds a permutation of its input -- when
+/// one was seen; the caller sorts it another way.
+template <class T>
+inline bool vqsort_rec_checked(T* a, std::size_t n, int budget) {
+    if (n <= VqLeaf<T>::value) {
+        if (!vrange_clean(a, n)) return false;
+        vnet_sort<T>(a, n);
+        return true;
+    }
+    const T pivot = vpick_pivot<T>(a, n);
+    T hi;
+    std::uint64_t bad = 0;
+    const std::size_t split = vpartition_lean<T, false, 4, true, true>(a, n, pivot, hi, &bad);
+    if (bad) return false;
+    --budget;
+    if (split == 0) {
+        if (!(pivot < hi)) return true;
+        T hi2;
+        const std::size_t eq = vpartition_lean<T, true>(a, n, pivot, hi2);
+        vqsort_rec<T>(a + eq, n - eq, budget);
+        return true;
+    }
+    vqsort_rec<T>(a, split, budget);
+    if (pivot < hi) vqsort_rec<T>(a + split, n - split, budget);
+    return true;
 }
 
 /// True when the range holds no NaN and no negative zero, i.e. when the
@@ -1411,6 +1469,70 @@ inline bool vall_equal(const T* p, std::size_t n) {
     return i == n || ne(n - V) == 0;
 }
 
+// Positions j in [from, n) with key(p[j]) < key(p[j-1]) in target order,
+// keys encoded as the radix total order (so NaN / -0 agree with the scalar
+// paths).  Returns the count, or maxd + 1 as soon as it exceeds maxd.
+template <class T>
+inline std::size_t vdescent_positions(const T* p, std::size_t from, std::size_t n, bool descending,
+                                      std::uint32_t* pos, std::size_t maxd) {
+    constexpr bool k64 = sizeof(T) == 8;
+    constexpr std::size_t V = 64 / sizeof(T);
+    auto enc = [](__m512i v) -> __m512i {
+        if constexpr (std::is_floating_point<T>::value) {
+            if constexpr (k64) {
+                const __m512i m = _mm512_or_si512(_mm512_srai_epi64(v, 63), _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
+                return _mm512_xor_si512(v, m);
+            } else {
+                const __m512i m = _mm512_or_si512(_mm512_srai_epi32(v, 31), _mm512_set1_epi32(static_cast<int>(0x80000000u)));
+                return _mm512_xor_si512(v, m);
+            }
+        } else if constexpr (std::is_signed<T>::value) {
+            if constexpr (k64) return _mm512_xor_si512(v, _mm512_set1_epi64(static_cast<long long>(1ull << 63)));
+            else return _mm512_xor_si512(v, _mm512_set1_epi32(static_cast<int>(0x80000000u)));
+        } else {
+            return v;
+        }
+    };
+    auto desc_mask = [&](std::size_t j) -> std::uint64_t {     // lanes j .. j+V-1
+        const __m512i c = enc(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j)));
+        const __m512i q = enc(_mm512_loadu_si512(reinterpret_cast<const void*>(p + j - 1)));
+        if constexpr (k64) return descending ? _mm512_cmpgt_epu64_mask(c, q) : _mm512_cmplt_epu64_mask(c, q);
+        else return descending ? _mm512_cmpgt_epu32_mask(c, q) : _mm512_cmplt_epu32_mask(c, q);
+    };
+    std::size_t d = 0;
+    std::size_t j = from < 1 ? 1 : from;
+    // Branch-free recording: compress-store the lane indices of a mask.
+    const __m512i iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    auto take = [&](std::uint64_t m, std::size_t base) -> bool {
+        const std::size_t c = static_cast<std::size_t>(__builtin_popcountll(m));
+        if (d + c > maxd) { d = maxd + 1; return false; }
+        const __m512i idx = _mm512_add_epi32(iota, _mm512_set1_epi32(static_cast<int>(base)));
+        _mm512_mask_compressstoreu_epi32(pos + d, static_cast<__mmask16>(m), idx);
+        d += c;
+        return true;
+    };
+    for (; j + 2 * V <= n; j += 2 * V) {
+        const std::uint64_t m0 = desc_mask(j), m1 = desc_mask(j + V);
+        if ((m0 | m1) == 0) continue;
+        if (!take(m0, j) || !take(m1, j + V)) return d;
+    }
+    for (; j + V <= n; j += V)
+        if (!take(desc_mask(j), j)) return d;
+    if (j < n && n > V) {
+        // Tail: re-test the last V pairs, keep only lanes not yet covered.
+        const std::size_t b = n - V;
+        const std::uint64_t m = desc_mask(b) >> (j - b);
+        if (!take(m, j)) return d;
+    } else if (j < n) {
+        using RT = RadixTraits<T>;
+        for (; j < n; ++j) {
+            const bool lt = descending ? RT::encode(p[j - 1]) < RT::encode(p[j]) : RT::encode(p[j]) < RT::encode(p[j - 1]);
+            if (lt && !take(1, j)) return d;
+        }
+    }
+    return d;
+}
+
 } // namespace isa_avx512
 } // namespace detail
 } // namespace fyx
@@ -1424,12 +1546,38 @@ namespace detail {
 /// Bitwise all-equal (AVX-512 single stream; memcmp elsewhere).
 template <class T>
 inline bool range_bitwise_all_equal(const T* p, std::size_t n) {
+    // Ends first (two scalar loads): random input leaves before any vector
+    // setup, which measured ~30 ns of the small-n probe budget.
+    if (n >= 2 && std::memcmp(static_cast<const void*>(p), static_cast<const void*>(p + n - 1), sizeof(T)) != 0)
+        return false;
 #if FYX_HAS_AVX512_CODE
     if constexpr (radix_supported_v<T> && (sizeof(T) == 4 || sizeof(T) == 8)) {
         if (use_avx512()) return isa_avx512::vall_equal(p, n);
     }
 #endif
     return n < 2 || std::memcmp(static_cast<const void*>(p), static_cast<const void*>(p + 1), (n - 1) * sizeof(T)) == 0;
+}
+
+/// Descent positions (see isa_avx512::vdescent_positions); scalar elsewhere.
+template <class T>
+inline std::size_t descent_positions(const T* p, std::size_t from, std::size_t n, bool descending,
+                                     std::uint32_t* pos, std::size_t maxd) {
+#if FYX_HAS_AVX512_CODE
+    if constexpr (radix_supported_v<T> && (sizeof(T) == 4 || sizeof(T) == 8)) {
+        if (use_avx512() && n <= 0xFFFFFFFFull) return isa_avx512::vdescent_positions(p, from, n, descending, pos, maxd);
+    }
+#endif
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    std::size_t d = 0;
+    for (std::size_t j = from < 1 ? 1 : from; j < n; ++j) {
+        if (static_cast<Key>(RT::encode(p[j]) ^ flip) < static_cast<Key>(RT::encode(p[j - 1]) ^ flip)) {
+            if (d == maxd) return maxd + 1;
+            pos[d++] = static_cast<std::uint32_t>(j);
+        }
+    }
+    return d;
 }
 
 /// Few-distinct-keys sort (<= 32 distinct, bitwise): a 64-key sample must
@@ -1564,6 +1712,14 @@ inline void vqsort_serial(T* p, std::size_t n) {
     else isa_avx512::vqsort_rec<T>(p, n, vqsort_budget(n));
 }
 
+/// Clean-screening vector quicksort: false (range permuted, unsorted) when
+/// the range holds a NaN or -0.
+template <class T>
+inline bool vqsort_serial_checked(T* p, std::size_t n) {
+    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; return false; }
+    else return isa_avx512::vqsort_rec_checked<T>(p, n, vqsort_budget(n));
+}
+
 template <class T>
 inline void vqsort_serial_budget(T* p, std::size_t n, int budget) {
     if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; (void)budget; }
@@ -1609,6 +1765,7 @@ inline constexpr std::size_t vqsort_leaf() {
 #else  // no AVX-512 kernel compiled in
 
 template <class T> inline unsigned vqsort_small_prescan(const T*, std::size_t) { return 4u; }
+template <class T> inline bool   vqsort_serial_checked(T*, std::size_t) { return false; }
 template <class T> inline bool   vqsort_range_clean(const T*, std::size_t) { return false; }
 inline int                       vqsort_budget(std::size_t) { return 0; }
 template <class T> inline void   vqsort_serial(T*, std::size_t) {}
