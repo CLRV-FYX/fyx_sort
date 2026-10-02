@@ -272,10 +272,7 @@ int main() {
         fyx::Options o;
         o.parallel = fyx::Tri::Off;
         fyx::sort(v.begin(), v.end(), o);
-        // On AVX-512 hosts the vector quicksort's equal-key handling beats
-        // the sparse counter on this shape (vq_beats_sparse_count).
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::LowCardinality ||
-              fd::test_last_dispatch() == fd::DispatchDecision::VectorQuick,
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::LowCardinality,
               "vector iterator float low-cardinality uses radix-key sparse count");
         CHECK(std::is_sorted(v.begin(), v.end()), "vector iterator float low-cardinality output");
     }
@@ -479,10 +476,7 @@ int main() {
             v[i] = static_cast<int>((i % 2 == 0) ? (i / 2) : (v.size() - i / 2));
         fd::test_reset_dispatch();
         fyx::sort(v);
-        // AVX-512 hosts send small numeric ranges to the vector quicksort,
-        // which beats the structural repair kernel on this shape.
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq ||
-              fd::test_last_dispatch() == fd::DispatchDecision::VectorQuick,
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
               "interleaved zigzag runs use linear two-run merge");
         CHECK(std::is_sorted(v.begin(), v.end()), "interleaved zigzag output");
     }
@@ -494,10 +488,7 @@ int main() {
             std::swap(v[i], v[i + 1]);
         fd::test_reset_dispatch();
         fyx::sort(v);
-        // AVX-512 hosts send small numeric ranges to the vector quicksort,
-        // which beats the structural repair kernel on this shape.
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq ||
-              fd::test_last_dispatch() == fd::DispatchDecision::VectorQuick,
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
               "adjacent-swap zigzag uses in-place pair repair");
         CHECK(std::is_sorted(v.begin(), v.end()), "adjacent-swap zigzag output");
     }
@@ -583,10 +574,7 @@ int main() {
         }
         fd::test_reset_dispatch();
         fyx::sort(v);
-        // AVX-512 hosts send small numeric ranges to the vector quicksort,
-        // which beats the structural repair kernel on this shape.
-        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq ||
-              fd::test_last_dispatch() == fd::DispatchDecision::VectorQuick,
+        CHECK(fd::test_last_dispatch() == fd::DispatchDecision::PartialPdq,
               "local sawtooth zigzag uses bounded insertion repair");
         CHECK(std::is_sorted(v.begin(), v.end()), "local sawtooth zigzag output");
     }

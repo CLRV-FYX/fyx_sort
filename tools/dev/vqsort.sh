@@ -27,25 +27,12 @@ clone() {                              # clone <url> <dir> [branch]
     if [ -n "${3:-}" ]; then git clone --depth 1 --branch "$3" "$1" "$2"
     else                     git clone --depth 1 "$1" "$2"; fi
 }
-pin_commit() {                         # pin_commit <dir> <commit>
-    local dir="$1" commit="$2"
-    if ! git -C "$dir" cat-file -e "$commit^{commit}" 2>/dev/null; then
-        git -C "$dir" fetch --depth 1 origin "$commit"
-    fi
-    git -C "$dir" checkout --detach "$commit"
-}
 
 clone https://github.com/ips4o/ips4o.git                 third_party/ips4o
 clone https://github.com/orlp/pdqsort.git                third_party/pdqsort
 clone https://github.com/google/highway.git              third_party/highway 1.4.0
 clone https://github.com/intel/x86-simd-sort.git         third_party/x86-simd-sort
 clone https://github.com/uxlfoundation/oneTBB.git        third_party/oneTBB
-# Pin exact dependency revisions so the comparison baseline survives upstream changes.
-pin_commit third_party/ips4o         08a5b926ee65cef19139057c6bde02bb5542c1cb
-pin_commit third_party/pdqsort       b1ef26a55cdb60d236a5cb199c4234c704f46726
-pin_commit third_party/highway       2607d3b5b0113992fe84d3848859eae13b3b52c1
-pin_commit third_party/x86-simd-sort fa944efbea1a33426b3f8a9a21e23794ab8aa300
-pin_commit third_party/oneTBB        9f554635c39c3897fadc52d13f94c06db17517a5
 
 # --- google/highway (vqsort lives in the contrib library) -------------------
 if [ ! -f third_party/highway/build/libhwy_contrib.a ]; then

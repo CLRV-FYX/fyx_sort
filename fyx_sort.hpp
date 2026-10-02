@@ -456,14 +456,6 @@ inline constexpr std::size_t kNetworkMax = 64;
 /// does not pay: a range that fits in L2 is where the radix passes are cheap,
 /// and the quicksort still has to walk log(n/leaf) levels over it.
 inline constexpr std::size_t kVqsortMinN = 1u << 14;          // 16384
-// Memory-form vpcompress in the AVX-512 quicksort partition (1, default):
-// ~15% faster than register compress + masked store on Ice Lake-SP.  AMD
-// Zen 4 microcodes the memory form; build with 0 there (unmeasured here).
-#ifndef FYX_VQ_COMPRESS_TO_MEMORY
-#  define FYX_VQ_COMPRESS_TO_MEMORY 1
-#endif
-// Lower bound of the small-range AVX-512 vector quicksort fast path.
-inline constexpr std::size_t kSmallVqsortMinN = 2;
 
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;
@@ -1710,7 +1702,7 @@ namespace detail {
 #elif FYX_COMPILER_CLANG
 #  define FYX_ISA_BEGIN(isa)                                       \
       FYX_DIAG_PUSH_SIMD                                           \
-      _Pragma(FYX_STRINGIFY(clang attribute push (__attribute__((target(isa))), apply_to = function)))
+      _Pragma("clang attribute push (__attribute__((target(isa))), apply_to = function)")
 #  define FYX_ISA_END                                              \
       _Pragma("clang attribute pop")                               \
       FYX_DIAG_POP_SIMD
@@ -4005,13 +3997,6 @@ namespace isa_avx512 {
 // ---------------------------------------------------------------------------
 // Per-type policies.  Everything is expressed in the native type: no encode.
 // ---------------------------------------------------------------------------
-// FYX_VQ_COMPRESS_TO_MEMORY=0 selects register-form compress + masked store:
-// the memory form is microcoded on AMD Zen 4, but on Ice Lake-SP the register
-// form measured ~15% slower, so the memory form stays the default.
-FYX_FORCE_INLINE std::uint64_t bzhi_mask(unsigned c) {
-    return c >= 64 ? ~0ull : ((1ull << c) - 1ull);
-}
-
 template <class T>
 struct VOps;
 
@@ -4026,13 +4011,7 @@ struct VOps<std::int32_t> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi32(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi32(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi32(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
-#if FYX_VQ_COMPRESS_TO_MEMORY
-        _mm512_mask_compressstoreu_epi32(p, k, v);
-#else
-        _mm512_mask_storeu_epi32(p, static_cast<__mmask16>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_epi32(k, v));
-#endif
-    }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi32(p, k, v); }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epi32_mask(a, b, _MM_CMPINT_NLT); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epi32_mask(a, b, _MM_CMPINT_NLE); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epi32(a, b); }
@@ -4067,13 +4046,7 @@ struct VOps<std::uint32_t> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi32(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi32(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi32(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
-#if FYX_VQ_COMPRESS_TO_MEMORY
-        _mm512_mask_compressstoreu_epi32(p, k, v);
-#else
-        _mm512_mask_storeu_epi32(p, static_cast<__mmask16>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_epi32(k, v));
-#endif
-    }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi32(p, k, v); }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epu32_mask(a, b, _MM_CMPINT_NLT); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epu32_mask(a, b, _MM_CMPINT_NLE); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epu32(a, b); }
@@ -4101,13 +4074,7 @@ struct VOps<std::int64_t> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi64(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi64(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi64(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
-#if FYX_VQ_COMPRESS_TO_MEMORY
-        _mm512_mask_compressstoreu_epi64(p, k, v);
-#else
-        _mm512_mask_storeu_epi64(p, static_cast<__mmask8>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_epi64(k, v));
-#endif
-    }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi64(p, k, v); }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_NLT); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_NLE); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epi64(a, b); }
@@ -4142,13 +4109,7 @@ struct VOps<std::uint64_t> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_epi64(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_epi64(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_epi64(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
-#if FYX_VQ_COMPRESS_TO_MEMORY
-        _mm512_mask_compressstoreu_epi64(p, k, v);
-#else
-        _mm512_mask_storeu_epi64(p, static_cast<__mmask8>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_epi64(k, v));
-#endif
-    }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_epi64(p, k, v); }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_epu64_mask(a, b, _MM_CMPINT_NLT); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_epu64_mask(a, b, _MM_CMPINT_NLE); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_epu64(a, b); }
@@ -4176,13 +4137,7 @@ struct VOps<float> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_ps(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_ps(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_ps(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
-#if FYX_VQ_COMPRESS_TO_MEMORY
-        _mm512_mask_compressstoreu_ps(p, k, v);
-#else
-        _mm512_mask_storeu_ps(p, static_cast<__mmask16>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_ps(k, v));
-#endif
-    }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_ps(p, k, v); }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_ps_mask(a, b, _CMP_GE_OQ); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_ps_mask(a, b, _CMP_GT_OQ); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_ps(a, b); }
@@ -4217,13 +4172,7 @@ struct VOps<double> {
     FYX_FORCE_INLINE static reg  maskz_loadu(mask k, const T* p) { return _mm512_maskz_loadu_pd(k, p); }
     FYX_FORCE_INLINE static reg  mask_loadu(reg s, mask k, const T* p) { return _mm512_mask_loadu_pd(s, k, p); }
     FYX_FORCE_INLINE static void mask_storeu(T* p, mask k, reg v) { _mm512_mask_storeu_pd(p, k, v); }
-    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) {
-#if FYX_VQ_COMPRESS_TO_MEMORY
-        _mm512_mask_compressstoreu_pd(p, k, v);
-#else
-        _mm512_mask_storeu_pd(p, static_cast<__mmask8>(bzhi_mask(popcount64(static_cast<std::uint64_t>(k)))), _mm512_maskz_compress_pd(k, v));
-#endif
-    }
+    FYX_FORCE_INLINE static void compressstore(T* p, mask k, reg v) { _mm512_mask_compressstoreu_pd(p, k, v); }
     FYX_FORCE_INLINE static mask ge(reg a, reg b) { return _mm512_cmp_pd_mask(a, b, _CMP_GE_OQ); }
     FYX_FORCE_INLINE static mask gt(reg a, reg b) { return _mm512_cmp_pd_mask(a, b, _CMP_GT_OQ); }
     FYX_FORCE_INLINE static reg  min(reg a, reg b) { return _mm512_min_pd(a, b); }
@@ -6774,9 +6723,6 @@ inline bool try_displacement_patch_merge_adaptive(T* p, std::size_t n, Comp comp
 //      * numeric keys, default "<" comparator, n  > 64  -> LSD radix (stable)
 //      * numeric keys, default ">" comparator           -> radix + reverse
 //      * everything else (custom comparator / non-numeric)-> pdqsort
-//      * numeric, AVX-512, n < kVqsortMinN              -> order scan + vector quicksort
-//      * stable_sort of integers, "<" or ">"            -> unstable engine (equal ints
-//                                                          are indistinguishable)
 //      * stable_sort of numeric ascending               -> radix (stable)
 //      * stable_sort otherwise                          -> bottom-up merge sort
 //
@@ -6921,19 +6867,6 @@ inline bool try_monotonic_sort(It first, It last, Comp comp, bool allow_reverse)
     return true;
 }
 
-// Stable sorting may reverse only a *strictly* descending range: if equivalent
-// adjacent elements exist, reversing them would violate stability. Kept out of
-// line so the common already-sorted monotonic exit remains compact.
-template <class It, class Comp>
-FYX_NOINLINE inline bool try_stable_reverse_sort(It first, It last, Comp comp) {
-    const std::size_t n = static_cast<std::size_t>(last - first);
-    if (n < 2) return false;
-    for (std::size_t i = 1; i < n; ++i)
-        if (!comp(first[i], first[i - 1])) return false;
-    std::reverse(first, last);
-    return true;
-}
-
 template <class T>
 inline bool try_radix_monotonic_sort(T* p, std::size_t n,
                                      bool descending, bool allow_reverse) {
@@ -6944,30 +6877,6 @@ inline bool try_radix_monotonic_sort(T* p, std::size_t n,
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
         if (n < 2) return true;
-
-        // Branch-free blocked pre-check for the common "already in target
-        // order" case.  Each block reduces a violation flag without an early
-        // exit, so compilers vectorise it and sorted input is verified at
-        // close to memory bandwidth; the first violating block falls through
-        // to the exact scalar classifier below (which also handles reverse
-        // and one-break rotations).  Random input fails in the first block.
-        {
-            constexpr std::size_t kBlock = 256;
-            bool in_order = true;
-            for (std::size_t b = 1; b < n && in_order; b += kBlock) {
-                const std::size_t e = std::min(n, b + kBlock);
-                unsigned bad = 0;
-                if (descending) {
-                    for (std::size_t j = b; j < e; ++j)
-                        bad |= static_cast<unsigned>(RT::encode(p[j - 1]) < RT::encode(p[j]));
-                } else {
-                    for (std::size_t j = b; j < e; ++j)
-                        bad |= static_cast<unsigned>(RT::encode(p[j]) < RT::encode(p[j - 1]));
-                }
-                in_order = bad == 0;
-            }
-            if (in_order) return true;
-        }
 
         Key prev = RT::encode(p[0]);
         for (std::size_t i = 1; i < n; ++i) {
@@ -7037,97 +6946,6 @@ enum class FastOrderKind : unsigned char {
     AllEqual
 };
 
-// Exact order classification over radix keys with branch-free 256-element
-// blocks: both direction flags are reduced per block (vectorisable), and the
-// scan stops at the first block where both directions have been violated.
-// Sorted input therefore runs at close to memory bandwidth instead of paying
-// a data-dependent branch per element; random input stops after one block.
-template <class T>
-inline FastOrderKind blocked_radix_order_kind(const T* p, std::size_t n, bool descending) {
-    using RT = RadixTraits<T>;
-    if (n < 2) return FastOrderKind::AllEqual;
-    constexpr std::size_t kBlock = 256;
-    unsigned up = 0, down = 0;   // saw k[j] > k[j-1] / k[j] < k[j-1]
-    for (std::size_t b = 1; b < n && !(up && down); b += kBlock) {
-        const std::size_t e = std::min(n, b + kBlock);
-        unsigned bu = 0, bd = 0;
-        for (std::size_t j = b; j < e; ++j) {
-            const auto k0 = RT::encode(p[j - 1]);
-            const auto k1 = RT::encode(p[j]);
-            bu |= static_cast<unsigned>(k0 < k1);
-            bd |= static_cast<unsigned>(k1 < k0);
-        }
-        up |= bu;
-        down |= bd;
-    }
-    if (!up && !down) return FastOrderKind::AllEqual;
-    if (up && down) return FastOrderKind::None;
-    const bool ascending_run = up != 0;
-    return ascending_run != descending ? FastOrderKind::Sorted : FastOrderKind::Reverse;
-}
-
-// Insertion repair over radix keys (the library's total order, so NaN / -0
-// are placed exactly as the radix paths place them) with a hard budget on
-// element moves.  Near-sorted input -- a few local displacements -- finishes
-// in one predictable pass; anything else exhausts the budget early and
-// returns false, leaving a permutation of the input for the caller's sort.
-template <class T>
-inline bool budgeted_insertion_repair(T* p, std::size_t n, bool descending,
-                                      std::size_t budget) {
-    using RT = RadixTraits<T>;
-    constexpr std::size_t kSkip = 16;
-    std::size_t moves = 0;
-    std::size_t i = 1;
-    while (i < n) {
-        // Branch-free skip over ordered stretches, 16 neighbours at a time.
-        while (i + kSkip <= n) {
-            unsigned bad = 0;
-            for (std::size_t k = 0; k < kSkip; ++k) {
-                const auto a = RT::encode(p[i + k - 1]);
-                const auto b = RT::encode(p[i + k]);
-                bad |= static_cast<unsigned>(descending ? (a < b) : (b < a));
-            }
-            if (bad) break;
-            i += kSkip;
-        }
-        const std::size_t e = std::min(n, i + kSkip);
-        for (; i < e; ++i) {
-        const auto ki = RT::encode(p[i]);
-        const auto kp = RT::encode(p[i - 1]);
-        if (descending ? !(kp < ki) : !(ki < kp)) continue;
-        const T x = p[i];
-        std::size_t j = i;
-        do {
-            p[j] = p[j - 1];
-            --j;
-        } while (j > 0 && (descending ? (RT::encode(p[j - 1]) < ki) : (ki < RT::encode(p[j - 1]))));
-        p[j] = x;
-        moves += i - j;
-        if (moves > budget) return false;
-        }
-    }
-    return true;
-}
-
-// Inversions between neighbours in the first `limit` pairs, in target order.
-// A cheap (branch-free, one short block) presortedness hint: random input
-// shows about half of the pairs inverted, near-sorted input almost none.
-template <class T>
-inline std::size_t head_adjacent_inversions(const T* p, std::size_t n, bool descending,
-                                            std::size_t limit = 256) {
-    using RT = RadixTraits<T>;
-    const std::size_t m = std::min(n == 0 ? std::size_t(0) : n - 1, limit);
-    std::size_t c = 0;
-    if (descending) {
-        for (std::size_t i = 0; i < m; ++i)
-            c += static_cast<std::size_t>(RT::encode(p[i]) < RT::encode(p[i + 1]));
-    } else {
-        for (std::size_t i = 0; i < m; ++i)
-            c += static_cast<std::size_t>(RT::encode(p[i + 1]) < RT::encode(p[i]));
-    }
-    return c;
-}
-
 template <class T>
 FYX_FORCE_INLINE bool fast_string_equal_value(const T* p, std::size_t n) {
     (void)p; (void)n;
@@ -7177,11 +6995,7 @@ inline FastOrderKind detect_fast_order_kind(T* p, std::size_t n, Comp comp,
     }
     constexpr bool radix_order = radix_supported_v<T> && std::is_floating_point<T>::value &&
         (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
-    constexpr bool blocked_order = radix_supported_v<T> &&
-        (is_ascending_v<Comp, T> || is_descending_v<Comp, T>);
-    if constexpr (blocked_order) {
-        return blocked_radix_order_kind(p, n, is_descending_v<Comp, T>);
-    } else if constexpr (radix_order) {
+    if constexpr (radix_order) {
         using RT  = RadixTraits<T>;
         using Key = typename RT::Key;
         const bool descending = is_descending_v<Comp, T>;
@@ -8879,52 +8693,6 @@ inline bool try_integer_range_count_exact(T* p, std::size_t n, bool descending) 
 // money in fixed-point) gets the same dense O(n + range) counter as ints
 // instead of the hash-probed sparse one.
 
-// The vector quicksort's NaN / -0 screen is a property of the multiset, so it
-// survives every permutation the declining probes may leave behind.  One
-// top-level sort call screens a given (pointer, length) at most once: the
-// memo is cleared on entry to and exit from sort_pointer_core_impl (a full
-// extra read of a 200K double range is ~55us, and up to three gates asked).
-struct VqCleanMemo {
-    const void* p = nullptr;
-    std::size_t n = 0;
-    bool clean = false;
-};
-inline VqCleanMemo& vq_clean_memo() noexcept {
-    static thread_local VqCleanMemo m;
-    return m;
-}
-struct VqCleanMemoScope {
-    VqCleanMemoScope() noexcept { vq_clean_memo().p = nullptr; }
-    ~VqCleanMemoScope() { vq_clean_memo().p = nullptr; }
-    VqCleanMemoScope(const VqCleanMemoScope&) = delete;
-    VqCleanMemoScope& operator=(const VqCleanMemoScope&) = delete;
-};
-template <class T>
-inline bool vq_range_clean_memo(const T* p, std::size_t n) {
-    VqCleanMemo& m = vq_clean_memo();
-    if (m.p == static_cast<const void*>(p) && m.n == n) return m.clean;
-    const bool c = vqsort_range_clean(p, n);
-    m.p = p;
-    m.n = n;
-    m.clean = c;
-    return c;
-}
-
-// True when the AVX-512 vector quicksort will accept this range.  Its
-// equal-key handling beats the hash-probed sparse counters on every
-// few-distinct shape measured (Ice Lake-SP, 200K serial: int32 16 values
-// 133us vs 523us, 256 values 247us vs 517us; int64 16 values 298us vs
-// 363us), so sparse counting is skipped where the quicksort is available.
-// Dense O(n + range) counting is unaffected.
-template <class T>
-inline bool vq_beats_sparse_count(const T* p, std::size_t n) {
-    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; return false; }
-    else {
-        return vqsort_preferred<T>() && vqsort_usable<T>(n) && n >= kVqsortMinN &&
-               vq_range_clean_memo(p, n);
-    }
-}
-
 template <class T>
 inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending,
                                          const SampleWindow<T>* win = nullptr) {
@@ -8965,7 +8733,6 @@ inline bool try_integer_range_count_sort(T* p, std::size_t n, bool descending,
             const unsigned long long spread = sizeof(T) <= 4 ? 64ull : 256ull;
             if (srange >= 32768ull &&
                 srange > spread * static_cast<unsigned long long>(dhat)) {
-                if (vq_beats_sparse_count(p, n)) return false;
                 if (try_radix_key_sparse_count_sort(p, n, descending, win)) return true;
             }
         }
@@ -9273,72 +9040,73 @@ inline bool dynamic_parallel_allowed(std::size_t n, const Options& o) {
 // Bit-exact keys keep the floating total order (NaN/-0 gates preserved); the
 // scalar tail and the scalar fallback are the same comparison the assist path
 // equivalence-tests in test/t_counting.cpp.
-#if FYX_HAS_AVX512_CODE
-FYX_DIAG_PUSH_SIMD
-template <class T>
-FYX_TARGET_AVX512 inline bool radix_key_monotone_scan_avx512(
-        const T* p, std::size_t start, std::size_t hi,
-        typename RadixTraits<T>::Key prev_key,
-        const bool want_up, const bool descending) {
-    using RT = RadixTraits<T>;
-    using Key = typename RT::Key;
-    constexpr unsigned lanes = (sizeof(Key) == 8) ? 8u : 16u;
-    __m512i prev_vec = (sizeof(Key) == 8)
-        ? _mm512_set1_epi64(static_cast<long long>(prev_key))
-        : _mm512_set1_epi32(static_cast<int>(prev_key));
-    const __m512i vsign = (sizeof(Key) == 8)
-        ? _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ULL))
-        : _mm512_set1_epi32(static_cast<int>(0x80000000u));
-    std::size_t i = start;
-    for (; i + lanes <= hi; i += lanes) {
-        const __m512i k = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
-        __m512i e;
-        if constexpr (std::is_integral_v<T>) {
-            if constexpr (std::is_unsigned_v<T>) e = k;
-            else e = _mm512_xor_si512(k, vsign);
-        } else if constexpr (sizeof(Key) == 8) {
-            const __m512i t = _mm512_srai_epi64(k, 63);
-            e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
-        } else {
-            const __m512i t = _mm512_srai_epi32(k, 31);
-            e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
-        }
-        const __m512i shifted = (sizeof(Key) == 8)
-            ? _mm512_alignr_epi64(e, prev_vec, 7)
-            : _mm512_alignr_epi32(e, prev_vec, 15);
-        const bool viol = (want_up != descending)
-            ? ((sizeof(Key) == 8 ? _mm512_cmpgt_epu64_mask(shifted, e)
-                                 : _mm512_cmpgt_epu32_mask(shifted, e)) != 0)
-            : ((sizeof(Key) == 8 ? _mm512_cmplt_epu64_mask(shifted, e)
-                                 : _mm512_cmplt_epu32_mask(shifted, e)) != 0);
-        if (viol) return false;
-        prev_vec = e;
-    }
-    if (i > start) prev_key = RT::encode(p[i - 1]);
-    for (; i < hi; ++i) {
-        const Key cur = RT::encode(p[i]);
-        const bool bad = want_up ? (descending ? (prev_key < cur) : (cur < prev_key))
-                                 : (descending ? (cur < prev_key) : (prev_key < cur));
-        if (bad) return false;
-        prev_key = cur;
-    }
-    return true;
-}
-FYX_DIAG_POP_SIMD
-#endif
-
 template <class T>
 inline bool radix_key_monotone_scan(const T* p, std::size_t start, std::size_t hi,
                                     typename RadixTraits<T>::Key prev_key,
                                     const bool want_up, const bool descending) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
 #if FYX_HAS_AVX512_CODE
-    if (use_avx512())
-        return radix_key_monotone_scan_avx512(p, start, hi, prev_key, want_up, descending);
+    if (use_avx512()) {
+        constexpr unsigned lanes = (sizeof(Key) == 8) ? 8u : 16u;
+        __m512i prev_vec = (sizeof(Key) == 8)
+            ? _mm512_set1_epi64(static_cast<long long>(prev_key))
+            : _mm512_set1_epi32(static_cast<int>(prev_key));
+        const __m512i vsign = (sizeof(Key) == 8)
+            ? _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ULL))
+            : _mm512_set1_epi32(static_cast<int>(0x80000000u));
+        std::size_t i = start;
+        for (; i + lanes <= hi; i += lanes) {
+            const __m512i k = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
+            // Key transform must match RadixTraits<T>::encode bit for bit:
+            // unsigned integers are identity, signed integers flip the sign
+            // bit only (two's-complement order preserving), and IEEE floats
+            // need the sign-propagating flip that reverses negative magnitudes.
+            // (The float transform applied to signed integers INVERTS the
+            // order within negatives -- measured: monotone negative arrays
+            // were declined by the vector proof and fell to slower paths.)
+            __m512i e;
+            if constexpr (std::is_integral_v<T>) {
+                if constexpr (std::is_unsigned_v<T>) {
+                    e = k;
+                } else {
+                    e = _mm512_xor_si512(k, vsign);
+                }
+            } else {
+                if constexpr (sizeof(Key) == 8) {
+                    const __m512i t = _mm512_srai_epi64(k, 63);
+                    e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
+                } else {
+                    const __m512i t = _mm512_srai_epi32(k, 31);
+                    e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
+                }
+            }
+            const __m512i shifted = (sizeof(Key) == 8)
+                ? _mm512_alignr_epi64(e, prev_vec, 7)
+                : _mm512_alignr_epi32(e, prev_vec, 15);
+            // bad lane: the neighbour pair violates the target order
+            const bool viol = (want_up != descending)
+                ? ((sizeof(Key) == 8 ? _mm512_cmpgt_epu64_mask(shifted, e)
+                                     : _mm512_cmpgt_epu32_mask(shifted, e)) != 0)
+                : ((sizeof(Key) == 8 ? _mm512_cmplt_epu64_mask(shifted, e)
+                                     : _mm512_cmplt_epu32_mask(shifted, e)) != 0);
+            if (viol) return false;
+            prev_vec = e;
+        }
+        if (i > start) prev_key = RT::encode(p[i - 1]);
+        for (; i < hi; ++i) {
+            const Key cur = RT::encode(p[i]);
+            const bool bad = want_up ? (descending ? (prev_key < cur) : (cur < prev_key))
+                                     : (descending ? (cur < prev_key) : (prev_key < cur));
+            if (bad) return false;
+            prev_key = cur;
+        }
+        return true;
+    }
 #endif
-    using Key = typename RadixTraits<T>::Key;
     Key prev = prev_key;
     for (std::size_t i = start; i < hi; ++i) {
-        const Key cur = RadixTraits<T>::encode(p[i]);
+        const Key cur = RT::encode(p[i]);
         const bool bad = want_up ? (descending ? (prev < cur) : (cur < prev))
                                  : (descending ? (cur < prev) : (prev < cur));
         if (bad) return false;
@@ -9347,64 +9115,11 @@ inline bool radix_key_monotone_scan(const T* p, std::size_t start, std::size_t h
     return true;
 }
 
-// Vectorised all-equal sweep. The AVX-512 body is isolated in a target-specific
-// helper; its baseline wrapper dispatches only after the runtime feature check.
-#if FYX_HAS_AVX512_CODE
-FYX_DIAG_PUSH_SIMD
-template <class T>
-FYX_TARGET_AVX512 inline bool range_all_equal_first_avx512(
-        const T* p, std::size_t lo, std::size_t hi) {
-    constexpr bool use_key = radix_supported_v<T> && std::is_floating_point<T>::value;
-    using RT = RadixTraits<T>;
-    using Key = typename RT::Key;
-    typename std::conditional<use_key, Key, T>::type first;
-    if constexpr (use_key) first = RT::encode(p[0]);
-    else                   first = p[0];
-    constexpr std::size_t width = sizeof(first);
-    const __m512i vfirst = (width == 8)
-        ? _mm512_set1_epi64(static_cast<long long>(
-              static_cast<typename std::conditional<use_key, std::uint64_t, std::int64_t>::type>(first)))
-        : (width == 4)
-            ? _mm512_set1_epi32(static_cast<int>(
-                  static_cast<typename std::conditional<use_key, std::uint32_t, std::int32_t>::type>(first)))
-            : (width == 2)
-                ? _mm512_set1_epi16(static_cast<short>(static_cast<std::int16_t>(first)))
-                : _mm512_set1_epi8(static_cast<char>(static_cast<std::int8_t>(first)));
-    const __mmask64 full = (width == 8) ? __mmask64(0xFF)
-                         : (width == 4) ? __mmask64(0xFFFF)
-                         : (width == 2) ? __mmask64(0xFFFFFFFFull)
-                                        : ~__mmask64(0);
-    std::size_t i = lo;
-    for (; i + width * 8 <= hi; i += width * 8) {
-        const __m512i k = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
-        __m512i e = k;
-        if constexpr (use_key) {
-            if constexpr (sizeof(Key) == 8) {
-                const __m512i t = _mm512_srai_epi64(k, 63);
-                e = _mm512_xor_si512(k, _mm512_or_si512(t, _mm512_set1_epi64(
-                    static_cast<long long>(0x8000000000000000ULL))));
-            } else {
-                const __m512i t = _mm512_srai_epi32(k, 31);
-                e = _mm512_xor_si512(k, _mm512_or_si512(t, _mm512_set1_epi32(
-                    static_cast<int>(0x80000000u))));
-            }
-        }
-        const __mmask64 m = (width == 8) ? _mm512_cmpeq_epi64_mask(e, vfirst)
-                          : (width == 4) ? static_cast<__mmask64>(_mm512_cmpeq_epi32_mask(e, vfirst))
-                          : (width == 2) ? static_cast<__mmask64>(_mm512_cmpeq_epi16_mask(e, vfirst))
-                                         : static_cast<__mmask64>(_mm512_cmpeq_epi8_mask(e, vfirst));
-        if (m != full) return false;
-    }
-    for (; i < hi; ++i) {
-        if constexpr (use_key) {
-            if (RT::encode(p[i]) != static_cast<Key>(first)) return false;
-        } else if (p[i] != first) return false;
-    }
-    return true;
-}
-FYX_DIAG_POP_SIMD
-#endif
-
+// Vectorised all-equal sweep: elements [lo, hi) all order-equal to p[0].
+// Radix floats compare encoded keys (so -0/+0 count as different, matching
+// the detector's verdict); integers compare raw.  Returns false when the
+// caller should run the full per-chunk classification instead -- including
+// every non-arithmetic type, which the classify path already serves.
 template <class T>
 inline bool range_all_equal_first_vec(const T* p, std::size_t lo, std::size_t hi) {
     if (lo >= hi) return true;
@@ -9413,7 +9128,58 @@ inline bool range_all_equal_first_vec(const T* p, std::size_t lo, std::size_t hi
         return false;
     } else {
 #if FYX_HAS_AVX512_CODE
-        if (use_avx512()) return range_all_equal_first_avx512(p, lo, hi);
+        if (use_avx512()) {
+            constexpr bool use_key = radix_supported_v<T> && std::is_floating_point<T>::value;
+            using RT  = RadixTraits<T>;
+            using Key = typename RT::Key;
+            typename std::conditional<use_key, Key, T>::type first;
+            if constexpr (use_key) first = RT::encode(p[0]);
+            else                   first = p[0];
+            constexpr std::size_t width = sizeof(first);
+            const __m512i vfirst = (width == 8)
+                ? _mm512_set1_epi64(static_cast<long long>(
+                      static_cast<typename std::conditional<use_key, std::uint64_t, std::int64_t>::type>(first)))
+                : (width == 4)
+                    ? _mm512_set1_epi32(static_cast<int>(
+                          static_cast<typename std::conditional<use_key, std::uint32_t, std::int32_t>::type>(first)))
+                    : (width == 2)
+                        ? _mm512_set1_epi16(static_cast<short>(static_cast<std::int16_t>(first)))
+                        : _mm512_set1_epi8(static_cast<char>(static_cast<std::int8_t>(first)));
+            // full mask has one bit per lane: 8 lanes of 8 bytes, 16 of 4, ...
+            const __mmask64 full = (width == 8) ? __mmask64(0xFF)
+                                 : (width == 4) ? __mmask64(0xFFFF)
+                                 : (width == 2) ? __mmask64(0xFFFFFFFFull)
+                                                : ~__mmask64(0);
+            std::size_t i = lo;
+            for (; i + (width * 8) <= hi; i += width * 8) {
+                const __m512i k = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
+                __m512i e = k;
+                if constexpr (use_key) {
+                    if constexpr (sizeof(Key) == 8) {
+                        const __m512i t = _mm512_srai_epi64(k, 63);
+                        e = _mm512_xor_si512(k, _mm512_or_si512(t, _mm512_set1_epi64(
+                            static_cast<long long>(0x8000000000000000ULL))));
+                    } else {
+                        const __m512i t = _mm512_srai_epi32(k, 31);
+                        e = _mm512_xor_si512(k, _mm512_or_si512(t, _mm512_set1_epi32(
+                            static_cast<int>(0x80000000u))));
+                    }
+                }
+                const __mmask64 m = (width == 8) ? _mm512_cmpeq_epi64_mask(e, vfirst)
+                                  : (width == 4) ? static_cast<__mmask64>(_mm512_cmpeq_epi32_mask(e, vfirst))
+                                  : (width == 2) ? static_cast<__mmask64>(_mm512_cmpeq_epi16_mask(e, vfirst))
+                                                 : static_cast<__mmask64>(_mm512_cmpeq_epi8_mask(e, vfirst));
+                if (m != full) return false;
+            }
+            for (; i < hi; ++i) {
+                if constexpr (use_key) {
+                    if (RT::encode(p[i]) != static_cast<Key>(first)) return false;
+                } else {
+                    if (p[i] != first) return false;
+                }
+            }
+            return true;
+        }
 #endif
         if constexpr (radix_supported_v<T> && std::is_floating_point<T>::value) {
             using RT = RadixTraits<T>;
@@ -10235,65 +10001,6 @@ inline constexpr unsigned kProofStructMaxBreaks = 7;   // up to 8 monotone runs
 /// so it does not run a second full scan on a parallel call.  The parallel
 /// counterpart (`try_proof_structured_sort_parallel`) owns the same shapes
 /// when the pool is live.
-#if FYX_HAS_AVX512_CODE
-FYX_DIAG_PUSH_SIMD
-template <class T>
-FYX_TARGET_AVX512 inline bool proof_structured_scan_avx512(
-        const T* p, std::size_t n, bool descending,
-        std::size_t* brk, unsigned& nb) {
-    using RT = RadixTraits<T>;
-    using Key = typename RT::Key;
-    constexpr unsigned lanes = (sizeof(Key) == 8) ? 8u : 16u;
-    const __m512i vsign = (sizeof(Key) == 8)
-        ? _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ULL))
-        : _mm512_set1_epi32(static_cast<int>(0x80000000u));
-    __m512i prev_vec = (sizeof(Key) == 8)
-        ? _mm512_set1_epi64(static_cast<long long>(RT::encode(p[0])))
-        : _mm512_set1_epi32(static_cast<int>(RT::encode(p[0])));
-    std::size_t i = 1;
-    for (; i + lanes <= n; i += lanes) {
-        const __m512i k = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
-        __m512i e;
-        if constexpr (std::is_integral_v<T>) {
-            if constexpr (std::is_unsigned_v<T>) e = k;
-            else e = _mm512_xor_si512(k, vsign);
-        } else if constexpr (sizeof(Key) == 8) {
-            const __m512i t = _mm512_srai_epi64(k, 63);
-            e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
-        } else {
-            const __m512i t = _mm512_srai_epi32(k, 31);
-            e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
-        }
-        const __m512i shifted = (sizeof(Key) == 8)
-            ? _mm512_alignr_epi64(e, prev_vec, 7)
-            : _mm512_alignr_epi32(e, prev_vec, 15);
-        unsigned bad = (sizeof(Key) == 8)
-            ? (descending ? _mm512_cmplt_epu64_mask(shifted, e)
-                          : _mm512_cmplt_epu64_mask(e, shifted))
-            : (descending ? _mm512_cmplt_epu32_mask(shifted, e)
-                          : _mm512_cmplt_epu32_mask(e, shifted));
-        while (bad) {
-            if (nb == kProofStructMaxBreaks) return false;
-            const unsigned bit = static_cast<unsigned>(__builtin_ctz(bad));
-            brk[nb++] = i + bit;
-            bad &= bad - 1;
-        }
-        prev_vec = e;
-    }
-    Key prev = RT::encode(p[i - 1]);
-    for (; i < n; ++i) {
-        const Key cur = RT::encode(p[i]);
-        if (descending ? (prev < cur) : (cur < prev)) {
-            if (nb == kProofStructMaxBreaks) return false;
-            brk[nb++] = i;
-        }
-        prev = cur;
-    }
-    return true;
-}
-FYX_DIAG_POP_SIMD
-#endif
-
 template <class T>
 inline bool try_proof_structured_sort(T* p, std::size_t n, bool descending,
                                       bool stable_wrap = false) {
@@ -10314,7 +10021,65 @@ inline bool try_proof_structured_sort(T* p, std::size_t n, bool descending,
         unsigned nb = 0;
 #if FYX_HAS_AVX512_CODE
         if (use_avx512()) {
-            if (!proof_structured_scan_avx512(p, n, descending, brk, nb)) return false;
+            constexpr unsigned lanes = (sizeof(Key) == 8) ? 8u : 16u;
+            const __m512i vsign = (sizeof(Key) == 8)
+                ? _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ULL))
+                : _mm512_set1_epi32(static_cast<int>(0x80000000u));
+            __m512i prev_vec = (sizeof(Key) == 8)
+                ? _mm512_set1_epi64(static_cast<long long>(RT::encode(p[0])))
+                : _mm512_set1_epi32(static_cast<int>(RT::encode(p[0])));
+            bool capped = false;
+            std::size_t i = 1;
+            for (; i + lanes <= n; i += lanes) {
+                const __m512i k = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
+                // same per-type transform as radix_key_monotone_scan (see there)
+                __m512i e;
+                if constexpr (std::is_integral_v<T>) {
+                    if constexpr (std::is_unsigned_v<T>) {
+                        e = k;
+                    } else {
+                        e = _mm512_xor_si512(k, vsign);
+                    }
+                } else {
+                    if constexpr (sizeof(Key) == 8) {
+                        const __m512i t = _mm512_srai_epi64(k, 63);
+                        e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
+                    } else {
+                        const __m512i t = _mm512_srai_epi32(k, 31);
+                        e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
+                    }
+                }
+                const __m512i shifted = (sizeof(Key) == 8)
+                    ? _mm512_alignr_epi64(e, prev_vec, 7)
+                    : _mm512_alignr_epi32(e, prev_vec, 15);
+                // violation: ascending -> cur < prev (e < shifted);
+                //            descending -> prev < cur (shifted < e)
+                unsigned bad = (sizeof(Key) == 8)
+                    ? (descending ? _mm512_cmplt_epu64_mask(shifted, e)
+                                  : _mm512_cmplt_epu64_mask(e, shifted))
+                    : (descending ? _mm512_cmplt_epu32_mask(shifted, e)
+                                  : _mm512_cmplt_epu32_mask(e, shifted));
+                while (bad) {
+                    if (nb == kProofStructMaxBreaks) { capped = true; break; }
+                    const unsigned bit = static_cast<unsigned>(__builtin_ctz(bad));
+                    brk[nb++] = i + bit;
+                    bad &= bad - 1;
+                }
+                if (capped) break;
+                prev_vec = e;
+            }
+            if (!capped) {
+                Key prev = RT::encode(p[(i > 1 ? i : 1) - 1]);
+                for (; i < n; ++i) {
+                    const Key cur = RT::encode(p[i]);
+                    if (descending ? (prev < cur) : (cur < prev)) {
+                        if (nb == kProofStructMaxBreaks) { capped = true; break; }
+                        brk[nb++] = i;
+                    }
+                    prev = cur;
+                }
+            }
+            if (capped) return false;
         } else
 #endif
         {
@@ -13195,7 +12960,6 @@ inline void parallel_fill_by_ranks(T* p, const std::size_t* offset, const T* ran
 }
 
 #if FYX_HAS_AVX512_CODE
-FYX_DIAG_PUSH_SIMD
 // AVX-512 count pass of the small-distinct kernel: one register holds eight
 // encoded 64-bit keys, and each of the <= 16 distinct keys costs one compare
 // plus one masked add per block -- no LUT reference, no dependent verify
@@ -13290,7 +13054,6 @@ inline bool simd_small_rank_count32(const T* p, std::size_t n,
         counts[r] += static_cast<std::uint32_t>(_mm512_reduce_add_epi32(acc[r]));
     return true;
 }
-FYX_DIAG_POP_SIMD
 #endif  // FYX_HAS_AVX512_CODE
 
 // ---------------------------------------------------------------------------
@@ -14789,73 +14552,67 @@ inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp) {
 
 /// Vectorised cousin of the monotone scan: returns the position of the first
 /// pair (i-1, i) that violates the target order, or `hi` when [start, hi) is
-/// monotone.  The AVX-512 implementation is isolated behind a baseline wrapper.
-#if FYX_HAS_AVX512_CODE
-FYX_DIAG_PUSH_SIMD
-template <class T>
-FYX_TARGET_AVX512 inline std::size_t radix_key_find_break_avx512(
-        const T* p, std::size_t start, std::size_t hi,
-        typename RadixTraits<T>::Key prev_key,
-        const bool want_up, const bool descending) {
-    using RT = RadixTraits<T>;
-    using Key = typename RT::Key;
-    constexpr unsigned lanes = (sizeof(Key) == 8) ? 8u : 16u;
-    __m512i prev_vec = (sizeof(Key) == 8)
-        ? _mm512_set1_epi64(static_cast<long long>(prev_key))
-        : _mm512_set1_epi32(static_cast<int>(prev_key));
-    const __m512i vsign = (sizeof(Key) == 8)
-        ? _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ULL))
-        : _mm512_set1_epi32(static_cast<int>(0x80000000u));
-    std::size_t i = start;
-    for (; i + lanes <= hi; i += lanes) {
-        const __m512i k = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
-        __m512i e;
-        if constexpr (std::is_integral_v<T>) {
-            if constexpr (std::is_unsigned_v<T>) e = k;
-            else e = _mm512_xor_si512(k, vsign);
-        } else if constexpr (sizeof(Key) == 8) {
-            const __m512i t = _mm512_srai_epi64(k, 63);
-            e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
-        } else {
-            const __m512i t = _mm512_srai_epi32(k, 31);
-            e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
-        }
-        const __m512i shifted = (sizeof(Key) == 8)
-            ? _mm512_alignr_epi64(e, prev_vec, 7)
-            : _mm512_alignr_epi32(e, prev_vec, 15);
-        const unsigned bad = (want_up != descending)
-            ? (sizeof(Key) == 8 ? _mm512_cmpgt_epu64_mask(shifted, e)
-                                : _mm512_cmpgt_epu32_mask(shifted, e))
-            : (sizeof(Key) == 8 ? _mm512_cmplt_epu64_mask(shifted, e)
-                                : _mm512_cmplt_epu32_mask(shifted, e));
-        if (bad) return i + static_cast<std::size_t>(__builtin_ctz(bad));
-        prev_vec = e;
-    }
-    if (i > start) prev_key = RT::encode(p[i - 1]);
-    for (; i < hi; ++i) {
-        const Key cur = RT::encode(p[i]);
-        const bool bad = want_up ? (descending ? (prev_key < cur) : (cur < prev_key))
-                                 : (descending ? (cur < prev_key) : (prev_key < cur));
-        if (bad) return i;
-        prev_key = cur;
-    }
-    return hi;
-}
-FYX_DIAG_POP_SIMD
-#endif
-
+/// monotone.  Same encode/alignr shape as radix_key_monotone_scan, so the two
+/// agree bit for bit on where the break is.
 template <class T>
 inline std::size_t radix_key_find_break(const T* p, std::size_t start, std::size_t hi,
                                         typename RadixTraits<T>::Key prev_key,
                                         const bool want_up, const bool descending) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
 #if FYX_HAS_AVX512_CODE
-    if (use_avx512())
-        return radix_key_find_break_avx512(p, start, hi, prev_key, want_up, descending);
+    if (use_avx512()) {
+        constexpr unsigned lanes = (sizeof(Key) == 8) ? 8u : 16u;
+        __m512i prev_vec = (sizeof(Key) == 8)
+            ? _mm512_set1_epi64(static_cast<long long>(prev_key))
+            : _mm512_set1_epi32(static_cast<int>(prev_key));
+        const __m512i vsign = (sizeof(Key) == 8)
+            ? _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ULL))
+            : _mm512_set1_epi32(static_cast<int>(0x80000000u));
+        std::size_t i = start;
+        for (; i + lanes <= hi; i += lanes) {
+            const __m512i k = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
+            __m512i e;
+            if constexpr (std::is_integral_v<T>) {
+                if constexpr (std::is_unsigned_v<T>) {
+                    e = k;
+                } else {
+                    e = _mm512_xor_si512(k, vsign);
+                }
+            } else {
+                if constexpr (sizeof(Key) == 8) {
+                    const __m512i t = _mm512_srai_epi64(k, 63);
+                    e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
+                } else {
+                    const __m512i t = _mm512_srai_epi32(k, 31);
+                    e = _mm512_xor_si512(k, _mm512_or_si512(t, vsign));
+                }
+            }
+            const __m512i shifted = (sizeof(Key) == 8)
+                ? _mm512_alignr_epi64(e, prev_vec, 7)
+                : _mm512_alignr_epi32(e, prev_vec, 15);
+            const unsigned bad = (want_up != descending)
+                ? ((sizeof(Key) == 8 ? _mm512_cmpgt_epu64_mask(shifted, e)
+                                     : _mm512_cmpgt_epu32_mask(shifted, e)))
+                : ((sizeof(Key) == 8 ? _mm512_cmplt_epu64_mask(shifted, e)
+                                     : _mm512_cmplt_epu32_mask(shifted, e)));
+            if (bad) return i + static_cast<std::size_t>(__builtin_ctz(bad));
+            prev_vec = e;
+        }
+        if (i > start) prev_key = RT::encode(p[i - 1]);
+        for (; i < hi; ++i) {
+            const Key cur = RT::encode(p[i]);
+            const bool bad = want_up ? (descending ? (prev_key < cur) : (cur < prev_key))
+                                     : (descending ? (cur < prev_key) : (prev_key < cur));
+            if (bad) return i;
+            prev_key = cur;
+        }
+        return hi;
+    }
 #endif
-    using Key = typename RadixTraits<T>::Key;
     Key prev = prev_key;
     for (std::size_t i = start; i < hi; ++i) {
-        const Key cur = RadixTraits<T>::encode(p[i]);
+        const Key cur = RT::encode(p[i]);
         const bool bad = want_up ? (descending ? (prev < cur) : (cur < prev))
                                  : (descending ? (cur < prev) : (prev < cur));
         if (bad) return i;
@@ -15071,7 +14828,7 @@ inline bool try_vector_quicksort(T* p, std::size_t n, bool descending, bool para
         if (!vqsort_preferred<T>()) return false;
         if (!vqsort_usable<T>(n)) return false;
         if (n < kVqsortMinN) return false;
-        if (!vq_range_clean_memo(p, n)) return false;
+        if (!vqsort_range_clean(p, n)) return false;
 #if FYX_ENABLE_PARALLEL
         if (parallel && parallel_available()) {
             unsigned depth = 0;
@@ -15174,10 +14931,8 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
     if (radix_order) {
         if (!high_entropy) {
             if (try_integer_range_count_sort(p, n, descending, prof ? &prof->sample_window : nullptr)) { record_dispatch(DispatchDecision::LowCardinality); return; }
-            if (!vq_beats_sparse_count(p, n)) {
-                if (try_radix_key_sparse_count_sort(p, n, descending, prof ? &prof->sample_window : nullptr)) { record_dispatch(DispatchDecision::LowCardinality); return; }
-                if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
-            }
+            if (try_radix_key_sparse_count_sort(p, n, descending, prof ? &prof->sample_window : nullptr)) { record_dispatch(DispatchDecision::LowCardinality); return; }
+            if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         }
         if (partial_pdq && try_partially_sorted_local_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
         if (try_radix_permutation_range_sort(p, n, descending)) { record_dispatch(DispatchDecision::Radix); return; }
@@ -15540,98 +15295,11 @@ inline void parallel_sort_ptr(T* p, std::size_t n, Comp comp, bool descending,
 }
 #endif
 
-// Scratch storage for stable_merge_sort. Unlike vector::emplace_back, direct
-// construction into reserved storage has no per-element capacity branch. The
-// exact live-object count makes the buffer safe for move-only/non-default types
-// and for comparator or move exceptions during a merge.
-template <class T>
-class StableSortBuffer {
-    using Alloc = std::allocator<T>;
-    using Traits = std::allocator_traits<Alloc>;
-    Alloc alloc_;
-    T* data_;
-    std::size_t size_;
-    std::size_t capacity_;
-
-public:
-    explicit StableSortBuffer(std::size_t capacity)
-        : data_(Traits::allocate(alloc_, capacity)), size_(0), capacity_(capacity) {}
-    StableSortBuffer(const StableSortBuffer&) = delete;
-    StableSortBuffer& operator=(const StableSortBuffer&) = delete;
-    ~StableSortBuffer() {
-        clear();
-        Traits::deallocate(alloc_, data_, capacity_);
-    }
-
-    T* data() noexcept { return data_; }
-    const T* data() const noexcept { return data_; }
-    T& operator[](std::size_t i) noexcept { return data_[i]; }
-    const T& operator[](std::size_t i) const noexcept { return data_[i]; }
-
-    void emplace_back(T&& value) {
-        // Callers keep each output pass within the buffer's allocated
-        // capacity; treating that bound as a loop invariant avoids a capacity
-        // branch on every element.
-        Traits::construct(alloc_, data_ + size_, std::move(value));
-        ++size_;
-    }
-
-    void clear() noexcept {
-        while (size_ != 0) Traits::destroy(alloc_, data_ + --size_);
-    }
-
-    void swap(StableSortBuffer& other) noexcept {
-        using std::swap;
-        swap(data_, other.data_);
-        swap(size_, other.size_);
-        swap(capacity_, other.capacity_);
-    }
-};
-
-// Stable top-down merge sort using one reusable buffer for the left run.
-// Balanced splitting guarantees that the smaller run fits in n/2 scratch
-// elements. Boundary checks skip merges when adjacent recursive ranges are
-// already ordered; this retains stability while avoiding a second full buffer.
-template <class It, class T, class Comp>
-inline void stable_merge_sort_recursive(It first, std::size_t n,
-                                        StableSortBuffer<T>& scratch, Comp& comp) {
-    constexpr std::size_t kInsertionCutoff = 32;
-    if (n < 2) return;
-    if (n <= kInsertionCutoff) {
-        for (std::size_t i = 1; i < n; ++i) {
-            T value = std::move(first[i]);
-            std::size_t hole = i;
-            while (hole != 0 && comp(value, first[hole - 1])) {
-                first[hole] = std::move(first[hole - 1]);
-                --hole;
-            }
-            first[hole] = std::move(value);
-        }
-        return;
-    }
-
-    const std::size_t left_size = n / 2;
-    const std::size_t middle = left_size;
-    stable_merge_sort_recursive(first, left_size, scratch, comp);
-    stable_merge_sort_recursive(first + middle, n - middle, scratch, comp);
-    if (!comp(first[middle], first[middle - 1])) return;
-
-    scratch.clear();
-    for (std::size_t i = 0; i < left_size; ++i)
-        scratch.emplace_back(std::move(first[i]));
-    std::size_t left = 0, right = middle, out = 0;
-    while (left < left_size && right < n) {
-        if (comp(first[right], scratch[left])) first[out++] = std::move(first[right++]);
-        else                                      first[out++] = std::move(scratch[left++]);
-    }
-    while (left < left_size) first[out++] = std::move(scratch[left++]);
-    scratch.clear();
-}
-
 // ---------------------------------------------------------------------------
-// Adaptive, allocation-assisted, STABLE merge sort. Works for any random-
-// access range (pointers, vector/deque iterators, ...). Used by stable_sort
-// whenever the radix path cannot be taken.
+// Bottom-up, allocation-assisted, STABLE merge sort.  Works for any
+// random-access range (pointers, vector/deque iterators, ...).  Used by
+// stable_sort whenever the radix path cannot be taken (non-numeric types,
+// descending order, mixed comparators).
 // ---------------------------------------------------------------------------
 template <class It, class Comp>
 inline void stable_merge_sort(It first, It last, Comp comp) {
@@ -15639,11 +15307,22 @@ inline void stable_merge_sort(It first, It last, Comp comp) {
     const std::size_t n = static_cast<std::size_t>(last - first);
     if (n < 2) return;
 
-    // A balanced recursion needs at most floor(n/2) live scratch objects.
-    // Raw allocator-backed storage supports move-only/non-default types and
-    // avoids reserving a second n-element buffer for alternating merge passes.
-    StableSortBuffer<T> scratch(n / 2);
-    stable_merge_sort_recursive(first, n, scratch, comp);
+    std::vector<T> a(n), b(n);
+    for (std::size_t i = 0; i < n; ++i) a[i] = std::move(first[i]);
+
+    bool from_a = true;
+    for (std::size_t width = 1; width < n; width *= 2) {
+        T* src = from_a ? a.data() : b.data();
+        T* dst = from_a ? b.data() : a.data();
+        for (std::size_t i = 0; i < n; i += 2 * width) {
+            const std::size_t m = std::min(i + width, n);
+            const std::size_t r = std::min(i + 2 * width, n);
+            merge_runs_moving(src + i, m - i, src + m, r - m, dst + i, comp);
+        }
+        from_a = !from_a;
+    }
+    T* final = from_a ? a.data() : b.data();
+    for (std::size_t i = 0; i < n; ++i) first[i] = std::move(final[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -15709,7 +15388,6 @@ template <class T, class Comp>
 inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options& o) {
     (void)o;   // consumed only by the parallel branches (compiled out otherwise)
     if (n == 0) return;
-    const detail::VqCleanMemoScope vq_clean_scope;
 #if FYX_ENABLE_GPU
     // If the caller asked for the GPU and a backend is present, try it; on any
     // failure (no device, compile error, ...) it returns false and we fall
@@ -15719,62 +15397,6 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
     const bool descending = detail::is_descending_v<Comp, T>;
     const bool ascending  = detail::is_ascending_v<Comp, T>;
     const bool radix_ok   = detail::radix_supported_v<T> && (ascending || descending);
-
-    // Small numeric ranges on AVX-512 hosts: the vectorised quicksort (with
-    // its bitonic-network leaves) is ~5-30x faster below kVqsortMinN than
-    // the probe stack + pdq/radix below, which only pays for itself on large
-    // inputs.  One branch-free order scan keeps sorted / reverse / all-equal
-    // inputs O(n); random input leaves that scan after a single block.
-    if constexpr (detail::vqsort_kernel_supported_v<T> && detail::vqsort_preferred<T>()) {
-        if (radix_ok && n >= detail::kSmallVqsortMinN && n < detail::kVqsortMinN &&
-            detail::use_avx512()) {
-            const detail::FastOrderKind k = detail::blocked_radix_order_kind(p, n, descending);
-            if (k == detail::FastOrderKind::AllEqual) {
-                detail::record_dispatch(detail::DispatchDecision::ProfileAllEqual);
-                return;
-            }
-            if (k == detail::FastOrderKind::Sorted) {
-                detail::record_dispatch(detail::DispatchDecision::ProfileSorted);
-                return;
-            }
-            if (k == detail::FastOrderKind::Reverse) {
-                std::reverse(p, p + n);
-                detail::record_dispatch(detail::DispatchDecision::ProfileReverse);
-                return;
-            }
-            // Few-run shapes (rotated, organ pipe, bitonic) are O(n) for the
-            // structural kernels; each rejects random data within a few
-            // hundred elements.
-            if (n > detail::kNetworkMax) {
-                if (detail::try_one_break_rotate(p, n, descending)) {
-                    detail::record_dispatch(detail::DispatchDecision::ProfileSorted);
-                    return;
-                }
-                if (detail::try_zigzag_organ_pipe_sort(p, n, comp) ||
-                    detail::try_numeric_half_organ_fill(p, n, comp) ||
-                    detail::try_bitonic_runs_sort(p, n, comp)) {
-                    detail::record_dispatch(detail::DispatchDecision::PartialPdq);
-                    return;
-                }
-                // Near-sorted (a few local displacements): the head block has
-                // almost no inverted neighbours.  Bounded insertion rehearses
-                // and declines within its budget otherwise.
-                const std::size_t head = std::min<std::size_t>(n - 1, 256);
-                if (detail::head_adjacent_inversions(p, n, descending, head) * 32 <= head &&
-                    detail::budgeted_insertion_repair(p, n, descending, n / 4 + 64)) {
-                    detail::record_dispatch(detail::DispatchDecision::PartialPdq);
-                    return;
-                }
-            }
-            // NaN / unclean ranges take the general path below.
-            if (detail::vq_range_clean_memo(p, n)) {
-                detail::vqsort_serial(p, n);
-                if (descending) std::reverse(p, p + n);
-                detail::record_dispatch(detail::DispatchDecision::VectorQuick);
-                return;
-            }
-        }
-    }
 
 #if FYX_ENABLE_FAST_PATHS
     if (n > detail::kNetworkMax && detail::try_parallel_all_equal_exit(p, n, comp)) return;
@@ -16408,23 +16030,10 @@ inline void stable_sort_dispatch(T* p, std::size_t n, Comp comp) {
     if (n < 2) return;
     const bool ascending  = detail::is_ascending_v<Comp, T>;
     const bool descending = detail::is_descending_v<Comp, T>;
-    // Integers ordered by the standard "<" / ">" comparators: elements that
-    // compare equal are bit-identical, so stability is unobservable and the
-    // (faster, adaptive) unstable engine produces the exact same output.
-    // Kept serial: stable_sort has no Options and never spawned threads.
-    if constexpr (std::is_integral<T>::value) {
-        if (ascending || descending) {
-            Options o;
-            o.parallel = Tri::Off;
-            sort_pointer_core(p, n, comp, o);
-            return;
-        }
-    }
     if (detail::radix_supported_v<T> && (ascending || descending)) {
         if (detail::try_radix_monotonic_sort(p, n, descending, false)) return;
     } else {
         if (detail::try_monotonic_sort(p, p + n, comp, false)) return;
-        if (detail::try_stable_reverse_sort(p, p + n, comp)) return;
     }
     if (ascending || descending) {
         if (detail::try_integer_range_count_sort(p, n, descending)) return;
@@ -16464,7 +16073,6 @@ inline void stable_sort(It first, It last) {
     } else {
         if (last - first < 2) return;
         if (detail::try_monotonic_sort(first, last, fyx::less{}, false)) return;
-        if (detail::try_stable_reverse_sort(first, last, fyx::less{})) return;
         if (detail::try_low_cardinality_count_sort(first, last, fyx::less{})) return;
         detail::stable_merge_sort(first, last, fyx::less{});
     }
@@ -16479,7 +16087,6 @@ inline void stable_sort(It first, It last, Comp comp) {
     } else {
         if (last - first < 2) return;
         if (detail::try_monotonic_sort(first, last, comp, false)) return;
-        if (detail::try_stable_reverse_sort(first, last, comp)) return;
         if (detail::try_low_cardinality_count_sort(first, last, comp)) return;
         detail::stable_merge_sort(first, last, comp);
     }

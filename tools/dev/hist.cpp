@@ -42,10 +42,6 @@ template <class F> double bench(F f, int reps) {
 int main(int argc, char** argv) {
     std::size_t n = argc > 1 ? std::strtoull(argv[1], 0, 10) : 1000000;
     int bits = argc > 2 ? std::atoi(argv[2]) : 12;
-    if (n == 0 || bits != 12) {
-        std::fprintf(stderr, "usage: hist [n>0] [bits=12] (the compared kernels are fixed at 12 bits)\n");
-        return 2;
-    }
     const std::size_t B = std::size_t(1) << bits;
     const unsigned shift = 32 - unsigned(bits);
     std::mt19937_64 rng(5);

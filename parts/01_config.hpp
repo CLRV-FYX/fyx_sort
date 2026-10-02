@@ -456,14 +456,6 @@ inline constexpr std::size_t kNetworkMax = 64;
 /// does not pay: a range that fits in L2 is where the radix passes are cheap,
 /// and the quicksort still has to walk log(n/leaf) levels over it.
 inline constexpr std::size_t kVqsortMinN = 1u << 14;          // 16384
-// Memory-form vpcompress in the AVX-512 quicksort partition (1, default):
-// ~15% faster than register compress + masked store on Ice Lake-SP.  AMD
-// Zen 4 microcodes the memory form; build with 0 there (unmeasured here).
-#ifndef FYX_VQ_COMPRESS_TO_MEMORY
-#  define FYX_VQ_COMPRESS_TO_MEMORY 1
-#endif
-// Lower bound of the small-range AVX-512 vector quicksort fast path.
-inline constexpr std::size_t kSmallVqsortMinN = 2;
 
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;
