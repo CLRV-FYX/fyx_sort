@@ -579,6 +579,30 @@ static void run_new_small_paths(const char* tname) {
             ++cases;
         }
     }
+    // 6. moderate cardinality (hash counting): 33..2500 distinct keys incl.
+    //    NaN / -0 / +0 among them, skewed (zipf-like) and near the table cap.
+    for (std::size_t n : {std::size_t(4096), std::size_t(20000), std::size_t(70000), std::size_t(300000)}) {
+        for (int K : {33, 100, 256, 447, 1000, 1500, 2048, 2049, 2500}) {
+            for (int variant = 0; variant < 3; ++variant) {
+                std::vector<T> vals(K);
+                for (int j = 0; j < K; ++j) vals[j] = from_u64<T>(rng());
+                if (std::is_floating_point<T>::value) {
+                    vals[0] = -T(0); vals[1] = T(0); vals[2] = std::numeric_limits<T>::quiet_NaN();
+                }
+                std::vector<T> v(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    std::size_t r = rng() % K;
+                    if (variant == 1) r = std::min<std::size_t>(r, rng() % K);       // skew
+                    v[i] = vals[r];
+                }
+                if (variant == 2) {                                          // long tail
+                    for (std::size_t i = 0; i < n; i += 7) v[i] = from_u64<T>(rng());
+                }
+                check_both_dirs(v, tname, "hash-count", n, K * 10 + variant);
+                ++cases;
+            }
+        }
+    }
     std::printf("  %-8s new small-n paths ok (%d cases)\n", tname, cases);
 }
 

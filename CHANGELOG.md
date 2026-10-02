@@ -19,6 +19,12 @@ Date: 2026-09-16
   - 少值（≤32 distinct，AVX-512 计数+填充）、位级全等单流扫描、vq 首次分区融合 NaN/-0
     筛查（f64 random 200K 省去单独一遍扫描）、局部 descent 门控 insertion repair。
   - extract-merge 块跳过改为同宽求和（可向量化）+ 有序前缀一次搬移。
+- **中等基数哈希计数**（`try_hash_count_sort`，33–2048 个不同位模式）：256 点抽样有重复才尝试；
+  前缀（n/64，至少 512）后用 Chao1 估计总基数，长尾（zipf）提前放弃；其余一遍开放寻址计数，
+  按 radix 键排序不同值后成段回填（NaN/-0 按位计数，顺序与库一致）。64 位键 n≥4096、32 位
+  n≥65536 启用。ab_all 对 xss：f64 few256 20K/200K 1.63/1.75 倍，sqrt_unique 2.20/1.61 倍，
+  i32 sqrt_unique 200K 1.56 倍；f64 sqrt_unique 1M 2.1 vs 2.9 ms。放弃时开销：zipf f64 20K 约 1.3us、
+  200K 约 12us。
 - **可移植性修复**：通用 `-march`（运行时分派 AVX-512）构建下，返回 `__m512i` 的 lambda
   触发 `-Wpsabi`（`-Werror` 下编译失败），改为普通内联函数。
 - **测试**：`t_vsort` 新增 few-distinct（K=1..40、样本漏值、±0/NaN）、全等边界、带 NaN/-0

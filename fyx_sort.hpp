@@ -8286,6 +8286,100 @@ inline void merge_runs_galloping(const T* A, std::size_t na, const T* B, std::si
     if (j < nb) std::memcpy(static_cast<void*>(out + o), static_cast<const void*>(B + j), (nb - j) * sizeof(T));
 }
 
+// Moderate-cardinality sort (a few hundred to ~2000 distinct keys, beyond
+// the <= 32-key vector counter): one read-only pass counts bit patterns in
+// an open-addressing table, then the distinct keys are ordered by radix key
+// and written back as runs.  ~1.5 ns/key against ~3 ns/key for a vectorised
+// quicksort on 64-bit keys, and no NaN / -0 special cases (bit patterns are
+// counted, radix keys give the library's total order).  A 256-key strided
+// sample must show duplicates first; the pass itself declines -- range
+// untouched -- once the table holds more than kCap keys.
+template <class T>
+inline bool try_hash_count_sort(T* p, std::size_t n, bool descending) {
+    if constexpr (!radix_supported_v<T> || !(sizeof(T) == 4 || sizeof(T) == 8)) {
+        (void)p; (void)n; (void)descending;
+        return false;
+    } else {
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        using U   = typename std::conditional<sizeof(T) == 8, std::uint64_t, std::uint32_t>::type;
+        if (n < 4096 || n > 0xFFFFFFFFull) return false;
+        auto bits = [](const T& x) { U u; std::memcpy(&u, &x, sizeof(U)); return u; };
+        auto mix = [](U k, unsigned b) {
+            return static_cast<std::size_t>((static_cast<std::uint64_t>(k) * 0x9E3779B97F4A7C15ull) >> (64 - b));
+        };
+        {
+            // Sample gate: 256 strided keys, at most 240 distinct.
+            constexpr unsigned kSB = 10;
+            U sk[1u << kSB];
+            unsigned char used[1u << kSB] = {};
+            unsigned sd = 0;
+            for (std::size_t j = 0; j < 256; ++j) {
+                const U k = bits(p[(j * n) >> 8]);
+                std::size_t h = mix(k, kSB);
+                while (used[h] && sk[h] != k) h = (h + 1) & ((1u << kSB) - 1);
+                if (!used[h]) { used[h] = 1; sk[h] = k; ++sd; }
+            }
+            if (sd > 240) return false;
+        }
+        constexpr unsigned kBits = 13;
+        constexpr std::size_t kSlots = std::size_t(1) << kBits, kMask = kSlots - 1, kCap = 2048;
+        std::unique_ptr<U[]> keys(new U[kSlots]);
+        std::unique_ptr<std::uint32_t[]> cnt(new std::uint32_t[kSlots]());
+        std::size_t D = 0;
+        // A fixed key set stops adding keys early; a long-tailed one (zipf)
+        // keeps producing singletons.  After a prefix the Chao1 estimate
+        // D + f1^2 / (2 f2) of the total key count (f1 / f2: keys seen once /
+        // twice) must stay within the table, so a doomed pass stops early.
+        const std::size_t pre_end = std::min(n, std::max<std::size_t>(n / 64, 512));
+        std::size_t f1 = 0, f2 = 0;
+        std::size_t i = 0;
+        for (; i < pre_end; ++i) {
+            const U k = bits(p[i]);
+            std::size_t h = mix(k, kBits);
+            while (cnt[h] != 0 && keys[h] != k) h = (h + 1) & kMask;
+            const std::uint32_t c = cnt[h];
+            if (c == 0) {
+                if (++D > kCap) return false;
+                keys[h] = k;
+            }
+            f1 += static_cast<std::size_t>(c == 0) - static_cast<std::size_t>(c == 1);
+            f2 += static_cast<std::size_t>(c == 1) - static_cast<std::size_t>(c == 2);
+            cnt[h] = c + 1;
+        }
+        if (D + f1 * f1 / (2 * (f2 ? f2 : 1)) > kCap * 3 / 4) return false;
+        for (; i < n; ++i) {
+            const U k = bits(p[i]);
+            std::size_t h = mix(k, kBits);
+            while (cnt[h] != 0 && keys[h] != k) h = (h + 1) & kMask;
+            if (cnt[h] == 0) {
+                if (++D > kCap) return false;
+                keys[h] = k;
+            }
+            ++cnt[h];
+        }
+        struct E { Key ord; U k; std::uint32_t c; };
+        std::unique_ptr<E[]> e(new E[D]);
+        const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+        std::size_t m = 0;
+        for (std::size_t h = 0; h < kSlots; ++h) {
+            if (cnt[h] == 0) continue;
+            T x;
+            std::memcpy(&x, &keys[h], sizeof(U));
+            e[m++] = E{static_cast<Key>(RT::encode(x) ^ flip), keys[h], cnt[h]};
+        }
+        std::sort(e.get(), e.get() + m, [](const E& a, const E& b) { return a.ord < b.ord; });
+        T* q = p;
+        for (std::size_t j = 0; j < m; ++j) {
+            T x;
+            std::memcpy(&x, &e[j].k, sizeof(U));
+            std::fill(q, q + e[j].c, x);
+            q += e[j].c;
+        }
+        return true;
+    }
+}
+
 // A handful of monotone runs (organ pipe, block swaps, concatenations, a
 // rotation, mixed ascending / descending stretches): split into maximal runs
 // (descending ones reversed), then pairwise merges ping-ponging through one
@@ -17432,6 +17526,12 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                     detail::record_dispatch(detail::DispatchDecision::LowCardinality);
                     return;
                 }
+            }
+            // A few hundred to ~2000 distinct keys: hash counting.  32-bit
+            // keys only from 64K up (below that the vq is as fast; measured).
+            if ((sizeof(T) == 8 || n >= 65536) && detail::try_hash_count_sort(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::LowCardinality);
+                return;
             }
             // NaN / unclean ranges take the general path below.
             if (clean && (pre & 8u) == 0) {
