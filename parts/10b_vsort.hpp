@@ -896,7 +896,11 @@ inline std::size_t vpartition_lean(T* a, std::size_t n, T pivot, T& out_max) {
 /// Pivot: two vectors' worth of strided samples, sorted in registers.
 template <class T>
 inline T vpick_pivot(const T* a, std::size_t n) {
+#ifndef FYX_VQ_PIVOT_VECS
     constexpr int S = 2 * VOps<T>::V;
+#else
+    constexpr int S = FYX_VQ_PIVOT_VECS * VOps<T>::V;
+#endif
     T s[S];
     const std::size_t step = n / S;
     for (int i = 0; i < S; ++i) s[i] = a[static_cast<std::size_t>(i) * step + (step >> 1)];
@@ -1271,6 +1275,142 @@ inline void vmerge_runs_impl(const T* A, std::size_t na, const T* B, std::size_t
     for (int c = 0; c < C; ++c) vmerge_chain_finish(ch[c], flip, key);
 }
 
+
+// ---------------------------------------------------------------------------
+// Few distinct keys (<= 32): count each table entry with one compare + one
+// masked add per vector, then write the runs.  O(n K / V) and no data
+// movement besides the final fill.  Keys are matched bitwise (exact for
+// -0 / +0 and NaN payloads); the caller orders the table by radix key.
+// Returns false (range untouched) when some key is not in the table.
+// ---------------------------------------------------------------------------
+template <class T, int KB>
+inline bool vfew_count(const T* p, std::size_t n, const T* vals, unsigned K, std::uint64_t* cnt) {
+    constexpr bool k64 = sizeof(T) == 8;
+    constexpr std::size_t V = k64 ? 8 : 16;
+    using U = typename std::conditional<k64, std::uint64_t, std::uint32_t>::type;
+    U bits[KB];
+    for (int t = 0; t < KB; ++t) {
+        T x = vals[t < static_cast<int>(K) ? t : 0];
+        std::memcpy(&bits[t], &x, sizeof(U));
+    }
+    std::uint64_t total = 0;
+    std::size_t i = 0;
+    // lane counters are 32-bit: flush every 2^20 vectors at the latest
+    while (i + V <= n) {
+        const std::size_t stop = std::min(n - (n - i) % V, i + (std::size_t(1) << 20) * V);
+        __m512i acc[KB];
+        for (int t = 0; t < KB; ++t) acc[t] = _mm512_setzero_si512();
+        for (; i < stop; i += V) {
+            const __m512i v = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
+            FYX_VQ_UNROLL for (int t = 0; t < KB; ++t) {
+                if constexpr (k64) {
+                    const __mmask8 m = _mm512_cmpeq_epi64_mask(v, _mm512_set1_epi64(static_cast<long long>(bits[t])));
+                    acc[t] = _mm512_mask_sub_epi64(acc[t], m, acc[t], _mm512_set1_epi64(-1));
+                } else {
+                    const __mmask16 m = _mm512_cmpeq_epi32_mask(v, _mm512_set1_epi32(static_cast<int>(bits[t])));
+                    acc[t] = _mm512_mask_sub_epi32(acc[t], m, acc[t], _mm512_set1_epi32(-1));
+                }
+            }
+        }
+        for (int t = 0; t < static_cast<int>(K); ++t) {
+            std::uint64_t c;
+            if constexpr (k64) c = static_cast<std::uint64_t>(_mm512_reduce_add_epi64(acc[t]));
+            else c = static_cast<std::uint64_t>(static_cast<std::uint32_t>(_mm512_reduce_add_epi32(acc[t])));
+            cnt[t] += c;
+            total += c;
+        }
+    }
+    for (; i < n; ++i) {
+        U x;
+        std::memcpy(&x, p + i, sizeof(U));
+        unsigned t = 0;
+        while (t < K && bits[t] != x) ++t;
+        if (t == K) return false;
+        ++cnt[t];
+        ++total;
+    }
+    return total == n;
+}
+
+template <class T>
+inline void vfill(T* p, std::size_t n, T x) {
+    __m512i v;
+    if constexpr (sizeof(T) == 8) { std::uint64_t b; std::memcpy(&b, &x, 8); v = _mm512_set1_epi64(static_cast<long long>(b)); }
+    else { std::uint32_t b; std::memcpy(&b, &x, 4); v = _mm512_set1_epi32(static_cast<int>(b)); }
+    constexpr std::size_t V = 64 / sizeof(T);
+    std::size_t i = 0;
+    for (; i + V <= n; i += V) _mm512_storeu_si512(reinterpret_cast<void*>(p + i), v);
+    for (; i < n; ++i) p[i] = x;
+}
+
+// Distinct-key table from strided samples: returns K, or 0 when the first 64
+// samples already show more than `cap1` distinct keys or all samples more
+// than 32.  The table lives in vector registers (padded with entry 0).
+template <class T>
+inline unsigned vfew_sample(const T* p, std::size_t n, unsigned cap1, std::size_t extra, T* vals) {
+    constexpr bool k64 = sizeof(T) == 8;
+    constexpr int NV = k64 ? 4 : 2;            // 32 entries
+    using U = typename std::conditional<k64, std::uint64_t, std::uint32_t>::type;
+    alignas(64) U tb[32];
+    unsigned K = 0;
+    __m512i tv[NV];
+    auto bcast = [](U b) {
+        if constexpr (k64) return _mm512_set1_epi64(static_cast<long long>(b));
+        else return _mm512_set1_epi32(static_cast<int>(b));
+    };
+    auto probe = [&](std::size_t idx, unsigned cap) -> bool {
+        U b;
+        std::memcpy(&b, p + idx, sizeof(U));
+        if (K != 0) {
+            const __m512i x = bcast(b);
+            bool hit = false;
+            for (int v = 0; v < NV; ++v) {
+                if constexpr (k64) hit |= _mm512_cmpeq_epi64_mask(tv[v], x) != 0;
+                else hit |= _mm512_cmpeq_epi32_mask(tv[v], x) != 0;
+            }
+            if (hit) return true;
+        }
+        if (K == cap) return false;
+        if (K == 0) for (int t = 0; t < 32; ++t) tb[t] = b;
+        tb[K] = b;
+        vals[K++] = p[idx];
+        for (int v = 0; v < NV; ++v) tv[v] = _mm512_load_si512(reinterpret_cast<const void*>(tb + v * (64 / sizeof(U))));
+        return true;
+    };
+    for (std::size_t j = 0; j < 64; ++j)
+        if (!probe((j * n) >> 6, cap1)) return 0;
+    for (std::size_t j = 0; j < extra; ++j)
+        if (!probe(((j * n) / extra + n / (2 * extra)) % n, 32)) return 0;
+    return K;
+}
+
+// Bitwise all-equal test: one read stream against a broadcast of p[0]
+// (memcmp(p, p + 1) reads two misaligned streams).  Stops at the first
+// differing vector.
+template <class T>
+inline bool vall_equal(const T* p, std::size_t n) {
+    constexpr bool k64 = sizeof(T) == 8;
+    constexpr std::size_t V = 64 / sizeof(T);
+    if (n < V) {
+        for (std::size_t i = 1; i < n; ++i) if (std::memcmp(p + i, p, sizeof(T)) != 0) return false;
+        return true;
+    }
+    __m512i b;
+    if constexpr (k64) { std::uint64_t x; std::memcpy(&x, p, 8); b = _mm512_set1_epi64(static_cast<long long>(x)); }
+    else { std::uint32_t x; std::memcpy(&x, p, 4); b = _mm512_set1_epi32(static_cast<int>(x)); }
+    auto ne = [&](std::size_t i) -> unsigned {
+        const __m512i v = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
+        if constexpr (k64) return _mm512_cmpneq_epi64_mask(v, b); else return _mm512_cmpneq_epi32_mask(v, b);
+    };
+    if (ne(0)) return false;               // random input: one vector
+    std::size_t i = V;
+    for (; i + 4 * V <= n; i += 4 * V)
+        if ((ne(i) | ne(i + V) | ne(i + 2 * V) | ne(i + 3 * V)) != 0) return false;
+    for (; i + V <= n; i += V)
+        if (ne(i)) return false;
+    return i == n || ne(n - V) == 0;
+}
+
 } // namespace isa_avx512
 } // namespace detail
 } // namespace fyx
@@ -1280,6 +1420,65 @@ FYX_ISA_END
 
 namespace fyx {
 namespace detail {
+
+/// Bitwise all-equal (AVX-512 single stream; memcmp elsewhere).
+template <class T>
+inline bool range_bitwise_all_equal(const T* p, std::size_t n) {
+#if FYX_HAS_AVX512_CODE
+    if constexpr (radix_supported_v<T> && (sizeof(T) == 4 || sizeof(T) == 8)) {
+        if (use_avx512()) return isa_avx512::vall_equal(p, n);
+    }
+#endif
+    return n < 2 || std::memcmp(static_cast<const void*>(p), static_cast<const void*>(p + 1), (n - 1) * sizeof(T)) == 0;
+}
+
+/// Few-distinct-keys sort (<= 32 distinct, bitwise): a 64-key sample must
+/// show <= 16 distinct keys, 64 more samples refine the table, then one
+/// counting pass (declines, range untouched, if a key is missing) and a fill.
+template <class T>
+inline bool try_vfew_distinct_sort(T* p, std::size_t n, bool descending) {
+#if FYX_HAS_AVX512_CODE
+    if constexpr (radix_supported_v<T> && (sizeof(T) == 4 || sizeof(T) == 8)) {
+        if (!use_avx512() || n < 1024) return false;
+        T vals[32];
+        const unsigned K = isa_avx512::vfew_sample(p, n, 16, 64, vals);
+        if (K == 0) return false;
+        std::uint64_t cnt[32] = {};
+        bool ok;
+        switch ((K + 3) / 4) {             // table padded to a multiple of 4
+            case 1:  ok = isa_avx512::vfew_count<T, 4>(p, n, vals, K, cnt); break;
+            case 2:  ok = isa_avx512::vfew_count<T, 8>(p, n, vals, K, cnt); break;
+            case 3:  ok = isa_avx512::vfew_count<T, 12>(p, n, vals, K, cnt); break;
+            case 4:  ok = isa_avx512::vfew_count<T, 16>(p, n, vals, K, cnt); break;
+            case 5:  ok = isa_avx512::vfew_count<T, 20>(p, n, vals, K, cnt); break;
+            case 6:  ok = isa_avx512::vfew_count<T, 24>(p, n, vals, K, cnt); break;
+            case 7:  ok = isa_avx512::vfew_count<T, 28>(p, n, vals, K, cnt); break;
+            default: ok = isa_avx512::vfew_count<T, 32>(p, n, vals, K, cnt); break;
+        }
+        if (!ok) return false;
+        using RT  = RadixTraits<T>;
+        using Key = typename RT::Key;
+        const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+        unsigned ord[32];
+        for (unsigned t = 0; t < K; ++t) ord[t] = t;
+        std::sort(ord, ord + K, [&](unsigned a, unsigned b) {
+            return static_cast<Key>(RT::encode(vals[a]) ^ flip) < static_cast<Key>(RT::encode(vals[b]) ^ flip);
+        });
+        std::size_t o = 0;
+        for (unsigned t = 0; t < K; ++t) {
+            isa_avx512::vfill(p + o, static_cast<std::size_t>(cnt[ord[t]]), vals[ord[t]]);
+            o += static_cast<std::size_t>(cnt[ord[t]]);
+        }
+        return true;
+    } else {
+        (void)p; (void)n; (void)descending;
+        return false;
+    }
+#else
+    (void)p; (void)n; (void)descending;
+    return false;
+#endif
+}
 
 /// SIMD merge of two sorted runs (radix-key order, `descending` flips it)
 /// into out[0..na+nb).  Returns false when no vector kernel applies; the

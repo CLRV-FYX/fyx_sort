@@ -9300,7 +9300,7 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             // the radix-key scan decides.
             // Bitwise all-equal first: random input differs in the first
             // bytes, and an all-equal range costs one memcmp.
-            if (std::memcmp(p, p + 1, (n - 1) * sizeof(T)) == 0) {
+            if (detail::range_bitwise_all_equal(p, n)) {
                 detail::record_dispatch(detail::DispatchDecision::ProfileAllEqual);
                 return;
             }
@@ -9327,6 +9327,12 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             if (k == detail::FastOrderKind::Reverse) {
                 detail::reverse_range_adaptive(p, n);
                 detail::record_dispatch(detail::DispatchDecision::ProfileReverse);
+                return;
+            }
+            // At most 32 distinct keys: count + fill (a 64-key sample with
+            // more than 16 distinct keys declines at once).
+            if (detail::try_vfew_distinct_sort(p, n, descending)) {
+                detail::record_dispatch(detail::DispatchDecision::LowCardinality);
                 return;
             }
             // Few-run shapes (rotated, organ pipe, bitonic, permuted blocks)
