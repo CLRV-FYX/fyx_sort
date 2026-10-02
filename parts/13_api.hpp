@@ -281,10 +281,13 @@ template <class T>
 inline FastOrderKind blocked_radix_order_kind(const T* p, std::size_t n, bool descending) {
     using RT = RadixTraits<T>;
     if (n < 2) return FastOrderKind::AllEqual;
+    // The first block is short: random input shows both directions within
+    // a handful of pairs, and on small ranges a full 256-pair block would
+    // cost a sizeable fraction of the whole sort.
     constexpr std::size_t kBlock = 256;
     unsigned up = 0, down = 0;   // saw k[j] > k[j-1] / k[j] < k[j-1]
-    for (std::size_t b = 1; b < n && !(up && down); b += kBlock) {
-        const std::size_t e = std::min(n, b + kBlock);
+    for (std::size_t b = 1, blk = 16; b < n && !(up && down); b += blk, blk = kBlock) {
+        const std::size_t e = std::min(n, b + blk);
         unsigned bu = 0, bd = 0;
         for (std::size_t j = b; j < e; ++j) {
             const auto k0 = RT::encode(p[j - 1]);
@@ -344,23 +347,30 @@ inline bool budgeted_insertion_repair(T* p, std::size_t n, bool descending,
     return true;
 }
 
-// Inversions between neighbours in the first `limit` pairs, in target order.
-// A cheap (branch-free, one short block) presortedness hint: random input
-// shows about half of the pairs inverted, near-sorted input almost none.
+// Same hint as a predicate: true when the first `limit` neighbour pairs hold
+// at most `max_inv` inversions.  Counts in blocks of 32 pairs and stops as
+// soon as the allowance is exceeded, so random input -- half its pairs
+// inverted -- is rejected after the first block instead of after `limit`.
 template <class T>
-inline std::size_t head_adjacent_inversions(const T* p, std::size_t n, bool descending,
-                                            std::size_t limit = 256) {
+inline bool head_inversions_within(const T* p, std::size_t n, bool descending,
+                                   std::size_t limit, std::size_t max_inv) {
     using RT = RadixTraits<T>;
     const std::size_t m = std::min(n == 0 ? std::size_t(0) : n - 1, limit);
     std::size_t c = 0;
-    if (descending) {
-        for (std::size_t i = 0; i < m; ++i)
-            c += static_cast<std::size_t>(RT::encode(p[i]) < RT::encode(p[i + 1]));
-    } else {
-        for (std::size_t i = 0; i < m; ++i)
-            c += static_cast<std::size_t>(RT::encode(p[i + 1]) < RT::encode(p[i]));
+    for (std::size_t b = 0; b < m; b += 32) {
+        const std::size_t e = std::min(m, b + 32);
+        unsigned bc = 0;
+        if (descending) {
+            for (std::size_t i = b; i < e; ++i)
+                bc += static_cast<unsigned>(RT::encode(p[i]) < RT::encode(p[i + 1]));
+        } else {
+            for (std::size_t i = b; i < e; ++i)
+                bc += static_cast<unsigned>(RT::encode(p[i + 1]) < RT::encode(p[i]));
+        }
+        c += bc;
+        if (c > max_inv) return false;
     }
-    return c;
+    return true;
 }
 
 template <class T>
@@ -8980,7 +8990,9 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             // Few-run shapes (rotated, organ pipe, bitonic) are O(n) for the
             // structural kernels; each rejects random data within a few
             // hundred elements.
-            if (n > detail::kNetworkMax) {
+            // Up to one leaf the column network sorts any shape in a few
+            // hundred vector ops; the structural probes would cost as much.
+            if (n > detail::vqsort_leaf<T>()) {
                 if (detail::try_one_break_rotate(p, n, descending)) {
                     detail::record_dispatch(detail::DispatchDecision::ProfileSorted);
                     return;
@@ -8995,7 +9007,7 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                 // almost no inverted neighbours.  Bounded insertion rehearses
                 // and declines within its budget otherwise.
                 const std::size_t head = std::min<std::size_t>(n - 1, 256);
-                if (detail::head_adjacent_inversions(p, n, descending, head) * 32 <= head &&
+                if (detail::head_inversions_within(p, n, descending, head, head / 32) &&
                     detail::budgeted_insertion_repair(p, n, descending, n / 4 + 64)) {
                     detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                     return;

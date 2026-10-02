@@ -6,6 +6,18 @@ Date: 2026-09-16
 
 ### Added
 
+- **列式网络叶子**（`VColLeaf`，`parts/10b_vsort.hpp`；`FYX_VQ_COLUMN_LEAF=0` 可退回）：
+  向量快排叶子由逐行 Batcher 网络（每个寄存器内级 = permute+min+max+blend）改为
+  vqsort 式列布局：寄存器间最优网络（4/8/16 路 5/19/60 CE，16 路经 0-1 原则穷举
+  验证；32 路 Batcher 191 CE）只用 min/max 排列，再 log2(L) 级反转比较 + 半清洁器
+  合并，最后 permutex2var 转置。覆盖 4/8/16/32 寄存器（32 位 64–512 元，64 位
+  32–256 元）。叶子阈值 16→32 寄存器（`FYX_VQ_LEAF_VECS`）。叶子单测（ns/elem）：
+  i32 256 1.45→0.78，f64 128 2.54→1.00，i32 64 0.81→0.62。
+  单线程 vq kernel 对 x86-simd-sort（fa944ef，独立进程，取最小值）：i32 1000
+  1.55 vs 1.60，200K 2.94 vs 3.21；i64 3.80/5.97 vs 4.17/6.01；f64 2.72/4.79 vs
+  2.81/5.58；f32 1.35/2.71 vs 1.72/2.87（此前 8 格全败）。仅 Ice Lake-SP、GCC 12.2。
+- **小 n 前门开销削减**：`n ≤ 叶子` 时跳过结构探针；有序扫描首块 16 对；近有序
+  提示改为分块提前退出（`head_inversions_within`）。f64 n=300 前门开销约 400→100ns。
 - **小规模数值快路径**（AVX-512 主机，`n < kVqsortMinN`=16384，int32/uint32/
   int64/uint64/float/double，`<`/`>`）：一次分块无分支有序扫描（sorted /
   reverse / all-equal 直接 O(n) 退出）+ 旋转 / 风琴管 / 双调结构探针，其余直接

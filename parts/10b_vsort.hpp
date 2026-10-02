@@ -342,6 +342,260 @@ FYX_FORCE_INLINE void vnet_sort_v(T* keys, std::size_t n) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Column-network leaf (the layout vqsort uses): V registers x L lanes.
+//
+//   1. a size-optimal sorting network across the V registers sorts every
+//      lane ("column") with min/max only -- no shuffles at all;
+//   2. log2(L) merge levels join lane groups pairwise.  Each level is one
+//      reversed compare (two lane permutes per register pair), lane
+//      half-cleaners (one permute per register) and register half-cleaners
+//      (plain min/max);
+//   3. one in-register transpose restores memory order.
+//
+// For 16 x int32 (256 keys) that is ~1000 vector ops against ~1800 for the
+// row-wise Batcher network above, whose every intra-vector stage pays a
+// permute, a min, a max and a blend.
+// ---------------------------------------------------------------------------
+template <unsigned V> struct ColNet;
+template <> struct ColNet<4> {
+    static constexpr unsigned n = 5;
+    static constexpr unsigned char a[n] = {0, 2, 0, 1, 1};
+    static constexpr unsigned char b[n] = {1, 3, 2, 3, 2};
+};
+template <> struct ColNet<8> {
+    static constexpr unsigned n = 19;
+    static constexpr unsigned char a[n] = {0, 1, 4, 5, 0, 1, 2, 3, 0, 2, 4, 6, 2, 3, 1, 3, 1, 3, 5};
+    static constexpr unsigned char b[n] = {2, 3, 6, 7, 4, 5, 6, 7, 1, 3, 5, 7, 4, 5, 4, 6, 2, 4, 6};
+};
+template <> struct ColNet<16> {   // 60 comparators, depth 10
+    static constexpr unsigned n = 60;
+    static constexpr unsigned char a[n] = {
+        0, 1, 2, 3, 4, 5, 7, 9,   0, 1, 2, 3, 6, 8, 10, 11,   0, 2, 4, 6, 7, 10, 12, 14,
+        0, 1, 4, 5, 6, 8, 12, 13,  1, 3, 4, 5, 8, 9, 13,      1, 2, 5, 7, 9, 11,
+        2, 3, 9, 11,               3, 6, 7, 10,               3, 5, 7, 9, 11,   6, 8};
+    static constexpr unsigned char b[n] = {
+        13, 12, 15, 14, 8, 6, 11, 10,   5, 7, 9, 4, 13, 14, 15, 12,   1, 3, 5, 8, 9, 11, 13, 15,
+        2, 3, 10, 11, 7, 9, 14, 15,      2, 12, 6, 7, 10, 11, 14,      4, 6, 8, 10, 13, 14,
+        4, 6, 12, 13,                    5, 8, 9, 12,                  4, 6, 8, 10, 12,  7, 9};
+};
+
+template <> struct ColNet<32> {   // Batcher odd-even merge sort, 191 comparators
+    static constexpr unsigned n = 191;
+    static constexpr unsigned char a[n] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21, 24, 25, 28, 29, 1, 5, 9, 13, 17, 21, 25, 29, 0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27, 2, 3, 10, 11, 18, 19, 26, 27, 1, 3, 5, 9, 11, 13, 17, 19, 21, 25, 27, 29, 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 4, 5, 6, 7, 20, 21, 22, 23, 2, 3, 6, 7, 10, 11, 18, 19, 22, 23, 26, 27, 1, 3, 5, 7, 9, 11, 13, 17, 19, 21, 23, 25, 27, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 8, 9, 10, 11, 12, 13, 14, 15, 4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 2, 3, 6, 7, 10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29};
+    static constexpr unsigned char b[n] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 2, 3, 6, 7, 10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 30, 31, 2, 6, 10, 14, 18, 22, 26, 30, 4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31, 4, 5, 12, 13, 20, 21, 28, 29, 2, 4, 6, 10, 12, 14, 18, 20, 22, 26, 28, 30, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31, 8, 9, 10, 11, 24, 25, 26, 27, 4, 5, 8, 9, 12, 13, 20, 21, 24, 25, 28, 29, 2, 4, 6, 8, 10, 12, 14, 18, 20, 22, 24, 26, 28, 30, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21, 24, 25, 28, 29, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30};
+};
+
+template <class T>
+FYX_FORCE_INLINE typename VOps<T>::reg vp2v(typename VOps<T>::reg a, __m512i idx,
+                                            typename VOps<T>::reg b) {
+    if constexpr (std::is_same<T, float>::value)       return _mm512_permutex2var_ps(a, idx, b);
+    else if constexpr (std::is_same<T, double>::value) return _mm512_permutex2var_pd(a, idx, b);
+    else if constexpr (sizeof(T) == 4)                 return _mm512_permutex2var_epi32(a, idx, b);
+    else                                               return _mm512_permutex2var_epi64(a, idx, b);
+}
+
+/// Index vectors for one transpose round at block size B over L lanes.
+template <unsigned L, unsigned B, bool Hi>
+struct VTransIdx {
+    using I = typename std::conditional<L == 16, std::int32_t, std::int64_t>::type;
+    struct Tab { alignas(64) I v[L]; };
+    static constexpr Tab make() {
+        Tab t{};
+        for (unsigned l = 0; l < L; ++l) {
+            const bool up = (l & B) != 0;
+            t.v[l] = static_cast<I>(Hi ? (up ? L + l : l + B) : (up ? L + (l - B) : l));
+        }
+        return t;
+    }
+    static constexpr Tab tab = make();
+    FYX_FORCE_INLINE static __m512i load() {
+        return _mm512_load_si512(reinterpret_cast<const void*>(tab.v));
+    }
+};
+
+template <class T>
+struct VColLeaf {
+    using P   = VOps<T>;
+    using reg = typename P::reg;
+    using M   = typename P::mask;
+    static constexpr unsigned L = static_cast<unsigned>(P::V);
+
+    FYX_FORCE_INLINE static void ce(reg& x, reg& y) {
+        const reg mn = P::min(x, y);
+        y = P::max(x, y);
+        x = mn;
+    }
+    static constexpr std::uint64_t low_lanes(unsigned bit) {
+        std::uint64_t m = 0;
+        for (unsigned l = 0; l < L; ++l) if (((l >> bit) & 1u) == 0) m |= 1ull << l;
+        return m;
+    }
+    template <unsigned V, std::size_t... I>
+    FYX_FORCE_INLINE static void columns(reg* v, std::index_sequence<I...>) {
+        (ce(v[ColNet<V>::a[I]], v[ColNet<V>::b[I]]), ...);
+    }
+    template <unsigned V, unsigned K>
+    FYX_FORCE_INLINE static void reversed_compare(reg* v) {
+        constexpr unsigned Mx = (2u << K) - 1u;
+        const M low = static_cast<M>(low_lanes(K));
+        rc_each<V, Mx>(v, low, std::make_index_sequence<V / 2>{});
+    }
+    template <unsigned V, unsigned Mx, unsigned R>
+    FYX_FORCE_INLINE static void rc_one(reg* v, M low) {
+        const reg x = v[R];
+        const reg s = P::template permute_xor<Mx>(v[V - 1 - R]);
+        const reg mn = P::min(x, s);
+        const reg mx = P::max(x, s);
+        v[R]         = P::blend(low, mn, mx);
+        v[V - 1 - R] = P::template permute_xor<Mx>(P::blend(low, mx, mn));
+    }
+    template <unsigned V, unsigned Mx, std::size_t... R>
+    FYX_FORCE_INLINE static void rc_each(reg* v, M low, std::index_sequence<R...>) {
+        (rc_one<V, Mx, static_cast<unsigned>(R)>(v, low), ...);
+    }
+    template <unsigned V, unsigned Bit>
+    FYX_FORCE_INLINE static void lane_clean(reg* v) {
+        const M low = static_cast<M>(low_lanes(Bit));
+        lc_each<Bit>(v, low, std::make_index_sequence<V>{});
+    }
+    template <unsigned Bit, std::size_t... R>
+    FYX_FORCE_INLINE static void lc_each(reg* v, M low, std::index_sequence<R...>) {
+        ((v[R] = lc_one<Bit>(v[R], low)), ...);
+    }
+    template <unsigned Bit>
+    FYX_FORCE_INLINE static reg lc_one(reg x, M low) {
+        const reg q = P::template permute_xor<(1u << Bit)>(x);
+        return P::blend(low, P::min(x, q), P::max(x, q));
+    }
+    template <unsigned V, unsigned K, unsigned Bit>
+    FYX_FORCE_INLINE static void lane_cleans(reg* v) {
+        if constexpr (Bit < K) {
+            lane_cleans<V, K, Bit + 1>(v);       // larger bits first
+            lane_clean<V, Bit>(v);
+        }
+    }
+    template <unsigned V, unsigned J>
+    FYX_FORCE_INLINE static void reg_cleans(reg* v) {
+        if constexpr (J > 0) {
+            rcl_each<J>(v, std::make_index_sequence<V>{});
+            reg_cleans<V, J / 2>(v);
+        }
+    }
+    template <unsigned J, std::size_t... R>
+    FYX_FORCE_INLINE static void rcl_each(reg* v, std::index_sequence<R...>) {
+        ((((R & J) == 0) ? ce(v[R], v[R | J]) : void()), ...);
+    }
+    template <unsigned V, unsigned K>
+    FYX_FORCE_INLINE static void levels(reg* v) {
+        if constexpr ((1u << K) < L) {
+            reversed_compare<V, K>(v);
+            lane_cleans<V, K, 0>(v);
+            reg_cleans<V, V / 2>(v);
+            levels<V, K + 1>(v);
+        }
+    }
+    template <unsigned B, unsigned N = L>
+    FYX_FORCE_INLINE static void transpose_round(reg* v) {
+        if constexpr (B > 0) {
+            const __m512i lo = VTransIdx<L, B, false>::load();
+            const __m512i hi = VTransIdx<L, B, true>::load();
+            tr_each<B>(v, lo, hi, std::make_index_sequence<N>{});
+            transpose_round<B / 2, N>(v);
+        }
+    }
+
+    template <unsigned B, std::size_t... R>
+    FYX_FORCE_INLINE static void tr_each(reg* v, __m512i lo, __m512i hi, std::index_sequence<R...>) {
+        ((((R & B) == 0) ? tr_one<B, static_cast<unsigned>(R)>(v, lo, hi) : void()), ...);
+    }
+    template <unsigned B, unsigned R>
+    FYX_FORCE_INLINE static void tr_one(reg* v, __m512i lo, __m512i hi) {
+        {
+            const reg x = v[R], y = v[R + B];
+            v[R]     = vp2v<T>(x, lo, y);
+            v[R + B] = vp2v<T>(x, hi, y);
+        }
+    }
+
+    FYX_FORCE_INLINE static reg load_one(const T* keys, std::size_t n, std::size_t off) {
+        if (off + L <= n) return P::loadu(keys + off);
+        const reg s = P::set1(P::hi());
+        if (off < n) return P::mask_loadu(s, static_cast<M>((1ull << (n - off)) - 1ull), keys + off);
+        return s;
+    }
+    FYX_FORCE_INLINE static void store_one(T* keys, std::size_t n, std::size_t off, reg x) {
+        if (off + L <= n)  P::storeu(keys + off, x);
+        else if (off < n)  P::mask_storeu(keys + off, static_cast<M>((1ull << (n - off)) - 1ull), x);
+    }
+    template <std::size_t... I>
+    FYX_FORCE_INLINE static void load_all(reg* v, const T* keys, std::size_t n, std::index_sequence<I...>) {
+        ((v[I] = load_one(keys, n, I * L)), ...);
+    }
+    // Logical order is lane-major: key (lane l, register r) sits at l*V + r.
+    // After transposing each L x L register block c, its register l holds
+    // output vector l*C + c.
+    template <unsigned C, std::size_t... I>
+    FYX_FORCE_INLINE static void store_all(const reg* v, T* keys, std::size_t n, std::index_sequence<I...>) {
+        (store_one(keys, n, ((I % L) * C + I / L) * L, v[I]), ...);
+    }
+
+    // V == L/2: each register's halves are transposed as two independent
+    // V x V blocks, then registers (2i, 2i+1) are recombined into output
+    // vectors i and i + V/2.
+    template <unsigned V, std::size_t... I>
+    FYX_FORCE_INLINE static void store_half(const reg* v, T* keys, std::size_t n, std::index_sequence<I...>) {
+        (store_one(keys, n, ((I % 2 == 0) ? I / 2 : I / 2 + V / 2) * L, v[I]), ...);
+    }
+    template <unsigned R, std::size_t... I>
+    FYX_FORCE_INLINE static void pair_each(reg* v, __m512i lo, __m512i hi, std::index_sequence<I...>) {
+        ((tr_pair(v[2 * I], v[2 * I + 1], lo, hi)), ...);
+    }
+    FYX_FORCE_INLINE static void tr_pair(reg& a, reg& b, __m512i lo, __m512i hi) {
+        const reg x = a, y = b;
+        a = vp2v<T>(x, lo, y);
+        b = vp2v<T>(x, hi, y);
+    }
+
+    /// Sorts n <= V*L keys; V is a multiple of L, or exactly L/2.
+    template <unsigned V>
+    FYX_FORCE_INLINE static void sort(T* keys, std::size_t n) {
+        static_assert(V % L == 0 || 2 * V == L || (4 * V == L && V == 4), "unsupported column leaf shape");
+        reg v[V];
+        load_all(v, keys, n, std::make_index_sequence<V>{});
+        columns<V>(v, std::make_index_sequence<ColNet<V>::n>{});
+        levels<V, 0>(v);
+        if constexpr (4 * V == L) {
+            // 4 registers x 16 lanes: transpose the 4x4 blocks inside each
+            // lane quarter, then the 4x4 matrix of quarters.
+            transpose_round<V / 2, V>(v);
+            tr_each<2>(v, VTransIdx<L, 8, false>::load(), VTransIdx<L, 8, true>::load(),
+                       std::make_index_sequence<V>{});
+            tr_each<1>(v, VTransIdx<L, 4, false>::load(), VTransIdx<L, 4, true>::load(),
+                       std::make_index_sequence<V>{});
+            store_all<1>(v, keys, n, std::make_index_sequence<V>{});
+            return;
+        }
+        if constexpr (2 * V == L) {
+            transpose_round<V / 2, V>(v);
+            pair_each<0>(v, VTransIdx<L, L / 2, false>::load(), VTransIdx<L, L / 2, true>::load(),
+                         std::make_index_sequence<V / 2>{});
+            store_half<V>(v, keys, n, std::make_index_sequence<V>{});
+            return;
+        }
+        transpose_round<L / 2>(v);
+        if constexpr (V > L)     transpose_round<L / 2>(v + L);
+        if constexpr (V > 2 * L) transpose_round<L / 2>(v + 2 * L);
+        if constexpr (V > 3 * L) transpose_round<L / 2>(v + 3 * L);
+        static_assert(V <= 4 * L, "column leaf supports at most four blocks");
+        store_all<V / L>(v, keys, n, std::make_index_sequence<V>{});
+    }
+};
+
+#ifndef FYX_VQ_COLUMN_LEAF
+#  define FYX_VQ_COLUMN_LEAF 1
+#endif
+
 /// Leaf sort for n <= 16 vectors' worth of elements.
 template <class T>
 inline void vnet_sort(T* a, std::size_t n) {
@@ -351,9 +605,24 @@ inline void vnet_sort(T* a, std::size_t n) {
     switch (vecs) {
         case 1:  vnet_sort_v<T, 1>(a, n);  return;
         case 2:  vnet_sort_v<T, 2>(a, n);  return;
-        case 4:  vnet_sort_v<T, 4>(a, n);  return;
-        case 8:  vnet_sort_v<T, 8>(a, n);  return;
-        case 16: vnet_sort_v<T, 16>(a, n); return;
+        case 4:
+#if FYX_VQ_COLUMN_LEAF
+            VColLeaf<T>::template sort<4>(a, n); return;
+#endif
+            vnet_sort_v<T, 4>(a, n);  return;
+        case 8:
+#if FYX_VQ_COLUMN_LEAF
+            VColLeaf<T>::template sort<8>(a, n); return;
+#endif
+            vnet_sort_v<T, 8>(a, n);  return;
+        case 16:
+#if FYX_VQ_COLUMN_LEAF
+            VColLeaf<T>::template sort<16>(a, n); return;
+#endif
+            vnet_sort_v<T, 16>(a, n); return;
+#if FYX_VQ_COLUMN_LEAF
+        case 32: VColLeaf<T>::template sort<32>(a, n); return;
+#endif
         default: break;
     }
     pdqsort(a, a + n, std::less<T>());
@@ -634,11 +903,16 @@ inline T vpick_pivot(const T* a, std::size_t n) {
     return s[S / 2];
 }
 
-/// Leaf size: 16 vectors, i.e. 256 elements for 4-byte types and 128 for
-/// 8-byte ones (measured best of 64/128/256 for both widths).
+/// Leaf size: 32 vectors, i.e. 512 elements for 4-byte types and 256 for
+/// 8-byte ones.  With the column-network leaf (VColLeaf) a 32-register leaf
+/// beat 16 registers for every width in the standalone kernel benchmark; the
+/// row-wise Batcher leaf it replaced was best at 16.
+#ifndef FYX_VQ_LEAF_VECS
+#  define FYX_VQ_LEAF_VECS 32
+#endif
 template <class T>
 struct VqLeaf {
-    static constexpr std::size_t value = 16u * static_cast<std::size_t>(VOps<T>::V);
+    static constexpr std::size_t value = static_cast<std::size_t>(FYX_VQ_LEAF_VECS) * static_cast<std::size_t>(VOps<T>::V);
 };
 
 template <class T>
