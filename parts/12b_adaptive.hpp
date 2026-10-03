@@ -95,23 +95,40 @@ inline std::size_t scan_monotone_runs(const T* p, std::size_t n, Comp comp,
     int dir = 0;                       // +1 ascending, -1 descending, 0 unknown
     for (std::size_t i = 1; i < n; ++i) {
         const bool down = comp(p[i], p[i - 1]);
-        if (!down) {
-            if (!comp(p[i - 1], p[i])) continue;   // equivalent: no information
+        // Inside an ascending run "not down" never changes anything, so the
+        // equivalence test (a second comparison) is only paid elsewhere.
+        if (dir == 1) {
+            if (!down) continue;
+        } else {
+            if (!down && !comp(p[i - 1], p[i])) continue;   // equivalent: no information
+            const int d = down ? -1 : 1;
+            if (dir == 0 || d == dir) { dir = d; continue; }
         }
-        const int d = down ? -1 : 1;
-        if (dir == 0) { dir = d; continue; }
-        if (d != dir) {
-            // The extremum at i-1 keeps the closed run; the new run starts at i.
-            if (count < cap) { out[count].begin = start; out[count].end = i; }
-            ++count;
-            if (count > cap) return cap + 1;
-            start = i;
-            dir = d;
-        }
+        // The extremum at i-1 keeps the closed run; the new run starts at i.
+        if (count < cap) { out[count].begin = start; out[count].end = i; }
+        ++count;
+        if (count > cap) return cap + 1;
+        start = i;
+        dir = -dir;
     }
     if (count < cap) { out[count].begin = start; out[count].end = n; }
     ++count;
     return count > cap ? cap + 1 : count;
+}
+
+/// Moves `k` elements from `src` to `dst`; the ranges may overlap, and `dst`
+/// may sit before or after `src`.  Trivially copyable payloads go through
+/// memmove, which the vectoriser cannot beat; the rest are walked away from
+/// the end that would otherwise be overwritten first.
+template <class T>
+inline void move_range_bulk(T* dst, T* src, std::size_t k) noexcept {
+    if constexpr (std::is_trivially_copyable<T>::value) {
+        if (k) std::memmove(static_cast<void*>(dst), static_cast<const void*>(src), k * sizeof(T));
+    } else if (dst < src) {
+        for (std::size_t i = 0; i < k; ++i) dst[i] = std::move(src[i]);
+    } else if (dst > src) {
+        for (std::size_t i = k; i-- > 0;) dst[i] = std::move(src[i]);
+    }
 }
 
 /// Merges the adjacent runs [l, m) and [m, r) in place, using `buf` as scratch
@@ -121,9 +138,31 @@ inline std::size_t scan_monotone_runs(const T* p, std::size_t n, Comp comp,
 template <class T, class Comp>
 inline void merge_adjacent_runs(T* p, std::size_t l, std::size_t m, std::size_t r,
                                 T* buf, Comp comp) {
+    if (m == l || m == r) return;
+    // Already in order across the seam: nothing to do.
+    if (!comp(p[m], p[m - 1])) return;
+    // Trim what is already in place: the left prefix not above p[m] and the
+    // right suffix not below p[m-1] (TimSort's pre-merge gallop).
+    l = static_cast<std::size_t>(std::upper_bound(p + l, p + m, p[m], comp) - p);
+    r = static_cast<std::size_t>(std::lower_bound(p + m, p + r, p[m - 1], comp) - p);
     const std::size_t a = m - l;
     const std::size_t b = r - m;
     if (a == 0 || b == 0) return;
+    // Every remaining right element below every remaining left one: a
+    // rotation (moved blocks, rotated ranges), no comparisons needed.
+    if (comp(p[r - 1], p[l])) {
+        if (buf == nullptr) { std::rotate(p + l, p + m, p + r); return; }
+        if (a <= b) {
+            for (std::size_t i = 0; i < a; ++i) buf[i] = std::move(p[l + i]);
+            move_range_bulk(p + l, p + m, b);
+            for (std::size_t i = 0; i < a; ++i) p[l + b + i] = std::move(buf[i]);
+        } else {
+            for (std::size_t i = 0; i < b; ++i) buf[i] = std::move(p[m + i]);
+            move_range_bulk(p + l + b, p + l, a);
+            for (std::size_t i = 0; i < b; ++i) p[l + i] = std::move(buf[i]);
+        }
+        return;
+    }
     if (buf == nullptr) {
         std::inplace_merge(p + l, p + m, p + r, comp);
         return;
@@ -152,6 +191,217 @@ inline void merge_adjacent_runs(T* p, std::size_t l, std::size_t m, std::size_t 
             ++w;
         }
         while (ia != a) { p[w] = std::move(buf[ia]); ++ia; ++w; }
+    }
+}
+
+/// Sparse-displacement repair.
+///
+/// "Sorted except for a few elements that sit far from home" (a handful of
+/// long-distance swaps, say) splits into a few dozen long runs, and merging
+/// those drags every displaced element across the array one merge level at a
+/// time.  Instead, one read-only scan keeps a sorted subsequence and extracts
+/// whatever breaks it: when x is below the last kept element, x is extracted,
+/// unless x still fits after the kept element before that -- then the last
+/// kept element was the intruder and is extracted instead.  The extracted
+/// elements are sorted and streamed back in a single left-to-right rewrite in
+/// which records only move where the number of insertions so far differs from
+/// the number of extractions; for a swap the two cancel, so the stretch
+/// between the two swapped positions is never touched.  Returns false without
+/// modifying anything when more than `cap` elements would be extracted.
+template <class T, class Before>
+inline bool try_sparse_extract_repair(T* p, std::size_t n, Before before, std::size_t cap,
+                                      const MonotoneRun* runs = nullptr, std::size_t nruns = 0) {
+    if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)before; (void)cap; (void)runs; (void)nruns;
+        return false;
+    } else {
+        std::vector<std::size_t> ext;
+        ext.reserve(cap < 256 ? cap + 1 : 256);
+        std::size_t ring[8];
+        unsigned head = 0, depth = 0;      // depth = valid entries in the ring
+        // With the (ascending) run list the scan skips run interiors: once
+        // i and i-1 are both kept, everything up to the end of i's run is
+        // non-decreasing from i and would be kept without a decision.
+        std::size_t ri = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (depth != 0 && before(p[i], p[ring[head]])) {
+                if (depth >= 2 && !before(p[i], p[ring[(head - 1u) & 7u]])) {
+                    ext.push_back(ring[head]);
+                    ring[head] = i;            // pop the intruder, keep i
+                } else {
+                    ext.push_back(i);
+                }
+                if (ext.size() > cap) return false;
+                continue;
+            }
+            const bool chained = depth != 0 && ring[head] + 1 == i;
+            head = (head + 1u) & 7u;
+            ring[head] = i;
+            if (depth < 8) ++depth;
+            if (runs && chained) {
+                while (ri < nruns && runs[ri].end <= i) ++ri;
+                if (ri < nruns && runs[ri].begin < i && runs[ri].end > i + 2) {
+                    const std::size_t last = runs[ri].end - 1;
+                    head = (head + 1u) & 7u; ring[head] = last - 1;
+                    head = (head + 1u) & 7u; ring[head] = last;
+                    depth = depth + 2 < 8 ? depth + 2 : 8;
+                    i = last;
+                }
+            }
+        }
+        if (ext.empty()) return true;
+        std::sort(ext.begin(), ext.end());
+
+        std::vector<T> buf;
+        buf.reserve(ext.size());
+        for (std::size_t idx : ext) buf.push_back(std::move(p[idx]));
+        pdqsort(buf.data(), buf.data() + buf.size(), before);
+
+        // Streaming rewrite.  Kept elements are read in order from the queue
+        // (elements saved because a write overtook them) and then from p[r..];
+        // positions listed in `ext` are holes that may be overwritten freely.
+        std::vector<T> q;                  // FIFO: q[qh..)
+        std::size_t qh = 0;
+        std::size_t r = 0, e = 0, w = 0, b = 0;
+        const std::size_t ne = ext.size(), nb = buf.size();
+        auto skip_holes = [&]() { while (e < ne && ext[e] == r) { ++r; ++e; } };
+        auto save_upto = [&](std::size_t pos) {
+            while (r <= pos && r < n) {
+                if (e < ne && ext[e] == r) { ++e; ++r; continue; }
+                q.push_back(std::move(p[r]));
+                ++r;
+            }
+        };
+        while (w < n) {
+            const bool q_empty = qh == q.size();
+            if (q_empty) skip_holes();
+            const bool have_kept = !q_empty || r < n;
+            if (q_empty && w == r && r < n) {
+                // In-place stretch: kept elements before the next hole and
+                // before the next extracted element stay where they are.
+                const std::size_t lim = e < ne ? ext[e] : n;
+                std::size_t t;
+                if (b < nb) {
+                    const T& v = buf[b];
+                    std::size_t lo = r, step = 1;
+                    while (lo + step < lim && !before(v, p[lo + step])) { lo += step; step <<= 1; }
+                    std::size_t hi = lo + step < lim ? lo + step : lim;
+                    if (before(v, p[lo])) hi = lo;
+                    else {
+                        ++lo;
+                        while (lo < hi) {
+                            const std::size_t mid = lo + (hi - lo) / 2;
+                            if (before(v, p[mid])) hi = mid; else lo = mid + 1;
+                        }
+                    }
+                    t = hi;
+                } else {
+                    t = lim;
+                }
+                if (t != r) {
+                    w = r = t;
+                    if (w >= n) break;
+                    continue;
+                }
+            }
+            const bool take_buf = b < nb &&
+                (!have_kept || before(buf[b], q_empty ? p[r] : q[qh]));
+            if (take_buf) {
+                save_upto(w);
+                p[w++] = std::move(buf[b++]);
+            } else if (!q_empty) {
+                T v = std::move(q[qh++]);
+                save_upto(w);
+                p[w++] = std::move(v);
+                if (qh == q.size()) { q.clear(); qh = 0; }
+            } else {
+                // q empty, kept element is p[r] with r > w: slide it down.
+                p[w++] = std::move(p[r++]);
+            }
+        }
+        return true;
+    }
+}
+
+/// Ascending runs whose merge interleaves them only a few times are a block
+/// permutation: the merged output is a short sequence of chunks, each a
+/// contiguous slice of one run.  A k-way gallop lists those chunks (one
+/// binary search each) and gives up past `max_chunks`; then the sort is a
+/// rearrangement of whole slices, and slices that already sit at their final
+/// offset -- the middle of a block swap, the untouched ends -- never move.
+template <class T, class Before>
+inline bool try_disjoint_run_permutation(T* p, std::size_t n, const std::vector<std::size_t>& bounds,
+                                         std::size_t count, Before before) {
+    if constexpr (!std::is_move_constructible<T>::value || !std::is_move_assignable<T>::value) {
+        (void)p; (void)n; (void)bounds; (void)count; (void)before;
+        return false;
+    } else {
+        constexpr std::size_t max_chunks = 256;
+        std::vector<std::size_t> head(bounds.begin(), bounds.begin() + static_cast<std::ptrdiff_t>(count));
+        std::vector<std::size_t> csrc, clen;
+        csrc.reserve(64); clen.reserve(64);
+        for (;;) {
+            std::size_t best = count, second = count;
+            for (std::size_t r = 0; r < count; ++r) {
+                if (head[r] == bounds[r + 1]) continue;
+                if (best == count || before(p[head[r]], p[head[best]])) { second = best; best = r; }
+                else if (second == count || before(p[head[r]], p[head[second]])) second = r;
+            }
+            if (best == count) break;
+            std::size_t e = bounds[best + 1];
+            if (second != count)
+                e = static_cast<std::size_t>(std::upper_bound(p + head[best], p + e, p[head[second]], before) - p);
+            if (!csrc.empty() && csrc.back() + clen.back() == head[best]) {
+                clen.back() += e - head[best];      // same run continues
+            } else {
+                if (csrc.size() >= max_chunks) return false;
+                csrc.push_back(head[best]);
+                clen.push_back(e - head[best]);
+            }
+            head[best] = e;
+        }
+        const std::size_t cc = csrc.size();
+        std::vector<std::size_t> cdst(cc);
+        std::size_t off = 0, moved = 0;
+        for (std::size_t c = 0; c < cc; ++c) {
+            cdst[c] = off;
+            if (off != csrc[c]) moved += clen[c];
+            off += clen[c];
+        }
+        (void)n;
+        if (moved == 0) return true;
+        if constexpr (std::is_trivially_copyable<T>::value) {
+            ScratchLease<T> lease(moved);
+            if (lease.valid()) {
+                T* tmp = lease.get();
+                std::size_t t = 0;
+                for (std::size_t c = 0; c < cc; ++c) {
+                    if (cdst[c] == csrc[c]) continue;
+                    std::memcpy(static_cast<void*>(tmp + t), static_cast<const void*>(p + csrc[c]), clen[c] * sizeof(T));
+                    t += clen[c];
+                }
+                t = 0;
+                for (std::size_t c = 0; c < cc; ++c) {
+                    if (cdst[c] == csrc[c]) continue;
+                    std::memcpy(static_cast<void*>(p + cdst[c]), static_cast<const void*>(tmp + t), clen[c] * sizeof(T));
+                    t += clen[c];
+                }
+                return true;
+            }
+        }
+        std::vector<T> tmp;
+        tmp.reserve(moved);
+        for (std::size_t c = 0; c < cc; ++c) {
+            if (cdst[c] == csrc[c]) continue;
+            for (std::size_t i = csrc[c]; i < csrc[c] + clen[c]; ++i) tmp.push_back(std::move(p[i]));
+        }
+        std::size_t t = 0;
+        for (std::size_t c = 0; c < cc; ++c) {
+            if (cdst[c] == csrc[c]) continue;
+            for (std::size_t i = 0; i < clen[c]; ++i) p[cdst[c] + i] = std::move(tmp[t + i]);
+            t += clen[c];
+        }
+        return true;
     }
 }
 
@@ -187,6 +437,31 @@ inline bool try_natural_run_merge(T* p, std::size_t n, Comp comp,
         std::vector<std::size_t> next(count + 1);
         bounds[0] = 0;
         for (std::size_t i = 0; i < count; ++i) bounds[i + 1] = runbuf[i].end;
+        // Every run ascending and every break explained by one element on
+        // either side of it: a few far-displaced elements, not interleaved
+        // runs.  Extract and re-insert them instead of merging.
+        {
+            bool all_up = true, single = true;
+            for (std::size_t i = 0; i < count && all_up; ++i) {
+                const std::size_t b = runbuf[i].begin, e = runbuf[i].end;
+                if (e - b > 1 && before(p[e - 1], p[b])) all_up = false;
+                if (i == 0) continue;
+                const bool left_ok  = b >= 2 && !before(p[b], p[b - 2]);
+                const bool right_ok = b + 1 < n && !before(p[b + 1], p[b - 1]);
+                if (!left_ok && !right_ok) single = false;
+            }
+            if (all_up && single &&
+                try_sparse_extract_repair(p, n, before, 2 * count + 16, runbuf.data(), count)) return true;
+        }
+        {
+            // Disjoint runs: reverse the descending ones (a permutation, so
+            // harmless if this declines) and rearrange whole runs.
+            for (std::size_t i = 0; i < count; ++i) {
+                const std::size_t b = runbuf[i].begin, e = runbuf[i].end;
+                if (e - b > 1 && before(p[e - 1], p[b])) std::reverse(p + b, p + e);
+            }
+            if (count > 2 && try_disjoint_run_permutation(p, n, bounds, count, before)) return true;
+        }
         std::size_t levels = 0;
         std::size_t maxbuf = 1;
         {
@@ -267,21 +542,6 @@ inline bool try_natural_run_merge_adaptive(T* p, std::size_t n, Comp comp) {
 // ---------------------------------------------------------------------------
 // Dirty-patch merge
 // ---------------------------------------------------------------------------
-
-/// Moves `k` elements from `src` to `dst`; the ranges may overlap, and `dst`
-/// may sit before or after `src`.  Trivially copyable payloads go through
-/// memmove, which the vectoriser cannot beat; the rest are walked away from
-/// the end that would otherwise be overwritten first.
-template <class T>
-inline void move_range_bulk(T* dst, T* src, std::size_t k) noexcept {
-    if constexpr (std::is_trivially_copyable<T>::value) {
-        if (k) std::memmove(static_cast<void*>(dst), static_cast<const void*>(src), k * sizeof(T));
-    } else if (dst < src) {
-        for (std::size_t i = 0; i < k; ++i) dst[i] = std::move(src[i]);
-    } else if (dst > src) {
-        for (std::size_t i = k; i-- > 0;) dst[i] = std::move(src[i]);
-    }
-}
 
 /// Sorts a patch and merges it back over the clean run sitting at the front of
 /// `p`.  Writes run backwards so the array can act as its own output: the write

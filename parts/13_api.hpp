@@ -401,6 +401,35 @@ inline std::size_t count_descents_capped(const T* p, std::size_t n, bool descend
     return d;
 }
 
+// Cheap stand-in for "more than n/16 descents" on random-like input: three
+// 512-pair windows (head, middle, tail) each over a quarter descents, and
+// at least 8 of 64 strided neighbour pairs descending.  A sorted range with
+// a few disordered windows fails the strided test and gets the exact count.
+// (The exact capped count scans n/8 pairs of a random range: ~26k cycles at
+// n = 200000, 1% of its sort.)
+template <class T>
+inline bool descents_look_dense(const T* p, std::size_t n, bool descending) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    if (n < 8192) return false;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+    std::size_t sd = 0;
+    for (std::size_t j = 0; j < 64; ++j) {
+        const std::size_t i = (j * (n - 1)) >> 6;
+        sd += key(p[i + 1]) < key(p[i]);
+    }
+    if (sd < 8) return false;
+    const std::size_t starts[3] = {1, n / 2, n - 512};
+    for (std::size_t w = 0; w < 3; ++w) {
+        Key bd = 0;
+        for (std::size_t j = starts[w]; j < starts[w] + 512; ++j)
+            bd = static_cast<Key>(bd + static_cast<Key>(key(p[j]) < key(p[j - 1])));
+        if (bd <= 128) return false;
+    }
+    return true;
+}
+
 // True when the first few descents (from `from`) are local: the key after
 // each drop still sits at or above the key `reach` places back.  Near-sorted
 // input (short displacements) passes; sorted runs, far swaps and random
@@ -561,11 +590,21 @@ FYX_NOINLINE std::size_t hash_count_sample_gate(const unsigned char* base, std::
     alignas(64) U smp[S];
     for (std::size_t j = 0; j < S; ++j)
         std::memcpy(&smp[j], base + (((j / B) * (n - B)) / (S / B) + (j % B)) * sizeof(U), sizeof(U));
+    // Random-like input leaves on the first 128 keys holding no repeat
+    // (1536 uniform keys: P(no repeat) ~ 0.5%); one leaf-sized sort.
+    auto sort_n = [&](std::size_t m) {
 #if FYX_HAS_AVX512_CODE
-    if (use_avx512()) vqsort_serial<U>(smp, S);
-    else
+        if (use_avx512()) { vqsort_serial<U>(smp, m); return; }
 #endif
-        std::sort(smp, smp + S);
+        std::sort(smp, smp + m);
+    };
+    sort_n(128);
+    {
+        unsigned rep = 0;
+        for (std::size_t j = 1; j < 128; ++j) rep |= static_cast<unsigned>(smp[j] == smp[j - 1]);
+        if (!rep) return ~std::size_t(0);
+    }
+    sort_n(S);
     // A run of length L ends at j when smp[j] != smp[j + 1]; it adds one to
     // D, and to f1 / f2 when L is 1 / 2 -- i.e. when smp[j - 1] / smp[j - 2]
     // also differ from smp[j].
@@ -1494,6 +1533,18 @@ inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp,
         std::size_t shifts = 0, strikes = 0, next_check = 64;
         for (std::size_t i = 1; i < n; ++i) {
             if (!before(p[i], p[i - 1])) continue;
+            // Refuse long travel before paying for it: p[i] below the element
+            // `reach` back must cross more than that, and a lone intruder at
+            // i-1 above the element `reach` ahead would be bubbled forward one
+            // shift per element all the way (far swaps: ~2 ms of shifts per
+            // 1M records before the old in-loop check fired).
+            if (i >= reach && before(p[i], p[i - reach])) return false;
+            // Two neighbours that both travel more than 4096 back are the
+            // front of a moved block (each one would pay the whole distance).
+            if (i >= 4096 && i + 1 < n && before(p[i + 1], p[i - 4096]) &&
+                before(p[i], p[i - 4096])) return false;
+            if (i >= 2 && i + reach < n && !before(p[i], p[i - 2]) &&
+                before(p[i + reach], p[i - 1])) return false;
             T v = std::move(p[i]);
             std::size_t j = i;
             while (j > 0 && before(v, p[j - 1])) {
@@ -4854,7 +4905,8 @@ inline bool trivial_field_candidate_order(T* p, std::size_t n, Comp comp,
 
 template <class Field, class T>
 inline bool trivial_field_low_cardinality_probe(T* p, std::size_t n,
-                                                std::size_t offset) {
+                                                std::size_t offset,
+                                                std::size_t* distinct_out = nullptr) {
     using Key = typename RadixTraits<Field>::Key;
     constexpr std::size_t Probe = 512;
     const std::size_t s = std::min<std::size_t>(n, Probe);
@@ -4872,7 +4924,85 @@ inline bool trivial_field_low_cardinality_probe(T* p, std::size_t n,
             seen[distinct++] = k;
         }
     }
+    if (distinct_out) *distinct_out = distinct;
     return true;
+}
+
+// In-place counting for records with <= 256 distinct sampled-equivalent
+// keys.  The out-of-place version below reads and writes the records three
+// times (scatter, copy back, check); here a counting pass also records each
+// record's class in a byte array, an American-flag cycle permutation moves
+// every record once, and a read-only pass proves the order with `comp`.
+// Returns 0 = declined untouched, 1 = sorted, 2 = permuted but the proof
+// failed (the caller must sort it some other way).
+template <class Field, class T, class Comp>
+inline int trivial_field_flag_sort(T* p, std::size_t n, Comp comp, std::size_t offset,
+                                   bool descending) {
+    using Key = typename RadixTraits<Field>::Key;
+    constexpr std::size_t Cap = 1024, Mask = Cap - 1;
+    std::array<Key, Cap> keys{};
+    std::array<unsigned short, Cap> slot_id{};      // 0 = empty, else id + 1
+    std::array<Key, kCountingClassLimit> id_key{};
+    std::array<std::size_t, kCountingClassLimit> cnt{};
+    std::size_t distinct = 0;
+    // One lease for both the scatter buffer and the class bytes: a second
+    // concurrent lease misses the thread arena and pays fresh page faults on
+    // every call (16 MiB of them for 1M 16-byte records).
+    const std::size_t out_bytes = (n * sizeof(T) + 63u) & ~std::size_t(63);
+    ScratchLease<unsigned char> lease(out_bytes + n);
+    if (!lease.valid()) return 0;
+    T* out = reinterpret_cast<T*>(lease.get());
+    unsigned char* ids = lease.get() + out_bytes;
+    Key last_k = load_trivial_field_key<Field>(p[0], offset);
+    unsigned last_id = 256;
+    for (std::size_t i = 0; i < n; ++i) {
+        const Key k = load_trivial_field_key<Field>(p[i], offset);
+        if (k == last_k && last_id < 256) { ids[i] = static_cast<unsigned char>(last_id); ++cnt[last_id]; continue; }
+        std::size_t h = low_card_hash_key(k) & Mask;
+        unsigned id;
+        for (;;) {
+            if (slot_id[h] == 0) {
+                if (distinct >= kCountingClassLimit) return 0;
+                id = static_cast<unsigned>(distinct);
+                slot_id[h] = static_cast<unsigned short>(id + 1u);
+                keys[h] = k;
+                id_key[distinct++] = k;
+                break;
+            }
+            if (keys[h] == k) { id = slot_id[h] - 1u; break; }
+            h = (h + 1) & Mask;
+        }
+        ids[i] = static_cast<unsigned char>(id);
+        ++cnt[id];
+        last_k = k; last_id = id;
+    }
+    if (distinct <= 1) return std::is_sorted(p, p + n, comp) ? 1 : 2;
+    // Order the classes by key, then bucket starts in that order.
+    std::array<unsigned char, kCountingClassLimit> order{};
+    for (std::size_t i = 0; i < distinct; ++i) order[i] = static_cast<unsigned char>(i);
+    std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(distinct),
+              [&](unsigned char a, unsigned char b) {
+                  return descending ? id_key[b] < id_key[a] : id_key[a] < id_key[b];
+              });
+    std::array<std::size_t, kCountingClassLimit> start{}, next{}, end{};
+    std::size_t sum = 0;
+    for (std::size_t r = 0; r < distinct; ++r) {
+        const unsigned id = order[r];
+        start[id] = sum; next[id] = sum; sum += cnt[id]; end[id] = sum;
+    }
+    // Scatter (independent iterations, so it runs at store throughput; an
+    // in-place cycle permutation is a chain of dependent loads and measured
+    // 3x slower), then copy back while proving the order.
+    for (std::size_t i = 0; i < n; ++i) out[next[ids[i]]++] = p[i];
+    bool ok = true;
+    p[0] = out[0];
+    for (std::size_t i = 1; i < n; ++i) {
+        p[i] = out[i];
+        ok &= !comp(out[i], out[i - 1]);
+    }
+    (void)end;
+    (void)start;
+    return ok ? 1 : 2;
 }
 
 template <class Field, class T, class Comp>
@@ -4881,7 +5011,26 @@ inline bool try_trivial_field_count_sort(T* p, std::size_t n, Comp comp,
     using Key = typename RadixTraits<Field>::Key;
     bool descending = false;
     if (!trivial_field_candidate_order<Field>(p, n, comp, offset, descending)) return false;
-    if (!trivial_field_low_cardinality_probe<Field>(p, n, offset)) return false;
+    std::size_t sample_distinct = 0;
+    if (!trivial_field_low_cardinality_probe<Field>(p, n, offset, &sample_distinct)) return false;
+
+    // The scatter slows down sharply past a few dozen destination streams
+    // (TLB reach), so the in-place-class variant is kept to small key sets.
+    if constexpr (std::is_trivially_copyable<T>::value) if (sample_distinct <= 48) {
+        // Sample span first: a sparse key domain (hashes, random 64-bit
+        // palettes) can skip the dense-range min/max pass altogether.
+        Key smn = load_trivial_field_key<Field>(p[0], offset), smx = smn;
+        for (std::size_t j = 0; j < 256; ++j) {
+            const Key k = load_trivial_field_key<Field>(p[(j * n) / 256], offset);
+            smn = k < smn ? k : smn;
+            smx = smx < k ? k : smx;
+        }
+        const unsigned long long sspan = static_cast<unsigned long long>(static_cast<Key>(smx - smn));
+        if (sspan >= static_cast<unsigned long long>(std::min<std::size_t>(kCountingRangeLimit, std::max<std::size_t>(n, 4096)))) {
+            const int r = trivial_field_flag_sort<Field>(p, n, comp, offset, descending);
+            if (r != 0) return r == 1;
+        }
+    }
 
     // Fast subpath for the overwhelmingly common struct-key case: the key field
     // is a dense integer domain (e.g. `struct { int key; ... }` with 64 keys).
@@ -4902,9 +5051,13 @@ inline bool try_trivial_field_count_sort(T* p, std::size_t n, Comp comp,
                                                             std::max<std::size_t>(n, 4096));
             if (range64 <= static_cast<unsigned long long>(limit)) {
                 const std::size_t range = static_cast<std::size_t>(range64);
-                ScratchLease<std::size_t> counts_lease(range);
-                if (counts_lease.valid()) {
-                    std::size_t* counts = counts_lease.get();
+                // Counters and scatter buffer share one lease (a second,
+                // concurrent lease would miss the thread arena and fault in
+                // fresh pages on every call).
+                const std::size_t out_bytes = (n * sizeof(T) + 63u) & ~std::size_t(63);
+                ScratchLease<unsigned char> both_lease(out_bytes + range * sizeof(std::size_t));
+                if (both_lease.valid()) {
+                    std::size_t* counts = reinterpret_cast<std::size_t*>(both_lease.get() + out_bytes);
                     for (std::size_t i = 0; i < range; ++i) counts[i] = 0;
                     for (std::size_t i = 0; i < n; ++i)
                         ++counts[static_cast<std::size_t>(load_trivial_field_key<Field>(p[i], offset) - mn)];
@@ -4927,9 +5080,8 @@ inline bool try_trivial_field_count_sort(T* p, std::size_t n, Comp comp,
                             }
                         }
 
-                        ScratchLease<T> out_lease(n);
-                        if (out_lease.valid()) {
-                            T* out = out_lease.get();
+                        {
+                            T* out = reinterpret_cast<T*>(both_lease.get());
                             for (std::size_t i = 0; i < n; ++i) {
                                 const std::size_t r = static_cast<std::size_t>(
                                     load_trivial_field_key<Field>(p[i], offset) - mn);
@@ -5023,6 +5175,219 @@ inline bool try_trivial_field_count_sort(T* p, std::size_t n, Comp comp,
 }
 
 
+// ---------------------------------------------------------------------------
+// MSD radix for trivially copyable records keyed by one integer field.
+// The LSD record radix above pays a full read+write of every record per active
+// digit -- eight passes for a random 64-bit key, which left 1M 16-byte records
+// 3-4x behind ips2ra / vqsort's key-value mode.  This version spends one
+// streaming pass (min/max), one histogram pass and one scatter into scratch;
+// everything after that works on buckets that fit in L1/L2: a range-adaptive
+// second digit, insertion-sorted leaves, and per-bucket comparator checks
+// while the bucket is still cached (the field/comparator equivalence is only
+// sampled, so the final order is always proven with `comp`).
+// ---------------------------------------------------------------------------
+template <class Key>
+FYX_FORCE_INLINE unsigned record_msd_key_bits(Key d) noexcept {
+    unsigned b = 0;
+    while (d != 0) { ++b; d = static_cast<Key>(d >> 1); }
+    return b;
+}
+
+template <class Field, class T>
+FYX_FORCE_INLINE typename RadixTraits<Field>::Key
+record_msd_key(const T& x, std::size_t offset, bool descending) noexcept {
+    using Key = typename RadixTraits<Field>::Key;
+    const Key k = load_trivial_field_key<Field>(x, offset);
+    return descending ? static_cast<Key>(~k) : k;
+}
+
+template <class Field, class T>
+inline void record_msd_insertion(T* p, std::size_t m, std::size_t offset, bool descending) {
+    using Key = typename RadixTraits<Field>::Key;
+    for (std::size_t i = 1; i < m; ++i) {
+        const Key k = record_msd_key<Field>(p[i], offset, descending);
+        if (!(k < record_msd_key<Field>(p[i - 1], offset, descending))) continue;
+        T tmp = p[i];
+        std::size_t j = i;
+        do { p[j] = p[j - 1]; --j; }
+        while (j > 0 && k < record_msd_key<Field>(p[j - 1], offset, descending));
+        p[j] = tmp;
+    }
+}
+
+#ifndef FYX_RMSD_TOP_BITS
+#  define FYX_RMSD_TOP_BITS 6
+#endif
+#ifndef FYX_RMSD_LEAF
+#  define FYX_RMSD_LEAF 24
+#endif
+#ifndef FYX_RMSD_SUB_SHIFT
+#  define FYX_RMSD_SUB_SHIFT 3
+#endif
+#ifndef FYX_RMSD_MAX_BITS
+#  define FYX_RMSD_MAX_BITS 11
+#endif
+inline constexpr unsigned kRecordMsdMaxBits  = FYX_RMSD_MAX_BITS;
+inline constexpr unsigned kRecordMsdMaxDepth = 10;
+#ifndef FYX_RMSD_RANK_LEAF
+#  define FYX_RMSD_RANK_LEAF 1
+#endif
+
+// Branch-free leaf: each record's final slot is its rank (keys below it plus
+// equal keys earlier in the bucket), so a bucket of s records costs s*s
+// predictable compares instead of insertion sort's data-dependent branches.
+// `scratch` (the bucket's slot in the other buffer) is free at this point.
+template <class Field, class T>
+inline void record_msd_rank_leaf(T* p, T* scratch, std::size_t s, std::size_t offset,
+                                 bool descending) {
+    using Key = typename RadixTraits<Field>::Key;
+    Key ks[FYX_RMSD_LEAF];
+    for (std::size_t i = 0; i < s; ++i) ks[i] = record_msd_key<Field>(p[i], offset, descending);
+    std::memcpy(static_cast<void*>(scratch), static_cast<const void*>(p), s * sizeof(T));
+    for (std::size_t i = 0; i < s; ++i) {
+        const Key k = ks[i];
+        std::size_t r = 0;
+        for (std::size_t j = 0; j < i; ++j) r += ks[j] <= k;
+        for (std::size_t j = i + 1; j < s; ++j) r += ks[j] < k;
+        p[r] = scratch[i];
+    }
+}
+inline constexpr std::size_t kRecordMsdFrame = (std::size_t(2) << kRecordMsdMaxBits) + 1;
+
+// Sorts src[0,m) into dst[0,m); src is scratch afterwards.  `work` holds
+// kRecordMsdFrame counters per remaining recursion level.
+template <class Field, class T>
+inline void record_msd_rec(T* src, T* dst, std::size_t m, std::size_t offset,
+                           bool descending, unsigned depth, std::size_t* work) {
+    using Key = typename RadixTraits<Field>::Key;
+    constexpr std::size_t kLeaf = FYX_RMSD_LEAF;
+    if (m <= kLeaf || depth >= kRecordMsdMaxDepth) {
+        std::memcpy(static_cast<void*>(dst), static_cast<const void*>(src), m * sizeof(T));
+        if (m <= kLeaf) record_msd_insertion<Field>(dst, m, offset, descending);
+        else {
+            std::sort(dst, dst + m, [&](const T& a, const T& b) {
+                return record_msd_key<Field>(a, offset, descending) <
+                       record_msd_key<Field>(b, offset, descending);
+            });
+        }
+        return;
+    }
+    Key mn = record_msd_key<Field>(src[0], offset, descending), mx = mn;
+    for (std::size_t i = 1; i < m; ++i) {
+        const Key k = record_msd_key<Field>(src[i], offset, descending);
+        mn = k < mn ? k : mn;
+        mx = mx < k ? k : mx;
+    }
+    if (mn == mx) {
+        std::memcpy(static_cast<void*>(dst), static_cast<const void*>(src), m * sizeof(T));
+        return;
+    }
+    const unsigned bits = record_msd_key_bits(static_cast<Key>(mx - mn));
+    unsigned lg = 0;
+    while ((std::size_t(1) << (lg + 1)) <= m) ++lg;
+    unsigned B = lg > FYX_RMSD_SUB_SHIFT ? lg - FYX_RMSD_SUB_SHIFT : 1;
+    if (B > kRecordMsdMaxBits) B = kRecordMsdMaxBits;
+    if (B > bits) B = bits;
+    const unsigned shift = bits - B;
+    const std::size_t nb = std::size_t(1) << B;
+
+    std::size_t* cnt = work;
+    std::size_t* pos = work + nb + 1;
+    std::memset(cnt, 0, (nb + 1) * sizeof(std::size_t));
+    for (std::size_t i = 0; i < m; ++i)
+        ++cnt[static_cast<std::size_t>((record_msd_key<Field>(src[i], offset, descending) - mn) >> shift) + 1];
+    for (std::size_t b = 1; b <= nb; ++b) cnt[b] += cnt[b - 1];
+    std::memcpy(pos, cnt, nb * sizeof(std::size_t));
+    for (std::size_t i = 0; i < m; ++i) {
+        const std::size_t b = static_cast<std::size_t>(
+            (record_msd_key<Field>(src[i], offset, descending) - mn) >> shift);
+        dst[pos[b]++] = src[i];
+    }
+    // Large sub-buckets recurse; the small ones are finished by one
+    // insertion pass over the whole range (keys never cross a sub-bucket
+    // boundary, so it only moves records inside their own sub-bucket).
+    for (std::size_t b = 0; b < nb; ++b) {
+        const std::size_t lo = cnt[b], s = cnt[b + 1] - lo;
+        if (s <= 1) continue;
+        if (s <= kLeaf) {
+#if FYX_RMSD_RANK_LEAF
+            record_msd_rank_leaf<Field>(dst + lo, src + lo, s, offset, descending);
+#endif
+            continue;
+        }
+        record_msd_rec<Field>(dst + lo, src + lo, s, offset, descending, depth + 1,
+                              work + kRecordMsdFrame);
+        std::memcpy(static_cast<void*>(dst + lo), static_cast<const void*>(src + lo), s * sizeof(T));
+    }
+#if !FYX_RMSD_RANK_LEAF
+    record_msd_insertion<Field>(dst, m, offset, descending);
+#endif
+}
+
+template <class Field, class T, class Comp>
+inline bool record_msd_sort(T* p, std::size_t n, Comp comp, std::size_t offset,
+                            bool descending) {
+    using Key = typename RadixTraits<Field>::Key;
+    // The top digit is planned from a sample (out-of-sample keys clamp to the
+    // edge buckets, which only makes those buckets larger) and kept narrow:
+    // a full-array scatter into hundreds of streams is several times slower
+    // than into a few dozen once the destination spans more pages than the
+    // TLB covers, while the second level runs on L2-resident buckets.
+    constexpr std::size_t S = 256;
+    Key mn = record_msd_key<Field>(p[0], offset, descending), mx = mn;
+    for (std::size_t j = 0; j < S; ++j) {
+        const Key k = record_msd_key<Field>(p[(j * n) / S], offset, descending);
+        mn = k < mn ? k : mn;
+        mx = mx < k ? k : mx;
+    }
+    if (mn == mx) {
+        mn = record_msd_key<Field>(p[0], offset, descending); mx = mn;
+        for (std::size_t i = 1; i < n; ++i) {
+            const Key k = record_msd_key<Field>(p[i], offset, descending);
+            mn = k < mn ? k : mn;
+            mx = mx < k ? k : mx;
+        }
+        if (mn == mx) return true;   // every key equal under a sampled-equivalent comparator
+    }
+    const unsigned bits = record_msd_key_bits(static_cast<Key>(mx - mn));
+    unsigned lg = 0;
+    while ((std::size_t(1) << (lg + 1)) <= n) ++lg;
+    unsigned B = FYX_RMSD_TOP_BITS;
+    if (lg < 14) B = lg > 8 ? lg - 8 : 1;
+    if (B > bits) B = bits;
+    const unsigned shift = bits - B;
+    const std::size_t nb = std::size_t(1) << B;
+    auto bucket_of = [&](Key k) noexcept -> std::size_t {
+        if (k < mn) return 0;
+        const std::size_t b = static_cast<std::size_t>((k - mn) >> shift);
+        return b < nb ? b : nb - 1;
+    };
+
+    ScratchLease<T> tmp_lease(n);
+    if (!tmp_lease.valid()) return false;
+    T* tmp = tmp_lease.get();
+    std::vector<std::size_t> work(kRecordMsdFrame * (kRecordMsdMaxDepth + 1) + 2 * nb + 2, 0);
+    std::size_t* cnt = work.data() + kRecordMsdFrame * (kRecordMsdMaxDepth + 1);
+    std::size_t* pos = cnt + nb + 1;
+    for (std::size_t i = 0; i < n; ++i)
+        ++cnt[bucket_of(record_msd_key<Field>(p[i], offset, descending)) + 1];
+    for (std::size_t b = 1; b <= nb; ++b) cnt[b] += cnt[b - 1];
+    std::memcpy(pos, cnt, nb * sizeof(std::size_t));
+    for (std::size_t i = 0; i < n; ++i)
+        tmp[pos[bucket_of(record_msd_key<Field>(p[i], offset, descending))]++] = p[i];
+    const T* prev = nullptr;
+    for (std::size_t b = 0; b < nb; ++b) {
+        const std::size_t lo = cnt[b], s = cnt[b + 1] - lo;
+        if (s == 0) continue;
+        record_msd_rec<Field>(tmp + lo, p + lo, s, offset, descending, 1, work.data());
+        if (prev && comp(p[lo], *prev)) return false;
+        for (std::size_t i = lo + 1; i < lo + s; ++i)
+            if (comp(p[i], p[i - 1])) return false;
+        prev = p + lo + s - 1;
+    }
+    return true;
+}
+
 template <class Field, class T, class Comp>
 inline bool try_trivial_field_radix_sort(T* p, std::size_t n, Comp comp,
                                          std::size_t offset) {
@@ -5036,6 +5401,7 @@ inline bool try_trivial_field_radix_sort(T* p, std::size_t n, Comp comp,
 
         bool descending = false;
         if (!trivial_field_candidate_order<Field>(p, n, comp, offset, descending)) return false;
+        if (FYX_RECORD_MSD) return record_msd_sort<Field>(p, n, comp, offset, descending);
 
         RadixHistogram<Passes> hist;
         hist.clear();
@@ -5090,14 +5456,18 @@ inline bool try_trivial_prefix_key_radix_sort(T* p, std::size_t n, Comp comp) {
         (void)p; (void)n; (void)comp;
         return false;
     } else {
+        // 8-byte fields first: the upper half of a 64-bit key is itself a
+        // 32-bit field that orders a duplicate-free sample exactly like the
+        // key, so probing 4-byte fields first used to pick it, radix-sort on
+        // half the key and then fail the final check on the first tie.
         constexpr std::size_t max_probe = sizeof(T) < 32 ? sizeof(T) : 32;
-        for (std::size_t off = 0; off + 4 <= max_probe; off += 4) {
-            if (try_trivial_field_radix_sort<std::int32_t>(p, n, comp, off)) return true;
-            if (try_trivial_field_radix_sort<std::uint32_t>(p, n, comp, off)) return true;
-        }
         for (std::size_t off = 0; off + 8 <= max_probe; off += 8) {
             if (try_trivial_field_radix_sort<std::int64_t>(p, n, comp, off)) return true;
             if (try_trivial_field_radix_sort<std::uint64_t>(p, n, comp, off)) return true;
+        }
+        for (std::size_t off = 0; off + 4 <= max_probe; off += 4) {
+            if (try_trivial_field_radix_sort<std::int32_t>(p, n, comp, off)) return true;
+            if (try_trivial_field_radix_sort<std::uint32_t>(p, n, comp, off)) return true;
         }
         return false;
     }
@@ -5112,13 +5482,15 @@ inline bool try_trivial_prefix_key_count_sort(T* p, std::size_t n, Comp comp) {
     } else {
         if (n < kCountingMinN) return false;
         constexpr std::size_t max_probe = sizeof(T) < 32 ? sizeof(T) : 32;
-        for (std::size_t off = 0; off + 4 <= max_probe; off += 4) {
-            if (try_trivial_field_count_sort<std::int32_t>(p, n, comp, off)) return true;
-            if (try_trivial_field_count_sort<std::uint32_t>(p, n, comp, off)) return true;
-        }
+        // 8-byte fields first, as in the radix probe (a 64-bit key's upper
+        // half samples like a 32-bit key).
         for (std::size_t off = 0; off + 8 <= max_probe; off += 8) {
             if (try_trivial_field_count_sort<std::int64_t>(p, n, comp, off)) return true;
             if (try_trivial_field_count_sort<std::uint64_t>(p, n, comp, off)) return true;
+        }
+        for (std::size_t off = 0; off + 4 <= max_probe; off += 4) {
+            if (try_trivial_field_count_sort<std::int32_t>(p, n, comp, off)) return true;
+            if (try_trivial_field_count_sort<std::uint32_t>(p, n, comp, off)) return true;
         }
         return false;
     }
@@ -5285,7 +5657,139 @@ inline void string_msd_sort_rec(std::string* p, std::string* tmp,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Prefix-key string sort.  The byte-wise MSD below moves every std::string
+// object twice per level (about three levels for random text); here each
+// string contributes one 8-byte big-endian chunk of its bytes plus its index,
+// the 16-byte (index, key) records go through the record MSD radix, equal
+// chunks are refined with the next 8 bytes (strings that end inside a chunk
+// go first, ordered by length -- they are prefixes of the longer ones), and
+// the strings themselves move exactly twice at the end.  Exact for
+// std::string's unsigned-byte lexicographic order.
+// ---------------------------------------------------------------------------
+#ifndef FYX_STRING_PREFIX_SORT
+#  define FYX_STRING_PREFIX_SORT 1
+#endif
+struct StrKeyIdx {
+    std::uint32_t idx;
+    std::uint32_t len;     // the string's length (inputs with longer strings decline)
+    std::uint64_t key;
+};
+struct StrKeyIdxLess {
+    bool operator()(const StrKeyIdx& a, const StrKeyIdx& b) const noexcept { return a.key < b.key; }
+};
+
+inline std::uint64_t string_chunk_be(const std::string& s, std::size_t d) noexcept {
+    const std::size_t len = s.size();
+    if (d >= len) return 0;
+    const unsigned char* q = reinterpret_cast<const unsigned char*>(s.data()) + d;
+    const std::size_t m = len - d;
+    std::uint64_t v = 0;
+    if (m >= 8) {
+        for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | q[i];
+        return v;
+    }
+    for (std::size_t i = 0; i < m; ++i) v |= static_cast<std::uint64_t>(q[i]) << (56 - 8 * i);
+    return v;
+}
+
+inline void string_prefix_sort_keys(StrKeyIdx* a, std::size_t m) {
+    if (m <= 48) {
+        for (std::size_t i = 1; i < m; ++i) {
+            const StrKeyIdx x = a[i];
+            std::size_t j = i;
+            while (j > 0 && x.key < a[j - 1].key) { a[j] = a[j - 1]; --j; }
+            a[j] = x;
+        }
+        return;
+    }
+    if (!record_msd_sort<std::uint64_t>(a, m, StrKeyIdxLess{}, 8, false))
+        std::sort(a, a + m, StrKeyIdxLess{});
+}
+
+// a[0, m) agree on bytes [0, depth) (zero-padded).  Orders them completely.
+inline void string_prefix_refine(StrKeyIdx* a, std::size_t m, const std::string* p,
+                                 std::size_t depth) {
+    if (depth > 512) {
+        std::sort(a, a + m, [p](const StrKeyIdx& x, const StrKeyIdx& y) {
+            return p[x.idx] < p[y.idx];
+        });
+        return;
+    }
+    std::size_t e = 0;
+    for (std::size_t i = 0; i < m; ++i)
+        if (a[i].len <= depth) std::swap(a[i], a[e++]);
+    if (e > 1) {
+        std::sort(a, a + e, [](const StrKeyIdx& x, const StrKeyIdx& y) { return x.len < y.len; });
+    }
+    StrKeyIdx* b = a + e;
+    const std::size_t k = m - e;
+    if (k <= 1) return;
+    // Duplicate-heavy text: a group is usually one string repeated.  One
+    // memcmp per member settles that, instead of a cache-missing chunk load
+    // per member per 8 bytes until every copy has ended.
+    {
+        const std::uint32_t l0 = b[0].len;
+        const char* f0 = p[b[0].idx].data();
+        bool same = true;
+        for (std::size_t i = 1; i < k && same; ++i)
+            same = b[i].len == l0 &&
+                   std::memcmp(p[b[i].idx].data() + depth, f0 + depth, l0 - depth) == 0;
+        if (same) return;
+    }
+    for (std::size_t i = 0; i < k; ++i) b[i].key = string_chunk_be(p[b[i].idx], depth);
+    string_prefix_sort_keys(b, k);
+    for (std::size_t lo = 0; lo < k;) {
+        std::size_t hi = lo + 1;
+        while (hi < k && b[hi].key == b[lo].key) ++hi;
+        if (hi - lo > 1) string_prefix_refine(b + lo, hi - lo, p, depth + 8);
+        lo = hi;
+    }
+}
+
+inline bool string_prefix_sort(std::string* p, std::size_t n, bool descending) {
+    ScratchLease<StrKeyIdx> lease(n);
+    if (!lease.valid()) return false;
+    StrKeyIdx* a = lease.get();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i + 16 < n) prefetch_read<3>(p[i + 16].data());
+        const std::size_t len = p[i].size();
+        if (len >= 0xffffffffu) return false;      // nothing moved yet
+        a[i].idx = static_cast<std::uint32_t>(i);
+        a[i].len = static_cast<std::uint32_t>(len);
+        a[i].key = string_chunk_be(p[i], 0);
+    }
+    string_prefix_sort_keys(a, n);
+    for (std::size_t lo = 0; lo < n;) {
+        std::size_t hi = lo + 1;
+        while (hi < n && a[hi].key == a[lo].key) ++hi;
+        if (hi - lo > 1) string_prefix_refine(a + lo, hi - lo, p, 8);
+        lo = hi;
+    }
+    std::vector<std::string> tmp;
+    tmp.reserve(n);
+    // The gather is a dependent-free random read per string: prefetch it a
+    // few dozen iterations ahead so the misses overlap.
+    constexpr std::size_t kAhead = 24;
+    if (!descending) {
+        for (std::size_t k = 0; k < n; ++k) {
+            if (k + kAhead < n) prefetch_read<3>(p + a[k + kAhead].idx);
+            tmp.emplace_back(std::move(p[a[k].idx]));
+        }
+    } else {
+        for (std::size_t k = n; k-- > 0;) {
+            if (k >= kAhead) prefetch_read<3>(p + a[k - kAhead].idx);
+            tmp.emplace_back(std::move(p[a[k].idx]));
+        }
+    }
+    for (std::size_t k = 0; k < n; ++k) p[k] = std::move(tmp[k]);
+    return true;
+}
+
 inline bool string_msd_sort_default(std::string* p, std::size_t n, bool descending) {
+#if FYX_STRING_PREFIX_SORT
+    if (n >= 4096 && n < (std::size_t(1) << 32) && string_prefix_sort(p, n, descending)) return true;
+#endif
     if (n < 4096) return false;
     std::vector<std::string> tmp(n);
     string_msd_sort_rec(p, tmp.data(), n, 0);
@@ -8697,6 +9201,50 @@ inline bool try_guarded_radix_order_sort(T* p, std::size_t n, Comp comp,
 // Ordered except for one stretch in the middle
 // ---------------------------------------------------------------------------
 
+// Partially sorted input that the patch repairs declined (many short runs,
+// e.g. sqrt(n)-length sorted runs) used to fall to comparison pdqsort.  For a
+// default-ordered std::string or a record whose comparator samples as an
+// integer key field, the key radix sorts are several times cheaper than that.
+// The patch repairs decline a "many independent sorted runs" input only after
+// several full comparison passes (1M sqrt-length runs: ~20 ms for 16-byte
+// records, ~60 ms for strings).  Probe 16 windows instead: if they hold many
+// descents and almost every descent is *deep and wide* -- the element 8 past
+// the break is still below the one 2 before it, which a lone displaced
+// element never produces -- the input is run-structured and the key radix
+// should go first.
+template <class T, class Comp>
+inline bool partial_runs_look_independent(const T* p, std::size_t n, Comp comp) {
+    constexpr std::size_t kWindows = 16, kWin = 2048, kW = 8;
+    if constexpr (!std::is_same<T, std::string>::value &&
+                  !(std::is_trivially_copyable<T>::value && !std::is_arithmetic<T>::value)) {
+        (void)p; (void)n; (void)comp;
+        return false;
+    }
+    if (n < kWindows * kWin * 2) return false;
+    std::size_t desc = 0, deep = 0;
+    for (std::size_t w = 0; w < kWindows; ++w) {
+        const std::size_t lo = 2 + (w * (n - kWin - kW - 4)) / kWindows;
+        for (std::size_t i = lo; i < lo + kWin; ++i) {
+            if (!comp(p[i], p[i - 1])) continue;
+            ++desc;
+            deep += comp(p[i + kW], p[i - 2]) ? 1u : 0u;
+        }
+    }
+    return desc >= 24 && deep * 8 >= desc * 7;
+}
+
+template <class T, class Comp>
+inline bool try_key_radix_for_partial(T* p, std::size_t n, Comp comp) {
+    if constexpr (std::is_same<T, std::string>::value) {
+        return try_string_msd_sort(p, n, comp, is_descending_v<Comp, T>);
+    } else if constexpr (std::is_trivially_copyable<T>::value && !std::is_arithmetic<T>::value) {
+        return try_trivial_prefix_key_radix_sort(p, n, comp);
+    } else {
+        (void)p; (void)n; (void)comp;
+        return false;
+    }
+}
+
 template <class T, class Comp>
 inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
                     const InputProfile<T, Comp>* known_profile = nullptr);
@@ -9133,8 +9681,8 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
             // Continue into the radix block below instead of committing here.
         } else {
             if (try_guarded_radix_order_sort(p, n, comp, false, true)) { record_dispatch(DispatchDecision::Radix); return; }
-            if (try_partially_sorted_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
-            pdqsort_for_profile_pattern(p, n, comp);
+            if (partial_runs_look_independent(p, n, comp) && try_key_radix_for_partial(p, n, comp)) { record_dispatch(DispatchDecision::Radix); return; } if (try_partially_sorted_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; }
+            if (try_key_radix_for_partial(p, n, comp)) { record_dispatch(DispatchDecision::Radix); return; } pdqsort_for_profile_pattern(p, n, comp);
             record_dispatch(DispatchDecision::PartialPdq);
             return;
         }
@@ -9193,7 +9741,7 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
             if (try_trivial_prefix_key_count_sort(p, n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
             if (try_low_cardinality_count_sort(p, p + n, comp)) { record_dispatch(DispatchDecision::LowCardinality); return; }
         }
-        if (partial_pdq) { if (try_partially_sorted_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; } pdqsort_for_profile_pattern(p, n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
+        if (partial_pdq) { if (partial_runs_look_independent(p, n, comp) && try_key_radix_for_partial(p, n, comp)) { record_dispatch(DispatchDecision::Radix); return; } if (try_partially_sorted_repair(p, n, comp)) { record_dispatch(DispatchDecision::PartialPdq); return; } if (try_key_radix_for_partial(p, n, comp)) { record_dispatch(DispatchDecision::Radix); return; } pdqsort_for_profile_pattern(p, n, comp); record_dispatch(DispatchDecision::PartialPdq); return; }
         if (try_guarded_string_order_sort(p, n, comp, false)) { record_dispatch(DispatchDecision::Radix); return; }
         if (try_string_msd_sort(p, n, comp, descending)) { record_dispatch(DispatchDecision::Radix); return; }
         if (try_trivial_prefix_key_radix_sort(p, n, comp)) { record_dispatch(DispatchDecision::Radix); return; }
@@ -9772,6 +10320,8 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                     D = n < 2048 ? detail::descent_positions(p, 1, 33, descending, dpos, 8) : 0;
                     D = D > 8 ? n / 16 + 1 : detail::descent_positions(p, 1, n, descending, dpos, n / 16);
                     if (D != 0) brk = dpos[0];
+                } else if (detail::descents_look_dense(p, n, descending)) {
+                    D = n / 16 + 1;        // random-like: skip the n/8-pair count
                 } else {
                     D = detail::count_descents_capped(p, n, descending, n / 16, brk);
                 }
@@ -9874,8 +10424,8 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                     return;
                 }
             }
-            // A few hundred to ~2000 distinct keys: hash counting.  32-bit
-            // keys only from 64K up (below that the vq is as fast; measured).
+            // A few hundred to ~2000 distinct keys: hash counting (its gate
+            // routes 4-byte keys with few values per leaf back to the vq).
             if (detail::try_hash_count_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::LowCardinality);
                 return;
@@ -10071,11 +10621,11 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                 detail::record_dispatch(detail::DispatchDecision::Radix);
                 return;
             }
-            if (detail::try_partially_sorted_repair(p, n, comp)) {
+            if (detail::partial_runs_look_independent(p, n, comp) && detail::try_key_radix_for_partial(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; } if (detail::try_partially_sorted_repair(p, n, comp)) {
                 detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                 return;
             }
-            detail::pdqsort_for_profile_pattern(p, n, comp);
+            if (detail::try_key_radix_for_partial(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; } detail::pdqsort_for_profile_pattern(p, n, comp);
             detail::record_dispatch(detail::DispatchDecision::PartialPdq);
             return;
         }
@@ -10127,11 +10677,11 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                     detail::record_dispatch(detail::DispatchDecision::Radix);
                     return;
                 }
-                if (detail::try_partially_sorted_repair(p, n, comp)) {
+                if (detail::partial_runs_look_independent(p, n, comp) && detail::try_key_radix_for_partial(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; } if (detail::try_partially_sorted_repair(p, n, comp)) {
                     detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                     return;
                 }
-                detail::pdqsort_for_profile_pattern(p, n, comp);
+                if (detail::try_key_radix_for_partial(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; } detail::pdqsort_for_profile_pattern(p, n, comp);
                 detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                 return;
             }
@@ -10185,7 +10735,7 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                 if (detail::try_trivial_prefix_key_count_sort(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
                 if (detail::try_low_cardinality_count_sort(p, p + n, comp)) { detail::record_dispatch(detail::DispatchDecision::LowCardinality); return; }
             }
-            if (partial_pdq) { if (detail::try_partially_sorted_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; } detail::pdqsort_for_profile_pattern(p, n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
+            if (partial_pdq) { if (detail::partial_runs_look_independent(p, n, comp) && detail::try_key_radix_for_partial(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; } if (detail::try_partially_sorted_repair(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; } if (detail::try_key_radix_for_partial(p, n, comp)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; } detail::pdqsort_for_profile_pattern(p, n, comp); detail::record_dispatch(detail::DispatchDecision::PartialPdq); return; }
             if (detail::try_guarded_string_order_sort(p, n, comp, want_parallel)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_string_msd_sort_parallel(p, n, comp, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }
             if (detail::try_string_msd_sort(p, n, comp, descending)) { detail::record_dispatch(detail::DispatchDecision::Radix); return; }

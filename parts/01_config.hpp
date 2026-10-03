@@ -509,6 +509,12 @@ inline constexpr std::size_t kSmallVqsortMinN = 2;
 #endif
 inline constexpr std::size_t kSmallVqsortMaxN = FYX_SMALL_VQ_MAX_N;
 
+// Records keyed by a sampled integer field: 1 = MSD record radix (one scatter,
+// cache-resident buckets), 0 = legacy LSD pass-per-digit radix.
+#ifndef FYX_RECORD_MSD
+#  define FYX_RECORD_MSD 1
+#endif
+
 /// pdqsort switches to the network / small-sort below this.
 inline constexpr std::size_t kInsertionThreshold = 24;
 

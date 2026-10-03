@@ -6,6 +6,22 @@ Date: 2026-09-16
 
 ### Added
 
+- **记录 / 字符串 / 结构化输入第三轮（2026-10-03，Ice Lake-SP 2 vCPU / GCC 12.2 单机，1M 元素，
+  本地 kvb 进程内对比，单次噪声约 ±15%；未在其它 CPU / 编译器上验证）**：
+  - 16 字节记录（u64 键 + 载荷）按字段证明后走记录 MSD radix（`record_msd_sort`，
+    `FYX_RECORD_MSD=0` 回退旧 LSD）；前缀探测先探 8 字节。kv16 random 85.8→约 19 ms。
+  - 字符串前缀键排序（`string_prefix_sort`，`FYX_STRING_PREFIX_SORT=0` 关闭）：每串取 8 字节大端块 +
+    下标 + 长度做 16 字节记录走 radix，同键组用下一个 8 字节细化（提前结束的串按长度排在前），
+    同组整串相同一次 memcmp 判定；最后一次性 gather 搬移（预取）。str random 228→约 115 ms，
+    sorted_runs 221→约 94 ms，zipf 166→约 141 ms。
+  - 部分有序：k 路 galloping 块置换（block_swap kv 8.1→2.2 ms），稀疏抽取修复带 run 跳读，
+    insertion repair 三条提前拒绝（far_swaps kv 9.1→1.2 ms），相邻 run 归并接缝已序检查 / 修剪 /
+    旋转识别，partial 分支先判 run 是否独立再走 key radix。
+  - 少值结构体：≤48 个不同键时走 flag 计数（类别字节数组 + 一次 scatter + 拷回时验证）；dense 计数
+    路径计数器与 scatter 缓冲合用一个 scratch lease（第二个 lease 每次调用都会缺页）。
+  - 测试：`t_adaptive` 新增记录（升/降序、(key,val) 字典序比较器不得被字段证明误判）、稀疏抽取
+    接受/拒绝不改数据、字符串块置换、含 NUL/0xff/公共前缀/重复的字符串前缀排序。
+
 - **小 n 快路径新增（2026-10-02，Ice Lake-SP / GCC 12.2 单机，与 x86-simd-sort 进程内交替 A/B，
   中位数 ns/elem；`tools/dev/shape_bench/ab_all.sh`）**：
   - 稀疏离群修复 `sparse_outlier_repair_at`：AVX-512 压缩存储一次取得全部 descent 位置
