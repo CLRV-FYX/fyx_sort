@@ -544,6 +544,44 @@ inline void merge_runs_galloping(const T* A, std::size_t na, const T* B, std::si
     if (j < nb) std::memcpy(static_cast<void*>(out + o), static_cast<const void*>(B + j), (nb - j) * sizeof(T));
 }
 
+// Sample gate of try_hash_count_sort (kept out of line: inlined, it
+// perturbed the counting loop's code by ~15%).  256 keys in 16 blocks of 16
+// consecutive keys (on cold data ~2 lines per block instead of one miss per
+// key; block-local clustering can only inflate repeats, i.e. pass more
+// inputs on to the prefix check, which decides for itself).  The Chao1
+// estimate D + f1^2 / (2 f2) of the total key count (f1 / f2: keys seen
+// once / twice) is returned (all-ones: nearly all distinct); the caller
+// declines long-tailed inputs on it before any table is touched.  The keys are sorted in registers and their runs counted
+// without branches: a hash-probe gate cost ~7000-16000 cycles per call on
+// fresh inputs (mispredicted probes; a heap table also arrives cold).
+template <class U, std::size_t S>
+FYX_NOINLINE std::size_t hash_count_sample_gate(const unsigned char* base, std::size_t n) {
+    constexpr std::size_t B = 16;                       // keys per block (64 measured slower)
+    static_assert(S % B == 0, "whole blocks");
+    alignas(64) U smp[S];
+    for (std::size_t j = 0; j < S; ++j)
+        std::memcpy(&smp[j], base + (((j / B) * (n - B)) / (S / B) + (j % B)) * sizeof(U), sizeof(U));
+#if FYX_HAS_AVX512_CODE
+    if (use_avx512()) vqsort_serial<U>(smp, S);
+    else
+#endif
+        std::sort(smp, smp + S);
+    // A run of length L ends at j when smp[j] != smp[j + 1]; it adds one to
+    // D, and to f1 / f2 when L is 1 / 2 -- i.e. when smp[j - 1] / smp[j - 2]
+    // also differ from smp[j].
+    std::size_t sd = 0, f1 = 0, f2 = 0;
+    for (std::size_t j = 0; j < S; ++j) {
+        const bool end = j + 1 == S || smp[j] != smp[j + 1];
+        const bool s1  = j < 1 || smp[j - 1] != smp[j];
+        const bool s2  = !s1 && (j < 2 || smp[j - 2] != smp[j]);
+        sd += end;
+        f1 += end & s1;
+        f2 += end & s2;
+    }
+    if (sd > S - S / 16) return ~std::size_t(0);
+    return sd + f1 * f1 / (2 * (f2 ? f2 : 1));
+}
+
 // Moderate-cardinality sort (a few hundred to ~2000 distinct keys, beyond
 // the <= 32-key vector counter): one read-only pass counts bit patterns in
 // an open-addressing table, then the distinct keys are ordered by radix key
@@ -566,73 +604,124 @@ inline bool try_hash_count_sort(T* p, std::size_t n, bool descending) {
         auto mix = [](U k, unsigned b) {
             return static_cast<std::size_t>((static_cast<std::uint64_t>(k) * 0x9E3779B97F4A7C15ull) >> (64 - b));
         };
-        {
-            // Sample gate: 256 strided keys, at most 240 distinct.
-            constexpr unsigned kSB = 10;
-            U sk[1u << kSB];
-            unsigned char used[1u << kSB] = {};
-            unsigned sd = 0;
-            for (std::size_t j = 0; j < 256; ++j) {
-                const U k = bits(p[(j * n) >> 8]);
-                std::size_t h = mix(k, kSB);
-                while (used[h] && sk[h] != k) h = (h + 1) & ((1u << kSB) - 1);
-                if (!used[h]) { used[h] = 1; sk[h] = k; ++sd; }
-            }
-            if (sd > 240) return false;
-        }
         constexpr unsigned kBits = 13;
         constexpr std::size_t kSlots = std::size_t(1) << kBits, kMask = kSlots - 1, kCap = 2048;
-        std::unique_ptr<U[]> keys(new U[kSlots]);
-        std::unique_ptr<std::uint32_t[]> cnt(new std::uint32_t[kSlots]());
+        // Estimated key count (Chao1 over a sample; larger inputs afford 512
+        // keys, which separate a long tail (zipf) from ~1500 uniform keys
+        // better than 256 do) must fit the table (3/4 of kCap) and leave
+        // enough keys per distinct value: below n/24 (8-byte) or n/32
+        // (4-byte) the cold table and the distinct-key sort cost more than
+        // the quicksort they replace.  4-byte keys also need K > n/640: the
+        // 16-lane quicksort finishes cheaply once partitions turn
+        // single-valued above its 512-key leaf (n = 200000, 256 keys: 1.4
+        // ns/key against 2.0 for the table; 447 keys -- leaf-sized values --
+        // 3.3 against 2.2).
+        const unsigned char* const raw = reinterpret_cast<const unsigned char*>(p);
+        const std::size_t est = n >= 65536 ? hash_count_sample_gate<U, 512>(raw, n)
+                                           : hash_count_sample_gate<U, 256>(raw, n);
+        const std::size_t limit = std::min<std::size_t>(kCap * 3 / 4, n / (sizeof(T) == 8 ? 24 : 32));
+        if (est > limit) return false;
+        if (sizeof(T) == 4 && est <= n / 640) return false;
+        // Tables from the thread arena (a fresh 96 KB new/delete pair per call
+        // can be trimmed back to the OS and page-faulted in again).
+        // Layout: keys | cnt | ord (Key) | vals (T) | runs | slot list.
+        constexpr std::size_t oCnt  = kSlots * sizeof(U);
+        constexpr std::size_t oOrd  = oCnt + kSlots * sizeof(std::uint32_t);
+        constexpr std::size_t oVals = oOrd + kCap * sizeof(Key);
+        constexpr std::size_t oRuns = oVals + kCap * sizeof(T);
+        constexpr std::size_t oLst  = oRuns + kCap * sizeof(std::uint32_t);
+        ScratchLease<unsigned char> lease(oLst + (kCap + 1) * sizeof(std::uint16_t));
+        if (!lease.valid()) return false;
+        unsigned char* const mem = lease.get();
+        U* const keys = reinterpret_cast<U*>(mem);
+        std::uint32_t* const cnt = reinterpret_cast<std::uint32_t*>(mem + oCnt);
+        Key* const ord = reinterpret_cast<Key*>(mem + oOrd);
+        T* const vals = reinterpret_cast<T*>(mem + oVals);
+        std::uint32_t* const runs = reinterpret_cast<std::uint32_t*>(mem + oRuns);
+        std::uint16_t* const lst = reinterpret_cast<std::uint16_t*>(mem + oLst);
+        std::memset(cnt, 0, kSlots * sizeof(std::uint32_t));
         std::size_t D = 0;
         // A fixed key set stops adding keys early; a long-tailed one (zipf)
-        // keeps producing singletons.  After a prefix the Chao1 estimate
-        // D + f1^2 / (2 f2) of the total key count (f1 / f2: keys seen once /
-        // twice) must stay within the table, so a doomed pass stops early.
-        const std::size_t pre_end = std::min(n, std::max<std::size_t>(n / 64, 512));
+        // keeps producing singletons.  At checkpoints (a prefix of
+        // max(n/64, 512) keys, then each doubling up to n/4) the Chao1
+        // estimate D + f1^2 / (2 f2) of the total key count (f1 / f2: keys
+        // seen once / twice) must stay within the table, so a doomed pass
+        // stops early.  A single prefix check let borderline zipf inputs run
+        // on to the cap (~20 us at n = 20000).
+        // lst: slots in insertion order, so extraction never scans the table.
         std::size_t f1 = 0, f2 = 0;
         std::size_t i = 0;
-        for (; i < pre_end; ++i) {
-            const U k = bits(p[i]);
-            std::size_t h = mix(k, kBits);
-            while (cnt[h] != 0 && keys[h] != k) h = (h + 1) & kMask;
-            const std::uint32_t c = cnt[h];
-            if (c == 0) {
-                if (++D > kCap) return false;
+        std::size_t chk = std::min(n, std::max<std::size_t>(n / 64, 512));
+        for (;;) {
+            for (; i < chk; ++i) {
+                const U k = bits(p[i]);
+                std::size_t h = mix(k, kBits);
+                std::uint32_t c = cnt[h];
+                // Short-circuit on purpose: an empty slot's key line is
+                // never read, so first touches of the (usually cold) key
+                // table are stores, not load misses.
+                while (c != 0 && keys[h] != k) {
+                    h = (h + 1) & kMask;
+                    c = cnt[h];
+                }
+                lst[D] = static_cast<std::uint16_t>(h);
+                D += c == 0;
+                if (D > kCap) return false;            // table stays <= 1/4 full
                 keys[h] = k;
+                f1 += static_cast<std::size_t>(c == 0) - static_cast<std::size_t>(c == 1);
+                f2 += static_cast<std::size_t>(c == 1) - static_cast<std::size_t>(c == 2);
+                cnt[h] = c + 1;
             }
-            f1 += static_cast<std::size_t>(c == 0) - static_cast<std::size_t>(c == 1);
-            f2 += static_cast<std::size_t>(c == 1) - static_cast<std::size_t>(c == 2);
-            cnt[h] = c + 1;
+            if (D + f1 * f1 / (2 * (f2 ? f2 : 1)) > limit) return false;
+            if (chk >= n / 4) break;
+            chk = std::min(n / 4, chk * 2);
         }
-        if (D + f1 * f1 / (2 * (f2 ? f2 : 1)) > kCap * 3 / 4) return false;
         for (; i < n; ++i) {
             const U k = bits(p[i]);
             std::size_t h = mix(k, kBits);
             while (cnt[h] != 0 && keys[h] != k) h = (h + 1) & kMask;
             if (cnt[h] == 0) {
-                if (++D > kCap) return false;
+                if (D >= kCap) return false;
+                lst[D++] = static_cast<std::uint16_t>(h);
                 keys[h] = k;
             }
             ++cnt[h];
         }
-        struct E { Key ord; U k; std::uint32_t c; };
-        std::unique_ptr<E[]> e(new E[D]);
+        // Distinct keys in output order: radix-encode, sort the D keys (one
+        // SIMD sort when available), then decode and re-probe for the count.
+        // (A table scan plus std::sort of key/count records cost ~40 us at
+        // n = 20000, 600 keys.)
         const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
-        std::size_t m = 0;
-        for (std::size_t h = 0; h < kSlots; ++h) {
-            if (cnt[h] == 0) continue;
+        for (std::size_t t = 0; t < D; ++t) {
             T x;
-            std::memcpy(&x, &keys[h], sizeof(U));
-            e[m++] = E{static_cast<Key>(RT::encode(x) ^ flip), keys[h], cnt[h]};
+            std::memcpy(&x, &keys[lst[t]], sizeof(U));
+            ord[t] = static_cast<Key>(RT::encode(x) ^ flip);
         }
-        std::sort(e.get(), e.get() + m, [](const E& a, const E& b) { return a.ord < b.ord; });
+#if FYX_HAS_AVX512_CODE
+        if (use_avx512()) vqsort_serial<Key>(ord, D);
+        else
+#endif
+            std::sort(ord, ord + D);
+        // Decode and re-probe for counts; the probe chain from mix(k) holds
+        // only occupied slots up to k's.
+        for (std::size_t t = 0; t < D; ++t) {
+            const T x = RT::decode(static_cast<Key>(ord[t] ^ flip));
+            const U k = bits(x);
+            std::size_t h = mix(k, kBits);
+            while (keys[h] != k) h = (h + 1) & kMask;
+            vals[t] = x;
+            runs[t] = cnt[h];
+        }
+#if FYX_HAS_AVX512_CODE
+        if (use_avx512()) {
+            vfill_runs_dispatch<T, std::uint32_t>(p, n, vals, runs, D);
+            return true;
+        }
+#endif
         T* q = p;
-        for (std::size_t j = 0; j < m; ++j) {
-            T x;
-            std::memcpy(&x, &e[j].k, sizeof(U));
-            std::fill(q, q + e[j].c, x);
-            q += e[j].c;
+        for (std::size_t t = 0; t < D; ++t) {
+            std::fill(q, q + runs[t], vals[t]);
+            q += runs[t];
         }
         return true;
     }
@@ -9787,7 +9876,7 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             }
             // A few hundred to ~2000 distinct keys: hash counting.  32-bit
             // keys only from 64K up (below that the vq is as fast; measured).
-            if ((sizeof(T) == 8 || n >= 65536) && detail::try_hash_count_sort(p, n, descending)) {
+            if (detail::try_hash_count_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::LowCardinality);
                 return;
             }

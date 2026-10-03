@@ -603,6 +603,41 @@ static void run_new_small_paths(const char* tname) {
             }
         }
     }
+    // 7. hash counting entry points directly: gate boundaries (n/24, n/32,
+    //    n/640 for 4-byte keys), single-copy keys at both ends (the run fill
+    //    trims only the final run), block-clustered inputs that pass the
+    //    block sample but hold many keys (must decline untouched).
+    for (std::size_t n : {std::size_t(4096), std::size_t(20000), std::size_t(200000)}) {
+        for (int K : {150, 200, 300, 333, 400, 600, 700, 800, 1300}) {
+            for (int variant = 0; variant < 3; ++variant) {
+                std::vector<T> vals(K);
+                for (int j = 0; j < K; ++j) vals[j] = from_u64<T>(rng());
+                if (std::is_floating_point<T>::value && K > 3) {
+                    vals[0] = -T(0); vals[1] = T(0); vals[2] = std::numeric_limits<T>::quiet_NaN();
+                }
+                std::vector<T> v(n);
+                if (variant == 2) {
+                    // 64-key blocks of one value each, values all distinct
+                    for (std::size_t i = 0; i < n; ++i) v[i] = from_u64<T>((i / 64) * 0x9E3779B97F4A7C15ull + 1);
+                } else {
+                    for (std::size_t i = 0; i < n; ++i) v[i] = vals[rng() % K];
+                    if (variant == 1) {          // extreme keys present exactly once
+                        v[0] = std::numeric_limits<T>::lowest();
+                        v[n - 1] = std::numeric_limits<T>::max();
+                    }
+                }
+                for (int dir = 0; dir < 2; ++dir) {
+                    std::vector<T> s = v;
+                    const bool took = fd::try_hash_count_sort(s.data(), n, dir != 0);
+                    const bool ok = took ? sorted_ok(v, s, dir != 0) : (std::memcmp(s.data(), v.data(), n * sizeof(T)) == 0);
+                    if (!ok) std::printf("    [%s hash-direct n=%zu K=%d var=%d dir=%d took=%d]\n", tname, n, K, variant, dir, int(took));
+                    CHECK(ok, "hash-direct");
+                }
+                check_both_dirs(v, tname, "hash-gate", n, K * 10 + variant);
+                ++cases;
+            }
+        }
+    }
     std::printf("  %-8s new small-n paths ok (%d cases)\n", tname, cases);
 }
 

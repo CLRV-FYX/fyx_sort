@@ -51,6 +51,11 @@ namespace isa_avx512 {
 // FYX_VQ_COMPRESS_TO_MEMORY=0 selects register-form compress + masked store:
 // the memory form is microcoded on AMD Zen 4, but on Ice Lake-SP the register
 // form measured ~15% slower, so the memory form stays the default.
+// vfpclass categories whose hardware order differs from the radix total
+// order: QNaN (0x01), -0 (0x04), SNaN (0x80).  One instruction instead of an
+// unordered compare plus a -0 bit compare.
+constexpr int kFpClassUnclean = 0x01 | 0x04 | 0x80;
+
 FYX_FORCE_INLINE std::uint64_t bzhi_mask(unsigned c) {
     return c >= 64 ? ~0ull : ((1ull << c) - 1ull);
 }
@@ -821,11 +826,9 @@ FYX_FORCE_INLINE std::uint64_t vbad_lanes(typename VOps<T>::reg v) {
         (void)v;
         return 0;
     } else if constexpr (sizeof(T) == 4) {
-        return static_cast<std::uint64_t>(_mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q) |
-            _mm512_cmpeq_epi32_mask(_mm512_castps_si512(v), _mm512_set1_epi32(static_cast<int>(0x80000000u))));
+        return static_cast<std::uint64_t>(_mm512_fpclass_ps_mask(v, kFpClassUnclean));
     } else {
-        return static_cast<std::uint64_t>(_mm512_cmp_pd_mask(v, v, _CMP_UNORD_Q) |
-            _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(v), _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ull))));
+        return static_cast<std::uint64_t>(_mm512_fpclass_pd_mask(v, kFpClassUnclean));
     }
 }
 
@@ -1039,37 +1042,31 @@ inline bool vrange_clean(const T* a, std::size_t n) {
     } else if constexpr (sizeof(T) == 4) {
         const std::size_t V = 16;
         __mmask16 bad = 0;
-        const __m512i negzero = _mm512_set1_epi32(static_cast<int>(0x80000000u));
         std::size_t i = 0;
         for (; i + V <= n; i += V) {
             const __m512 v = _mm512_loadu_ps(a + i);
-            bad = static_cast<__mmask16>(bad | _mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q));
-            bad = static_cast<__mmask16>(bad | _mm512_cmpeq_epi32_mask(_mm512_castps_si512(v), negzero));
+            bad = static_cast<__mmask16>(bad | _mm512_fpclass_ps_mask(v, kFpClassUnclean));
             if (bad) return false;
         }
         if (i < n) {
             const __mmask16 k = static_cast<__mmask16>((1u << (n - i)) - 1u);
             const __m512 v = _mm512_maskz_loadu_ps(k, a + i);
-            bad = static_cast<__mmask16>(bad | (k & _mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q)));
-            bad = static_cast<__mmask16>(bad | (k & _mm512_cmpeq_epi32_mask(_mm512_castps_si512(v), negzero)));
+            bad = static_cast<__mmask16>(bad | (k & _mm512_fpclass_ps_mask(v, kFpClassUnclean)));
         }
         return bad == 0;
     } else {
         const std::size_t V = 8;
         __mmask8 bad = 0;
-        const __m512i negzero = _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ull));
         std::size_t i = 0;
         for (; i + V <= n; i += V) {
             const __m512d v = _mm512_loadu_pd(a + i);
-            bad = static_cast<__mmask8>(bad | _mm512_cmp_pd_mask(v, v, _CMP_UNORD_Q));
-            bad = static_cast<__mmask8>(bad | _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(v), negzero));
+            bad = static_cast<__mmask8>(bad | _mm512_fpclass_pd_mask(v, kFpClassUnclean));
             if (bad) return false;
         }
         if (i < n) {
             const __mmask8 k = static_cast<__mmask8>((1u << (n - i)) - 1u);
             const __m512d v = _mm512_maskz_loadu_pd(k, a + i);
-            bad = static_cast<__mmask8>(bad | (k & _mm512_cmp_pd_mask(v, v, _CMP_UNORD_Q)));
-            bad = static_cast<__mmask8>(bad | (k & _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(v), negzero)));
+            bad = static_cast<__mmask8>(bad | (k & _mm512_fpclass_pd_mask(v, kFpClassUnclean)));
         }
         return bad == 0;
     }
@@ -1079,13 +1076,9 @@ template <class T>
 FYX_FORCE_INLINE typename VOps<T>::mask vunclean_lanes(typename VOps<T>::reg v) {
     using M = typename VOps<T>::mask;
     if constexpr (std::is_same<T, float>::value) {
-        return static_cast<M>(_mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q) |
-                              _mm512_cmpeq_epi32_mask(_mm512_castps_si512(v),
-                                                      _mm512_set1_epi32(static_cast<int>(0x80000000u))));
+        return static_cast<M>(_mm512_fpclass_ps_mask(v, kFpClassUnclean));
     } else if constexpr (std::is_same<T, double>::value) {
-        return static_cast<M>(_mm512_cmp_pd_mask(v, v, _CMP_UNORD_Q) |
-                              _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(v),
-                                                      _mm512_set1_epi64(static_cast<long long>(0x8000000000000000ull))));
+        return static_cast<M>(_mm512_fpclass_pd_mask(v, kFpClassUnclean));
     } else {
         (void)v;
         return 0;
@@ -1401,6 +1394,29 @@ inline void vfill(T* p, std::size_t n, T x) {
     for (; i < n; ++i) p[i] = x;
 }
 
+/// Writes runs vals[t] x cnt[t] back to back from p (sum of cnt = n).  Each
+/// run is stored in whole vectors that may spill into the next run's slots
+/// (the next run overwrites them); only the final run is trimmed to p + n.
+/// One loop exit per run instead of a vector loop plus a scalar tail.
+template <class T, class C>
+inline void vfill_runs(T* p, std::size_t n, const T* vals, const C* cnt, std::size_t m) {
+    constexpr std::size_t V = 64 / sizeof(T);
+    T* const end = p + n;
+    for (std::size_t t = 0; t < m; ++t) {
+        __m512i v;
+        if constexpr (sizeof(T) == 8) { std::uint64_t b; std::memcpy(&b, &vals[t], 8); v = _mm512_set1_epi64(static_cast<long long>(b)); }
+        else { std::uint32_t b; std::memcpy(&b, &vals[t], 4); v = _mm512_set1_epi32(static_cast<int>(b)); }
+        T* const stop = p + cnt[t];
+        if (static_cast<std::size_t>(end - p) >= V + static_cast<std::size_t>(stop - p)) {
+            T* q = p;
+            do { _mm512_storeu_si512(reinterpret_cast<void*>(q), v); q += V; } while (q < stop);
+        } else {
+            vfill(p, static_cast<std::size_t>(stop - p), vals[t]);
+        }
+        p = stop;
+    }
+}
+
 // Vector helpers as plain functions: a lambda returning __m512i gets no
 // target attribute from the ISA pragma and trips -Wpsabi in generic builds.
 template <class U>
@@ -1702,6 +1718,11 @@ template <class T>
 inline unsigned vqsort_small_prescan(const T* p, std::size_t n) {
     if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; return 4u; }
     else return isa_avx512::vsmall_prescan<T>(p, n);
+}
+
+template <class T, class C>
+inline void vfill_runs_dispatch(T* p, std::size_t n, const T* vals, const C* cnt, std::size_t m) {
+    isa_avx512::vfill_runs<T, C>(p, n, vals, cnt, m);
 }
 
 /// Depth budget: 2 log2(n) partitions is what a correct pivot stream needs;
