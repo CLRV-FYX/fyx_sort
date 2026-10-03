@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <random>
 #include <string>
@@ -532,6 +533,175 @@ static void check_round_strings() {
     }
 }
 
+
+// 16-byte records keyed by a 64-bit field: the AVX-512 in-place record
+// quicksort (early route + counting / radix hooks).  Every key layout and
+// signedness, both orders, tie-breaking comparators (the cache-hot proofs
+// must reject and fall back), and every shape at several sizes.
+struct KvLo  { std::uint64_t key; std::uint64_t val; };
+struct KvHiS { std::uint64_t val; std::int64_t key; };
+struct KvMix { std::int64_t key; double w; };
+
+template <class R, class Comp>
+static void kv16_case(const char* name, std::vector<R> v, Comp comp, bool full_order, bool par = false) {
+    std::vector<R> ref = v;
+    std::stable_sort(ref.begin(), ref.end(), comp);
+    fyx::Options o; o.parallel = par ? fyx::Tri::On : fyx::Tri::Off;
+    fyx::sort(v.data(), v.size(), comp, o);
+    CHECK(std::is_sorted(v.begin(), v.end(), comp), name);
+    if (full_order) {
+        bool same = v.size() == ref.size();
+        for (std::size_t i = 0; same && i < v.size(); ++i) same = std::memcmp(&v[i], &ref[i], sizeof(R)) == 0;
+        CHECK(same, name);
+    } else {
+        // Same multiset: compare after a total-order sort of both.
+        auto tot = [](const R& a, const R& b) { return std::memcmp(&a, &b, sizeof(R)) < 0; };
+        std::sort(v.begin(), v.end(), tot);
+        std::sort(ref.begin(), ref.end(), tot);
+        bool same = true;
+        for (std::size_t i = 0; same && i < v.size(); ++i) same = std::memcmp(&v[i], &ref[i], sizeof(R)) == 0;
+        CHECK(same, name);
+    }
+}
+
+
+// Structured record shapes through the comparator paths: organ pipes (both
+// directions, ties, both merge kernels), sparse nearly-sorted (insertion
+// repair's block skip), sorted / reverse exits (block scans) -- each checked
+// for order and for being a permutation of the input.
+struct RecS { std::uint64_t val; std::int64_t key; };
+static void rec_check(const char* name, std::vector<RecS> v, bool desc, bool par) {
+    std::vector<RecS> in = v;
+    fyx::Options o; o.parallel = par ? fyx::Tri::On : fyx::Tri::Off;
+    if (desc) fyx::sort(v.data(), v.size(), [](const RecS& a, const RecS& b) { return b.key < a.key; }, o);
+    else      fyx::sort(v.data(), v.size(), [](const RecS& a, const RecS& b) { return a.key < b.key; }, o);
+    bool ok = true;
+    for (std::size_t i = 1; i < v.size() && ok; ++i)
+        ok = desc ? !(v[i - 1].key < v[i].key) : !(v[i].key < v[i - 1].key);
+    auto full = [](const RecS& a, const RecS& b) { return a.key != b.key ? a.key < b.key : a.val < b.val; };
+    std::sort(in.begin(), in.end(), full);
+    std::vector<RecS> w = v;
+    std::sort(w.begin(), w.end(), full);
+    for (std::size_t i = 0; i < w.size() && ok; ++i) ok = w[i].key == in[i].key && w[i].val == in[i].val;
+    CHECK(ok, name);
+}
+static void check_record_structured() {
+    std::mt19937_64 rng(77);
+    for (std::size_t n : {5000ul, 100000ul, 300001ul}) {
+        for (int shape = 0; shape < 4; ++shape) {
+            // shape 0: asc then desc; 1: desc then asc; 2/3: same with ties.
+            const std::size_t split = n / 3 + (rng() % (n / 3));
+            std::vector<RecS> v(n);
+            const int step = shape >= 2 ? 0 : 1;
+            for (std::size_t i = 0; i < n; ++i) {
+                std::int64_t k;
+                if (i < split) k = static_cast<std::int64_t>(i);
+                else           k = static_cast<std::int64_t>(n - i) + static_cast<std::int64_t>(rng() % 3) - 1;
+                if (step == 0) k /= 4;
+                if (shape & 1) k = -k;
+                v[i] = {rng(), k};
+            }
+            // keep the runs monotone after the jitter
+            if (shape & 1) { std::sort(v.begin(), v.begin() + split, [](const RecS& a, const RecS& b) { return a.key > b.key; });
+                             std::sort(v.begin() + split, v.end(), [](const RecS& a, const RecS& b) { return a.key < b.key; }); }
+            else           { std::sort(v.begin(), v.begin() + split, [](const RecS& a, const RecS& b) { return a.key < b.key; });
+                             std::sort(v.begin() + split, v.end(), [](const RecS& a, const RecS& b) { return a.key > b.key; }); }
+            rec_check("organ asc", v, false, false);
+            rec_check("organ desc", v, true, false);
+            rec_check("organ asc par", v, false, true);
+        }
+        std::vector<RecS> s(n);
+        for (std::size_t i = 0; i < n; ++i) s[i] = {rng(), static_cast<std::int64_t>(i / 3)};
+        rec_check("sorted", s, false, false);
+        rec_check("sorted as desc", s, true, false);
+        std::vector<RecS> nearly = s;
+        for (int k = 0; k < 200; ++k) {
+            const std::size_t i = rng() % (n - 50);
+            std::swap(nearly[i], nearly[i + 1 + rng() % 40]);
+        }
+        rec_check("nearly", nearly, false, false);
+        rec_check("nearly par", nearly, false, true);
+        std::vector<RecS> late = s;
+        std::swap(late[n - 2], late[n - 1000]);
+        rec_check("sorted late break", late, false, false);
+        std::reverse(late.begin(), late.end());
+        rec_check("reverse late break", late, true, false);
+        rec_check("reverse late break as asc", late, false, false);
+    }
+}
+
+static void check_kv16_vqsort() {
+    std::mt19937_64 g(77);
+    const std::size_t sizes[] = {2049, 4096, 33333, 100000, 300000};
+    for (std::size_t n : sizes) {
+        for (int shape = 0; shape < 8; ++shape) {
+            auto key = [&](std::size_t i) -> std::uint64_t {
+                switch (shape) {
+                    case 0: return g();                                   // random
+                    case 1: return g() % 16;                              // few16
+                    case 2: return (g() % 256) * 0x9E3779B97F4A7C15ull;   // sparse 256
+                    case 3: return g() % 1000;                            // sqrt-ish
+                    case 4: return 42;                                    // all equal
+                    case 5: { const std::uint64_t r = g(); return (r & 7) ? r % 64 : r; }  // skewed
+                    case 6: return (i % 300) * 1000 + g() % 7;            // short runs-ish
+                    default: return (g() % 3) ? 0x8000000000000000ull + g() % 50 : g() % 50; // sign-mixed
+                }
+            };
+            std::vector<KvLo> lo(n);
+            std::vector<KvHiS> hi(n);
+            std::vector<KvMix> mx(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::uint64_t k = key(i);
+                lo[i] = KvLo{k, i};
+                hi[i] = KvHiS{i, static_cast<std::int64_t>(k)};
+                mx[i] = KvMix{static_cast<std::int64_t>(k), static_cast<double>(i) * 0.5};
+            }
+            kv16_case("kv16 lo asc", lo, [](const KvLo& a, const KvLo& b) { return a.key < b.key; }, false);
+            kv16_case("kv16 lo desc", lo, [](const KvLo& a, const KvLo& b) { return b.key < a.key; }, false);
+            kv16_case("kv16 hi signed asc", hi, [](const KvHiS& a, const KvHiS& b) { return a.key < b.key; }, false);
+            kv16_case("kv16 hi signed desc", hi, [](const KvHiS& a, const KvHiS& b) { return b.key < a.key; }, false);
+            kv16_case("kv16 mixed payload", mx, [](const KvMix& a, const KvMix& b) { return a.key < b.key; }, false);
+            // Tie-breaking comparators: key order is necessary but not
+            // sufficient, so every equal-key range must be caught.
+            kv16_case("kv16 lo tiebreak", lo, [](const KvLo& a, const KvLo& b) {
+                return a.key != b.key ? a.key < b.key : a.val < b.val; }, true);
+            kv16_case("kv16 hi tiebreak desc", hi, [](const KvHiS& a, const KvHiS& b) {
+                return a.key != b.key ? b.key < a.key : a.val > b.val; }, true);
+            if (n >= 100000) {
+                kv16_case("kv16 lo asc par", lo, [](const KvLo& a, const KvLo& b) { return a.key < b.key; }, false, true);
+                kv16_case("kv16 hi signed desc par", hi, [](const KvHiS& a, const KvHiS& b) { return b.key < a.key; }, false, true);
+                kv16_case("kv16 lo tiebreak par", lo, [](const KvLo& a, const KvLo& b) {
+                    return a.key != b.key ? a.key < b.key : a.val < b.val; }, true, true);
+            }
+        }
+    }
+    // Kernel called directly: budget exhaustion and fin rejection leave a
+    // permutation; success leaves key order.
+#if FYX_HAS_AVX512_CODE
+    if (fyx::detail::use_avx512()) {
+        struct Fin {
+            bool reject = false;
+            bool verify(std::size_t, std::size_t, bool) { return !reject; }
+            void seam(std::size_t) {}
+            bool operator()(std::size_t, std::size_t) { return !reject; }
+        };
+        for (int rej = 0; rej < 2; ++rej) {
+            std::vector<KvLo> v(50000);
+            for (std::size_t i = 0; i < v.size(); ++i) v[i] = KvLo{g() % 5000, i};
+            std::vector<KvLo> w = v;
+            Fin fin; fin.reject = rej != 0;
+            const bool ok = fyx::detail::kv16_vqsort(w.data(), w.size(), false, false, fin);
+            CHECK(ok == !fin.reject, "kv16_vqsort result flag");
+            std::uint64_t s1 = 0, s2 = 0;
+            for (std::size_t i = 0; i < v.size(); ++i) { s1 += v[i].key * 31 + v[i].val; s2 += w[i].key * 31 + w[i].val; }
+            CHECK(s1 == s2, "kv16_vqsort keeps the multiset");
+            if (ok) CHECK(std::is_sorted(w.begin(), w.end(), [](const KvLo& a, const KvLo& b) { return a.key < b.key; }),
+                          "kv16_vqsort key order");
+        }
+    }
+#endif
+}
+
 int main() {
     std::printf("adaptive: public entry point, every shape\n");
     check_shapes<std::int32_t>("int32", 300000, nullptr);
@@ -561,6 +731,8 @@ int main() {
     check_round_records();
     check_round_extract_and_chunks();
     check_round_strings();
+    check_kv16_vqsort();
+    check_record_structured();
 
     std::printf("checks=%d failures=%d\n", checks, failures);
     if (failures == 0) { std::printf("ALL ADAPTIVE TESTS PASS\n"); return 0; }

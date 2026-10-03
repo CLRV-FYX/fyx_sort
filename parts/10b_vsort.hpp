@@ -1555,6 +1555,381 @@ inline std::size_t vdescent_positions(const T* p, std::size_t from, std::size_t 
     return d;
 }
 
+
+// ---------------------------------------------------------------------------
+// 16-byte record quicksort (key-value records keyed by one 64-bit field at
+// byte offset 0 or 8).  The same partition as vpartition, run on 64-bit lanes
+// with *pair* masks: the key lane's compare bit is copied onto its payload
+// lane, so one compress-store moves whole records.  Duplicate-heavy inputs
+// finish without leaves (a range whose min key equals its max key is done),
+// which is where the out-of-place counting / radix record paths -- two or
+// more full read+write passes plus a copy back -- lose to vqsort's K64V64.
+// Leaves (<= 32 records) are scalar insertion sorts.
+// ---------------------------------------------------------------------------
+template <bool KeyHi, bool Signed>
+struct KvOps {
+    static constexpr unsigned KM = KeyHi ? 0xAAu : 0x55u;
+    FYX_FORCE_INLINE static __mmask8 pair(__mmask8 m) {
+        const unsigned k = static_cast<unsigned>(m) & KM;
+        return static_cast<__mmask8>(KeyHi ? (k | (k >> 1)) : (k | (k << 1)));
+    }
+    FYX_FORCE_INLINE static __mmask8 ge(__m512i a, __m512i b) {
+        if constexpr (Signed) return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_NLT);
+        else                  return _mm512_cmp_epu64_mask(a, b, _MM_CMPINT_NLT);
+    }
+    FYX_FORCE_INLINE static __mmask8 gt(__m512i a, __m512i b) {
+        if constexpr (Signed) return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_NLE);
+        else                  return _mm512_cmp_epu64_mask(a, b, _MM_CMPINT_NLE);
+    }
+    FYX_FORCE_INLINE static __mmask8 ge_k(__mmask8 k, __m512i a, __m512i b) {
+        if constexpr (Signed) return _mm512_mask_cmp_epi64_mask(k, a, b, _MM_CMPINT_NLT);
+        else                  return _mm512_mask_cmp_epu64_mask(k, a, b, _MM_CMPINT_NLT);
+    }
+    FYX_FORCE_INLINE static __mmask8 gt_k(__mmask8 k, __m512i a, __m512i b) {
+        if constexpr (Signed) return _mm512_mask_cmp_epi64_mask(k, a, b, _MM_CMPINT_NLE);
+        else                  return _mm512_mask_cmp_epu64_mask(k, a, b, _MM_CMPINT_NLE);
+    }
+    FYX_FORCE_INLINE static __m512i vmin(__m512i s, __mmask8 k, __m512i a) {
+        if constexpr (Signed) return _mm512_mask_min_epi64(s, k, s, a);
+        else                  return _mm512_mask_min_epu64(s, k, s, a);
+    }
+    FYX_FORCE_INLINE static __m512i vmax(__m512i s, __mmask8 k, __m512i a) {
+        if constexpr (Signed) return _mm512_mask_max_epi64(s, k, s, a);
+        else                  return _mm512_mask_max_epu64(s, k, s, a);
+    }
+    FYX_FORCE_INLINE static std::uint64_t rmin(__m512i v) {
+        if constexpr (Signed) return static_cast<std::uint64_t>(_mm512_reduce_min_epi64(v));
+        else                  return _mm512_reduce_min_epu64(v);
+    }
+    FYX_FORCE_INLINE static std::uint64_t rmax(__m512i v) {
+        if constexpr (Signed) return static_cast<std::uint64_t>(_mm512_reduce_max_epi64(v));
+        else                  return _mm512_reduce_max_epu64(v);
+    }
+    static constexpr std::uint64_t hi() { return Signed ? 0x7fffffffffffffffull : ~0ull; }
+    static constexpr std::uint64_t lo() { return Signed ? 0x8000000000000000ull : 0ull; }
+    FYX_FORCE_INLINE static bool lt(std::uint64_t x, std::uint64_t y) {
+        if constexpr (Signed) return static_cast<std::int64_t>(x) < static_cast<std::int64_t>(y);
+        else                  return x < y;
+    }
+    FYX_FORCE_INLINE static std::uint64_t key(const std::uint64_t* a, std::size_t i) {
+        std::uint64_t k;
+        std::memcpy(&k, a + 2 * i + (KeyHi ? 1 : 0), 8);
+        return k;
+    }
+    FYX_FORCE_INLINE static void cstore(std::uint64_t* p, __mmask8 m, __m512i v) {
+#if FYX_VQ_COMPRESS_TO_MEMORY
+        _mm512_mask_compressstoreu_epi64(p, m, v);
+#else
+        _mm512_mask_storeu_epi64(p, static_cast<__mmask8>(bzhi_mask(popcount64(static_cast<std::uint64_t>(m)))),
+                                 _mm512_maskz_compress_epi64(m, v));
+#endif
+    }
+};
+
+struct KvRec { std::uint64_t w[2]; };
+#ifndef FYX_KVQ_LEAF
+#  define FYX_KVQ_LEAF 64
+#endif
+static_assert(FYX_KVQ_LEAF <= 64, "kv_leaf packs a 6-bit record index");
+
+template <bool KeyHi, bool Signed, bool Strict>
+FYX_FORCE_INLINE void kv_part_vec(std::uint64_t* a, std::size_t& ls, std::size_t& rs, __m512i cur,
+                                  __m512i pv, __m512i& vmn, __mmask8 valid) {
+    using O = KvOps<KeyHi, Signed>;
+    const __mmask8 hm = static_cast<__mmask8>(O::pair(Strict ? O::gt(cur, pv) : O::ge(cur, pv)) & valid);
+    const __mmask8 lm = static_cast<__mmask8>(~hm & valid);
+    const unsigned gc = static_cast<unsigned>(popcount64(hm));
+    const unsigned lc = static_cast<unsigned>(popcount64(lm));
+    O::cstore(a + ls, lm, cur);
+    O::cstore(a + rs - gc, hm, cur);
+    ls += lc;
+    rs -= gc;
+    vmn = O::vmin(vmn, static_cast<__mmask8>(O::KM & valid), cur);
+}
+
+/// Record permutation indexed by the even-lane "goes high" bits of a compare
+/// mask (bit 2r: record r): low records first, then high records, each in
+/// original order.  Only the 16 rows with even bits are used, so the direct
+/// index costs no bit gathering (pext is not in the AVX-512 target set).
+struct KvPermTable {
+    alignas(64) std::int64_t idx[86][8];
+    constexpr KvPermTable() : idx{} {
+        for (int m = 0; m < 86; ++m) {
+            int o = 0;
+            for (int pass = 0; pass < 2; ++pass)
+                for (int r = 0; r < 4; ++r)
+                    if (((m >> (2 * r)) & 1) == pass) { idx[m][o++] = 2 * r; idx[m][o++] = 2 * r + 1; }
+        }
+    }
+};
+inline constexpr KvPermTable kKvPerm{};
+
+/// Unmasked variant for the partition main loop: one permute, two full
+/// stores (callers guarantee >= 8 lanes of already-read slack on each side).
+template <bool KeyHi, bool Signed, bool Strict>
+FYX_FORCE_INLINE void kv_part_vec_full(std::uint64_t* a, std::size_t& ls, std::size_t& rs, __m512i cur,
+                                       __m512i pv, __m512i& vmn) {
+    using O = KvOps<KeyHi, Signed>;
+    const __mmask8 km = static_cast<__mmask8>(O::KM);
+    unsigned m = static_cast<unsigned>(Strict ? O::gt_k(km, cur, pv) : O::ge_k(km, cur, pv));
+    if constexpr (KeyHi) m >>= 1;
+    const __m512i perm = _mm512_permutexvar_epi64(_mm512_load_si512(kKvPerm.idx[m]), cur);
+    const unsigned gc = 2u * static_cast<unsigned>(popcount64(m));
+    _mm512_storeu_si512(a + ls, perm);
+    _mm512_storeu_si512(a + rs - 8, perm);
+    ls += 8u - gc;
+    rs -= gc;
+    vmn = O::vmin(vmn, static_cast<__mmask8>(O::KM), cur);
+}
+
+template <bool KeyHi, bool Signed, bool Strict>
+inline std::size_t kv_partition_scalar(std::uint64_t* a, std::size_t nr, std::uint64_t pivot,
+                                       std::uint64_t& kmin) {
+    using O = KvOps<KeyHi, Signed>;
+    std::uint64_t mn = O::hi();
+    for (std::size_t i = 0; i < nr; ++i) {
+        const std::uint64_t k = O::key(a, i);
+        mn = O::lt(k, mn) ? k : mn;
+    }
+    std::size_t i = 0, j = nr;
+    while (i < j) {
+        const std::uint64_t k = O::key(a, i);
+        const bool low = Strict ? !O::lt(pivot, k) : O::lt(k, pivot);
+        if (low) { ++i; continue; }
+        --j;
+        KvRec x, y;
+        std::memcpy(&x, a + 2 * i, 16);
+        std::memcpy(&y, a + 2 * j, 16);
+        std::memcpy(a + 2 * i, &y, 16);
+        std::memcpy(a + 2 * j, &x, 16);
+    }
+    kmin = mn;
+    return i;
+}
+
+/// Partition records a[0, nr) (2*nr lanes): key < pivot (Strict: key <= pivot)
+/// to the front; returns that record count.  kmin: the smallest key.
+template <bool KeyHi, bool Signed, bool Strict>
+inline std::size_t kv_partition(std::uint64_t* a, std::size_t nr, std::uint64_t pivot,
+                                std::uint64_t& kmin) {
+    using O = KvOps<KeyHi, Signed>;
+    constexpr std::size_t V = 8, U = 4, CH = U * V;
+    const std::size_t n = 2 * nr;
+    if (n < 2 * CH) return kv_partition_scalar<KeyHi, Signed, Strict>(a, nr, pivot, kmin);
+    const __m512i pv = _mm512_set1_epi64(static_cast<long long>(pivot));
+    __m512i vmn = _mm512_set1_epi64(static_cast<long long>(O::hi()));
+    std::size_t l = 0, r = n, ls = 0, rs = n;
+    __m512i vl[U], vr[U];
+    for (std::size_t i = 0; i < U; ++i) vl[i] = _mm512_loadu_si512(a + i * V);
+    for (std::size_t i = 0; i < U; ++i) vr[i] = _mm512_loadu_si512(a + n - (i + 1) * V);
+    l += CH;
+    r -= CH;
+    while (r - l >= CH) {
+        // A real branch, not a select: the next loads then issue on the
+        // predicted side instead of waiting on this iteration's counts.
+        __m512i cur[U];
+        if ((rs - r) < (l - ls)) {
+            r -= CH;
+            for (std::size_t i = 0; i < U; ++i) cur[i] = _mm512_loadu_si512(a + r + i * V);
+        } else {
+            for (std::size_t i = 0; i < U; ++i) cur[i] = _mm512_loadu_si512(a + l + i * V);
+            l += CH;
+        }
+        for (std::size_t i = 0; i < U; ++i)
+            kv_part_vec_full<KeyHi, Signed, Strict>(a, ls, rs, cur[i], pv, vmn);
+    }
+    while (r - l >= V) {
+        const bool from_right = (rs - r) < (l - ls);
+        const std::size_t src = from_right ? (r - V) : l;
+        const __m512i cur = _mm512_loadu_si512(a + src);
+        r -= from_right ? V : 0;
+        l += from_right ? 0 : V;
+        kv_part_vec_full<KeyHi, Signed, Strict>(a, ls, rs, cur, pv, vmn);
+    }
+    if (r != l) {
+        const __mmask8 valid = static_cast<__mmask8>((1u << (r - l)) - 1u);
+        const __m512i cur = _mm512_maskz_loadu_epi64(valid, a + l);
+        kv_part_vec<KeyHi, Signed, Strict>(a, ls, rs, cur, pv, vmn, valid);
+    }
+    for (std::size_t i = 0; i < U; ++i) kv_part_vec<KeyHi, Signed, Strict>(a, ls, rs, vl[i], pv, vmn, 0xFF);
+    for (std::size_t i = 0; i < U; ++i) kv_part_vec<KeyHi, Signed, Strict>(a, ls, rs, vr[i], pv, vmn, 0xFF);
+    kmin = O::rmin(vmn);
+    return ls / 2;
+}
+
+template <bool KeyHi, bool Signed>
+inline void kv_insertion(std::uint64_t* a, std::size_t nr) {
+    using O = KvOps<KeyHi, Signed>;
+    for (std::size_t i = 1; i < nr; ++i) {
+        const std::uint64_t k = O::key(a, i);
+        if (!O::lt(k, O::key(a, i - 1))) continue;
+        KvRec x;
+        std::memcpy(&x, a + 2 * i, 16);
+        std::size_t j = i;
+        do { std::memmove(a + 2 * j, a + 2 * (j - 1), 16); --j; }
+        while (j > 0 && O::lt(k, O::key(a, j - 1)));
+        std::memcpy(a + 2 * j, &x, 16);
+    }
+}
+
+/// Uniform-sample check: 1 when every key in records [lo, lo + nr) equals
+/// `key` and fin proved the range, 2 when fin rejected it, 0 when some key
+/// differs.  Read-only, block by block, with fin.verify run on each block
+/// while it is in L1 (one memory pass for both proofs).
+template <bool KeyHi, bool Signed, class Fin>
+inline int kv_all_equal_fin(const std::uint64_t* base, std::size_t lo, std::size_t nr, std::uint64_t key,
+                            Fin& fin) {
+    using O = KvOps<KeyHi, Signed>;
+    const __m512i kv = _mm512_set1_epi64(static_cast<long long>(key));
+    const __mmask8 km = static_cast<__mmask8>(O::KM);
+    constexpr std::size_t B = 128;                       // records per block
+    bool ok = true;
+    for (std::size_t b = 0; b < nr; b += B) {
+        const std::size_t e = nr - b < B ? nr : b + B;
+        const std::uint64_t* a = base + 2 * (lo + b);
+        const std::size_t n = 2 * (e - b);
+        std::size_t i = 0;
+        __mmask8 d = 0;
+        for (; i + 32 <= n; i += 32) {
+            d |= _mm512_mask_cmpneq_epi64_mask(km, _mm512_loadu_si512(a + i), kv);
+            d |= _mm512_mask_cmpneq_epi64_mask(km, _mm512_loadu_si512(a + i + 8), kv);
+            d |= _mm512_mask_cmpneq_epi64_mask(km, _mm512_loadu_si512(a + i + 16), kv);
+            d |= _mm512_mask_cmpneq_epi64_mask(km, _mm512_loadu_si512(a + i + 24), kv);
+        }
+        for (; i < n; i += 8) {
+            const std::size_t m = n - i < 8 ? n - i : 8;
+            const __mmask8 v = static_cast<__mmask8>((1u << m) - 1u);
+            d |= _mm512_mask_cmpneq_epi64_mask(static_cast<__mmask8>(km & v), _mm512_maskz_loadu_epi64(v, a + i), kv);
+        }
+        if (d != 0) return 0;
+        ok &= fin.verify(lo + b, e - b, b != 0);
+    }
+    if (!ok) return 2;
+    fin.seam(lo);
+    return 1;
+}
+
+/// Pivot by sample rank (after vqsort's PivotRank): keys equal to the pivot
+/// go low, so the pivot is never the largest sample, and between the median
+/// and the previous distinct sample the better-balanced split wins.
+/// uniform: every sample equal (pivot is that key).
+/// Leaf sort for nr <= 64 records: keys rebased to the leaf minimum and
+/// packed with the record index ((key - min) << 6 | i) sort as plain u64 in a
+/// register network, then one gather pass places the records.  Falls back to
+/// insertion when the leaf's key span needs more than 58 bits.
+template <bool KeyHi, bool Signed>
+inline void kv_leaf(std::uint64_t* a, std::size_t nr) {
+    using O = KvOps<KeyHi, Signed>;
+    if (nr < 2) return;
+    constexpr std::uint64_t flip = Signed ? 0x8000000000000000ull : 0ull;
+    alignas(64) std::uint64_t k[64];
+    std::uint64_t mn = ~0ull, mx = 0;
+    for (std::size_t i = 0; i < nr; ++i) {
+        const std::uint64_t u = O::key(a, i) ^ flip;
+        k[i] = u;
+        mn = u < mn ? u : mn;
+        mx = u > mx ? u : mx;
+    }
+    if (mx - mn >= (1ull << 58)) { kv_insertion<KeyHi, Signed>(a, nr); return; }
+    for (std::size_t i = 0; i < nr; ++i) k[i] = ((k[i] - mn) << 6) | i;
+    vnet_sort<std::uint64_t>(k, nr);
+    alignas(64) std::uint64_t tmp[128];
+    std::memcpy(tmp, a, nr * 16);
+    for (std::size_t j = 0; j < nr; ++j) {
+        const std::size_t i = static_cast<std::size_t>(k[j] & 63u);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(a + 2 * j),
+                         _mm_load_si128(reinterpret_cast<const __m128i*>(tmp + 2 * i)));
+    }
+}
+
+template <bool KeyHi, bool Signed>
+inline std::uint64_t kv_pick_pivot(const std::uint64_t* a, std::size_t nr, bool& uniform) {
+    using O = KvOps<KeyHi, Signed>;
+    constexpr std::size_t SMAX = 64;
+    const std::size_t S = nr >= 2048 ? SMAX : 16;
+    alignas(64) std::uint64_t s[SMAX];
+    const std::size_t step = nr / S;
+    // Signed keys sort as unsigned with the sign bit flipped (and back).
+    constexpr std::uint64_t flip = Signed ? 0x8000000000000000ull : 0ull;
+    for (std::size_t i = 0; i < S; ++i) s[i] = O::key(a, i * step + (step >> 1)) ^ flip;
+    vnet_sort<std::uint64_t>(s, S);
+    if constexpr (Signed) for (std::size_t i = 0; i < S; ++i) s[i] ^= flip;
+    uniform = s[0] == s[S - 1];
+    if (uniform) return s[0];
+    const std::size_t mid = S / 2;
+    std::size_t prev = mid;
+    while (prev > 0 && s[prev - 1] == s[mid]) --prev;
+    if (prev == 0) return s[mid];          // s[mid] is the sample minimum ...
+    --prev;                                 // last sample below the median
+    std::size_t next = mid + 1;
+    while (next < S && s[next] == s[mid]) ++next;
+    if (next == S) return s[prev];          // median is the sample maximum
+    return (next - mid) < (mid - prev) ? s[mid] : s[prev];
+}
+
+/// One quicksort step on records [lo, lo + nr) (nr > leaf size).  Returns
+/// 0: the range is final and proven; -1: fin rejected a final range; 1: one
+/// range is left, lo / nr updated; 2: split into [lo, lo + split) and
+/// [lo + split, lo + nr), both non-empty and unproven.
+template <bool KeyHi, bool Signed, class Fin>
+inline int kvq_step(std::uint64_t* base, std::size_t& lo, std::size_t& nr, std::size_t& split, Fin& fin) {
+    std::uint64_t* a = base + 2 * lo;
+    bool uniform;
+    const std::uint64_t pivot = kv_pick_pivot<KeyHi, Signed>(a, nr, uniform);
+    if (uniform) {
+        const int e = kv_all_equal_fin<KeyHi, Signed>(base, lo, nr, pivot, fin);
+        if (e != 0) return e == 1 ? 0 : -1;
+    }
+    std::uint64_t mn;
+    // Keys <= pivot low.
+    const std::size_t s = kv_partition<KeyHi, Signed, true>(a, nr, pivot, mn);
+    if (s == nr) {
+        // pivot >= every key (only via a misleading uniform sample).
+        if (mn == pivot) return fin(lo, nr) ? 0 : -1;
+        const std::size_t lt = kv_partition<KeyHi, Signed, false>(a, nr, pivot, mn);
+        if (!fin(lo + lt, nr - lt)) return -1;           // all == pivot
+        nr = lt;
+        return 1;
+    }
+    if (mn == pivot) {                                   // low side all == pivot
+        if (!fin(lo, s)) return -1;
+        lo += s;
+        nr -= s;
+        return 1;
+    }
+    split = s;
+    return 2;
+}
+
+/// false: depth budget exhausted or fin rejected a finished range (the range
+/// then holds a permutation of its input).  fin(first_record, count) is
+/// called on every final range while it is still cache-hot; it proves the
+/// adjacent pairs inside the range under the caller's comparator and records
+/// the seam at first_record.  fin.verify(first, count, with_prev) proves the
+/// pairs inside [first, first + count), plus (first - 1, first) when with_prev;
+/// fin.seam(first) records a seam.
+template <bool KeyHi, bool Signed, class Fin>
+inline bool kvq_rec(std::uint64_t* base, std::size_t lo, std::size_t nr, int budget, Fin& fin) {
+    while (nr > FYX_KVQ_LEAF) {
+        if (budget <= 0) return false;
+        --budget;
+        std::size_t split = 0;
+        const int r = kvq_step<KeyHi, Signed>(base, lo, nr, split, fin);
+        if (r == 0) return true;
+        if (r < 0) return false;
+        if (r == 1) continue;
+        if (split < nr - split) {
+            if (!kvq_rec<KeyHi, Signed>(base, lo, split, budget, fin)) return false;
+            lo += split;
+            nr -= split;
+        } else {
+            if (!kvq_rec<KeyHi, Signed>(base, lo + split, nr - split, budget, fin)) return false;
+            nr = split;
+        }
+    }
+    kv_leaf<KeyHi, Signed>(base + 2 * lo, nr);
+    return fin(lo, nr);
+}
 } // namespace isa_avx512
 } // namespace detail
 } // namespace fyx
@@ -1733,6 +2108,34 @@ inline int vqsort_budget(std::size_t n) {
     return budget;
 }
 
+/// 16-byte record quicksort entry (see isa_avx512::kvq_rec).  `p` holds nr
+/// records; the key is the 64-bit field at byte 8 (key_hi) or 0.  Ascending
+/// key order on true; on false p holds a permutation of its input.
+template <class Fin>
+inline bool kv16_vqsort_range(void* p, std::size_t lo, std::size_t nr, int budget, bool key_hi, bool is_signed,
+                              Fin& fin) {
+    std::uint64_t* a = static_cast<std::uint64_t*>(p);
+    if (key_hi) return is_signed ? isa_avx512::kvq_rec<true, true>(a, lo, nr, budget, fin)
+                                 : isa_avx512::kvq_rec<true, false>(a, lo, nr, budget, fin);
+    return is_signed ? isa_avx512::kvq_rec<false, true>(a, lo, nr, budget, fin)
+                     : isa_avx512::kvq_rec<false, false>(a, lo, nr, budget, fin);
+}
+template <class Fin>
+inline bool kv16_vqsort(void* p, std::size_t nr, bool key_hi, bool is_signed, Fin& fin) {
+    return kv16_vqsort_range(p, 0, nr, vqsort_budget(nr), key_hi, is_signed, fin);
+}
+/// One step of the record quicksort (see isa_avx512::kvq_step); nr must
+/// exceed FYX_KVQ_LEAF.
+template <class Fin>
+inline int kv16_vqsort_step(void* p, std::size_t& lo, std::size_t& nr, std::size_t& split, bool key_hi,
+                            bool is_signed, Fin& fin) {
+    std::uint64_t* a = static_cast<std::uint64_t*>(p);
+    if (key_hi) return is_signed ? isa_avx512::kvq_step<true, true>(a, lo, nr, split, fin)
+                                 : isa_avx512::kvq_step<true, false>(a, lo, nr, split, fin);
+    return is_signed ? isa_avx512::kvq_step<false, true>(a, lo, nr, split, fin)
+                     : isa_avx512::kvq_step<false, false>(a, lo, nr, split, fin);
+}
+
 template <class T>
 inline void vqsort_serial(T* p, std::size_t n) {
     if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; }
@@ -1795,6 +2198,12 @@ template <class T> inline unsigned vqsort_small_prescan(const T*, std::size_t) {
 template <class T> inline bool   vqsort_serial_checked(T*, std::size_t) { return false; }
 template <class T> inline bool   vqsort_range_clean(const T*, std::size_t) { return false; }
 inline int                       vqsort_budget(std::size_t) { return 0; }
+template <class Fin>
+inline bool                      kv16_vqsort(void*, std::size_t, bool, bool, Fin&) { return false; }
+template <class Fin>
+inline bool kv16_vqsort_range(void*, std::size_t, std::size_t, int, bool, bool, Fin&) { return false; }
+template <class Fin>
+inline int kv16_vqsort_step(void*, std::size_t&, std::size_t&, std::size_t&, bool, bool, Fin&) { return -1; }
 template <class T> inline void   vqsort_serial(T*, std::size_t) {}
 template <class T> inline void   vqsort_serial_budget(T*, std::size_t, int) {}
 template <class T> inline VqStep vqsort_partition_step(T*, std::size_t) { return VqStep{}; }

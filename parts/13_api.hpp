@@ -1162,6 +1162,53 @@ FYX_FORCE_INLINE bool fast_string_equal_value<std::string>(const std::string* p,
 #endif
 }
 
+// First descent found by the serial order exit's ascending scan, so the
+// affix weapon tried right after it (nothing in between moves elements)
+// need not rescan the ordered head.  Reset with the vq memo per top-level
+// call; consumed (cleared) by its reader; checked against (p, n).
+struct OrderBreakHint {
+    const void* p = nullptr;
+    std::size_t n = 0;
+    std::size_t head = 0;
+};
+inline OrderBreakHint& order_break_hint() noexcept {
+    static thread_local OrderBreakHint h;
+    return h;
+}
+
+// any_adjacent_pair: does pred(p[j], p[j-1]) (asc) / pred(p[j-1], p[j])
+// (!asc) hold for some j in [lo, hi)?  OR-reduced with no early exit so an
+// inlined key comparator vectorizes; the ISA-targeted copies let a portable
+// build reach 64-bit vector compares (SSE2 has none).
+#define FYX_ANY_ADJ_BODY                                                                       \
+    unsigned char bad = 0;                                                                    \
+    if (asc) for (std::size_t j = lo; j < hi; ++j) bad |= static_cast<unsigned char>(pred(p[j], p[j - 1])); \
+    else     for (std::size_t j = lo; j < hi; ++j) bad |= static_cast<unsigned char>(pred(p[j - 1], p[j])); \
+    return bad != 0;
+template <class T, class Pred>
+inline bool any_adjacent_pair_default(const T* p, std::size_t lo, std::size_t hi, Pred& pred, bool asc) {
+    FYX_ANY_ADJ_BODY
+}
+#if FYX_ARCH_X86 && FYX_GNUC_LIKE && !defined(__AVX512BW__)
+template <class T, class Pred>
+FYX_TARGET_AVX512 bool any_adjacent_pair_avx512(const T* p, std::size_t lo, std::size_t hi, Pred& pred, bool asc) {
+    FYX_ANY_ADJ_BODY
+}
+template <class T, class Pred>
+FYX_TARGET_AVX2 bool any_adjacent_pair_avx2(const T* p, std::size_t lo, std::size_t hi, Pred& pred, bool asc) {
+    FYX_ANY_ADJ_BODY
+}
+#endif
+#undef FYX_ANY_ADJ_BODY
+template <class T, class Pred>
+inline bool any_adjacent_pair(const T* p, std::size_t lo, std::size_t hi, Pred& pred, bool asc) {
+#if FYX_ARCH_X86 && FYX_GNUC_LIKE && !defined(__AVX512BW__)
+    if (use_avx512()) return any_adjacent_pair_avx512(p, lo, hi, pred, asc);
+    if (use_avx2())   return any_adjacent_pair_avx2(p, lo, hi, pred, asc);
+#endif
+    return any_adjacent_pair_default(p, lo, hi, pred, asc);
+}
+
 template <class T, class Comp>
 // `all_equal_possible` is a promise from the caller: pass false when something
 // outside this range already witnessed two strictly ordered elements, which
@@ -1232,16 +1279,26 @@ inline FastOrderKind detect_fast_order_kind(T* p, std::size_t n, Comp comp,
             if (i == n) return FastOrderKind::AllEqual;
         }
 
+        // Once the direction is known the rest is a block-wise OR-reduced
+        // scan (vectorizes for plain key comparators, ISA-dispatched), with
+        // an exit per block.
+        // Returns the block holding the first break (n if none).
+        auto any_break = [&](std::size_t from, bool asc) -> std::size_t {
+            constexpr std::size_t B = 1024;
+            for (std::size_t b = from; b < n; b += B)
+                if (any_adjacent_pair(p, b, std::min(n, b + B), comp, asc)) return b;
+            return n;
+        };
         for (std::size_t i = 1; i < n; ++i) {
-            if (comp(p[i], p[i - 1])) {          // reverse of comp order
-                for (++i; i < n; ++i)
-                    if (comp(p[i - 1], p[i])) return FastOrderKind::None;
-                return FastOrderKind::Reverse;
-            }
+            if (comp(p[i], p[i - 1]))            // reverse of comp order
+                return any_break(i + 1, false) != n ? FastOrderKind::None : FastOrderKind::Reverse;
             if (comp(p[i - 1], p[i])) {          // already in comp order
-                for (++i; i < n; ++i)
-                    if (comp(p[i], p[i - 1])) return FastOrderKind::None;
-                return FastOrderKind::Sorted;
+                std::size_t b = any_break(i + 1, true);
+                if (b == n) return FastOrderKind::Sorted;
+                while (!comp(p[b], p[b - 1])) ++b;
+                OrderBreakHint& h = order_break_hint();
+                h.p = p; h.n = n; h.head = b;
+                return FastOrderKind::None;
             }
         }
         return FastOrderKind::AllEqual;
@@ -1530,9 +1587,19 @@ inline bool try_bounded_insertion_repair(T* p, std::size_t n, Comp comp,
         // block is tens of thousands of them at a single position, while
         // random input breaks the cap at every checkpoint from the first.
         const std::size_t reach = n / 8u + 1u;
-        std::size_t shifts = 0, strikes = 0, next_check = 64;
+        std::size_t shifts = 0, strikes = 0, next_check = 64, walk_until = 0;
         for (std::size_t i = 1; i < n; ++i) {
-            if (!before(p[i], p[i - 1])) continue;
+            if (!before(p[i], p[i - 1])) {
+                // Skip an ordered stretch with one vectorized block test
+                // (only positions ahead of i are read; none were moved yet).
+                // A block that holds a descent is walked element-wise.
+                if (i >= walk_until) {
+                    const std::size_t e = std::min(n, i + 128u);
+                    if (i + 16u < e && !any_adjacent_pair(p, i + 1, e, before, true)) i = e - 1;
+                    else walk_until = e;
+                }
+                continue;
+            }
             // Refuse long travel before paying for it: p[i] below the element
             // `reach` back must cross more than that, and a lone intruder at
             // i-1 above the element `reach` ahead would be bubbled forward one
@@ -2569,6 +2636,10 @@ inline bool likely_mid_bitonic_runs(T* p, std::size_t n, Comp comp) {
            (head_down && mid_up && tail_up);
 }
 
+// try_bitonic_runs_sort: above this footprint merge in place from a buffer
+// holding only the descending run.
+inline constexpr std::size_t kBitonicHalfBufferBytes = std::size_t(4) << 20;
+
 template <class T, class Comp>
 inline bool try_bitonic_runs_sort(T* p, std::size_t n, Comp comp) {
 #if !FYX_USE_PDQ_PARTITION
@@ -2606,26 +2677,24 @@ inline bool try_bitonic_runs_sort(T* p, std::size_t n, Comp comp) {
         const bool first_asc = before(p[i - 1], p[i]);
         ++i;
 
+        // Block OR-reductions without early exits (they vectorize for plain
+        // key comparators); a hit is located inside its block afterwards.
+        constexpr std::size_t kScanBlock = 512;
+        auto any_break = [&](std::size_t lo, std::size_t hi, bool asc) -> bool {
+            return any_adjacent_pair(p, lo, hi, before, asc);
+        };
         std::size_t split = n;
-        for (; i < n; ++i) {
-            const bool up = before(p[i - 1], p[i]);
-            const bool down = before(p[i], p[i - 1]);
-            if (first_asc ? down : up) {
-                split = i;
-                ++i;
-                break;
-            }
+        for (std::size_t b = i; b < n; b += kScanBlock) {
+            const std::size_t e = std::min(n, b + kScanBlock);
+            if (!any_break(b, e, first_asc)) continue;
+            for (std::size_t j = b; j < e; ++j)
+                if (first_asc ? before(p[j], p[j - 1]) : before(p[j - 1], p[j])) { split = j; break; }
+            break;
         }
         if (split == n) return false;
         if (split < n / 16u || n - split < n / 16u) return false;
-
-        for (; i < n; ++i) {
-            if (first_asc) {
-                if (before(p[i - 1], p[i])) return false;
-            } else {
-                if (before(p[i], p[i - 1])) return false;
-            }
-        }
+        for (std::size_t b = split + 1; b < n; b += kScanBlock)
+            if (any_break(b, std::min(n, b + kScanBlock), !first_asc)) return false;
 
         auto try_arithmetic_organ_fill = [&]() -> bool {
             if constexpr (!(is_ascending_v<Comp, T> && radix_supported_v<T> &&
@@ -2714,40 +2783,84 @@ inline bool try_bitonic_runs_sort(T* p, std::size_t n, Comp comp) {
         };
         if (try_arithmetic_organ_fill()) return true;
 
-        struct Cursor {
-            std::size_t cur;
-            std::size_t lo;
-            std::size_t hi;
-            bool have;
-            bool forward;
-        };
-        auto advance = [](Cursor& c) {
-            if (!c.have) return;
-            if (c.forward) {
-                ++c.cur;
-                if (c.cur >= c.hi) c.have = false;
-            } else {
-                if (c.cur == c.lo) c.have = false;
-                else --c.cur;
-            }
-        };
-        Cursor a = first_asc ? Cursor{0, 0, split, true, true}
-                             : Cursor{split - 1, 0, split, true, false};
-        Cursor b = first_asc ? Cursor{n - 1, split, n, true, false}
-                             : Cursor{split, split, n, true, true};
-
         if constexpr (std::is_trivially_copyable<T>::value) {
+          if (n * sizeof(T) > kBitonicHalfBufferBytes) {
+            // Memory-bound size: save only the descending run (reversed, so
+            // ascending) and merge in place toward it -- about 40% less
+            // traffic than merge-to-buffer plus copy back.  first_asc: the
+            // back chain fills p from n-1 down (write index = X tail + buffer
+            // left, never past an unread X slot).  Otherwise the front chain
+            // fills from 0 up (write index <= next unread Y slot).
+            const std::size_t m = first_asc ? n - split : split;
+            ScratchLease<T> tmp_lease(m);
+            if (!tmp_lease.valid()) return false;
+            T* tmp = tmp_lease.get();
+            const T* src = first_asc ? p + split : p;
+            for (std::size_t k = 0; k < m; ++k) tmp[k] = src[m - 1 - k];
+            if (first_asc) {
+                std::size_t xr = split, tr = m, o = n;   // counts left
+                while (xr != 0 && tr != 0) {
+                    const bool tx = before(tmp[tr - 1], p[xr - 1]);
+                    p[--o] = *(tx ? p + (xr - 1) : tmp + (tr - 1));
+                    xr -= tx ? 1u : 0u;
+                    tr -= tx ? 0u : 1u;
+                }
+                if (tr != 0) std::memcpy(p, tmp, tr * sizeof(T));
+            } else {
+                std::size_t t = 0, y = split, o = 0;
+                while (t != m && y != n) {
+                    const bool ty = before(p[y], tmp[t]);
+                    p[o++] = *(ty ? p + y : tmp + t);
+                    y += ty ? 1u : 0u;
+                    t += ty ? 0u : 1u;
+                }
+                if (t != m) std::memcpy(p + o, tmp + t, (m - t) * sizeof(T));
+            }
+            return true;
+          }
             ScratchLease<T> tmp_lease(n);
             if (!tmp_lease.valid()) return false;
             T* tmp = tmp_lease.get();
-            std::size_t out = 0;
-            while (a.have && b.have) {
-                if (before(p[b.cur], p[a.cur])) { tmp[out++] = p[b.cur]; advance(b); }
-                else                            { tmp[out++] = p[a.cur]; advance(a); }
+            // X ascends over [x, xe], Y descends over [ye, y] (so p[y] is its
+            // smallest).  Two branchless chains: the front emits the smallest
+            // (ties -> X), the back the largest (ties -> Y), which is one
+            // consistent total order.  Each round runs h steps per chain with
+            // h = min(remaining X, remaining Y) / 2, so neither chain can
+            // drain a run inside the round: no bounds checks in the loop.
+            std::size_t x  = first_asc ? 0 : split;
+            std::size_t xe = first_asc ? split - 1 : n - 1;
+            std::size_t ye = first_asc ? split : 0;
+            std::size_t y  = first_asc ? n - 1 : split - 1;
+            std::size_t of = 0, ob = n - 1;
+            while (true) {
+                const std::size_t xr = xe - x + 1, yr = y - ye + 1;
+                const std::size_t h = std::min(xr, yr) / 2;
+                if (h < 4) break;
+                for (std::size_t k = 0; k < h; ++k) {
+                    const bool ty = before(p[y], p[x]);
+                    tmp[of + k] = *(ty ? p + y : p + x);
+                    x += ty ? 0u : 1u;
+                    y -= ty ? 1u : 0u;
+                    const bool tx = before(p[ye], p[xe]);
+                    tmp[ob - k] = *(tx ? p + xe : p + ye);
+                    xe -= tx ? 1u : 0u;
+                    ye += tx ? 0u : 1u;
+                }
+                of += h;
+                ob -= h;
             }
-            while (a.have) { tmp[out++] = p[a.cur]; advance(a); }
-            while (b.have) { tmp[out++] = p[b.cur]; advance(b); }
-            if (out != n) return false;
+            // Tail, front only.  Runs stay non-empty here (each round left
+            // at least half of the smaller one); x > xe marks X drained.
+            while (x <= xe) {
+                const bool ty = before(p[y], p[x]);
+                tmp[of++] = *(ty ? p + y : p + x);
+                if (!ty) { ++x; continue; }
+                if (y == ye) { ye = y + 1; break; }
+                --y;
+            }
+            while (x <= xe) tmp[of++] = p[x++];
+            if (ye <= y) for (std::size_t k = y + 1; k-- > ye;) tmp[of++] = p[k];
+            if (of != ob + 1) return false;
             std::memcpy(p, tmp, n * sizeof(T));
         } else {
             if (first_asc) std::reverse(p + split, p + n);
@@ -2914,8 +3027,8 @@ inline VqCleanMemo& vq_clean_memo() noexcept {
     return m;
 }
 struct VqCleanMemoScope {
-    VqCleanMemoScope() noexcept { vq_clean_memo().p = nullptr; }
-    ~VqCleanMemoScope() { vq_clean_memo().p = nullptr; }
+    VqCleanMemoScope() noexcept { vq_clean_memo().p = nullptr; order_break_hint().p = nullptr; }
+    ~VqCleanMemoScope() { vq_clean_memo().p = nullptr; order_break_hint().p = nullptr; }
     VqCleanMemoScope(const VqCleanMemoScope&) = delete;
     VqCleanMemoScope& operator=(const VqCleanMemoScope&) = delete;
 };
@@ -3098,6 +3211,11 @@ FYX_FORCE_INLINE std::size_t low_card_hash_key(Key k) noexcept {
 // ---------------------------------------------------------------------------
 
 inline constexpr std::size_t kProfileMinN            = 1024;
+// try_kv16_early_sort: below kKv16EarlyMinN the probe stack's small-n paths
+// win; from kKv16EarlyParallelMinN up parallel-eligible calls fork the
+// quicksort's top levels.
+inline constexpr std::size_t kKv16EarlyMinN          = 2048;
+inline constexpr std::size_t kKv16EarlyParallelMinN  = std::size_t(1) << 17;
 inline constexpr std::size_t kProfilePartialDivisor  = 64;
 inline constexpr std::size_t kProfilePartialPdqMax   = 64u << 20;
 // Below this many elements the thread-pool wake-up costs more than the extra
@@ -4863,11 +4981,12 @@ load_trivial_field_key(const T& x, std::size_t offset) noexcept {
 
 template <class Field, class T, class Comp>
 inline bool trivial_field_candidate_order(T* p, std::size_t n, Comp comp,
-                                          std::size_t offset, bool& descending) {
+                                          std::size_t offset, bool& descending,
+                                          std::size_t samples = 96) {
     using Key = typename RadixTraits<Field>::Key;
     if (offset + sizeof(Field) > sizeof(T)) return false;
 
-    const std::size_t s = std::min<std::size_t>(n, 96);
+    const std::size_t s = std::min<std::size_t>(n, std::min<std::size_t>(samples, 96));
     std::array<std::size_t, 96> idx{};
     for (std::size_t i = 0; i < s; ++i) idx[i] = (i * n) / s;
 
@@ -5110,6 +5229,190 @@ inline int trivial_field_flag_sort_parallel(T* p, std::size_t n, Comp comp, std:
 }
 #endif
 
+// 16-byte records keyed by a 64-bit field: in-place AVX-512 record quicksort
+// (no scratch, no copy back; equal-key ranges end without leaves).  Returns
+// 1 sorted, 2 permuted but not sorted under comp (caller re-sorts), 0 not
+// applicable (untouched).
+template <class T, class Comp>
+struct Kv16Proof {
+    // Seams per task slot (task tree ids < kSlots): no locking, each slot is
+    // written by one task at a time.
+    static constexpr unsigned kSlots = 64;
+    T* p;
+    Comp* comp;
+    bool descending;
+    std::vector<std::size_t> seams[kSlots];
+
+    bool verify(std::size_t lo, std::size_t cnt, bool with_prev) const {
+        // OR-reduction with no early exit: the compiler vectorizes it for
+        // plain key comparators (strided key loads).
+        if (cnt == 0) return true;
+        const T* q = p + (with_prev ? lo - 1 : lo);
+        const std::size_t m = cnt - (with_prev ? 0 : 1);
+        const Comp& c = *comp;
+        unsigned char bad = 0;
+        if (descending) for (std::size_t i = 0; i < m; ++i) bad |= static_cast<unsigned char>(c(q[i], q[i + 1]));
+        else            for (std::size_t i = 0; i < m; ++i) bad |= static_cast<unsigned char>(c(q[i + 1], q[i]));
+        return bad == 0;
+    }
+    bool seams_ok() const {
+        for (unsigned s = 0; s < kSlots; ++s)
+            for (const std::size_t i : seams[s])
+                if (descending ? (*comp)(p[i - 1], p[i]) : (*comp)(p[i], p[i - 1])) return false;
+        return true;
+    }
+};
+
+template <class T, class Comp>
+struct Kv16Fin {
+    Kv16Proof<T, Comp>* pr;
+    unsigned slot;
+    bool verify(std::size_t lo, std::size_t cnt, bool with_prev) { return pr->verify(lo, cnt, with_prev); }
+    void seam(std::size_t lo) { if (lo != 0) pr->seams[slot].push_back(lo); }
+    bool operator()(std::size_t lo, std::size_t cnt) {
+        seam(lo);
+        return pr->verify(lo, cnt, false);
+    }
+};
+
+#if FYX_ENABLE_PARALLEL
+template <class T, class Comp>
+inline bool kv16_vqsort_parallel_rec(T* p, std::size_t lo, std::size_t nr, int budget, unsigned depth,
+                                     bool key_hi, bool is_signed, Kv16Proof<T, Comp>& pr, unsigned slot) {
+    constexpr std::size_t kMinParTask = std::size_t(1) << 15;
+    Kv16Fin<T, Comp> fin{&pr, slot};
+    while (true) {
+        if (depth == 0 || budget <= 0 || nr < kMinParTask)
+            return kv16_vqsort_range(static_cast<void*>(p), lo, nr, budget, key_hi, is_signed, fin);
+        std::size_t split = 0;
+        const int r = kv16_vqsort_step(static_cast<void*>(p), lo, nr, split, key_hi, is_signed, fin);
+        --budget;
+        if (r == 0) return true;
+        if (r < 0) return false;
+        if (r == 1) continue;
+        bool okl = false, okr = false;
+        const std::size_t l0 = lo, ln = split, r0 = lo + split, rn = nr - split;
+        const int nb = budget;
+        const unsigned nd = depth - 1;
+        fork_join([&] { okl = kv16_vqsort_parallel_rec(p, l0, ln, nb, nd, key_hi, is_signed, pr, 2 * slot); },
+                  [&] { okr = kv16_vqsort_parallel_rec(p, r0, rn, nb, nd, key_hi, is_signed, pr, 2 * slot + 1); });
+        return okl && okr;
+    }
+}
+#endif
+
+// 16-byte records keyed by a 64-bit field: in-place AVX-512 record quicksort
+// (no scratch, no copy back; equal-key ranges end without leaves).  Every
+// final range is proven under comp while hot and the seams between ranges
+// afterwards (ascending, so a descending comp is checked mirrored before the
+// reverse).  par: fork the top levels over the pool.  Returns 1 sorted, 2
+// permuted but not sorted under comp (caller re-sorts), 0 not applicable
+// (untouched).
+template <class Field, class T, class Comp>
+FYX_NOINLINE int trivial_field_kv16_vqsort(T* p, std::size_t n, Comp comp, std::size_t offset,
+                                           bool descending, bool par = false) {
+    if constexpr (sizeof(T) != 16 || sizeof(Field) != 8 || !std::is_trivially_copyable<T>::value) {
+        (void)p; (void)n; (void)comp; (void)offset; (void)descending; (void)par;
+        return 0;
+    } else {
+        if ((offset != 0 && offset != 8) || !use_avx512()) return 0;
+        const bool key_hi = offset == 8;
+        constexpr bool is_signed = std::is_signed<Field>::value;
+        std::unique_ptr<Kv16Proof<T, Comp>> pr(new Kv16Proof<T, Comp>{p, &comp, descending, {}});
+        bool ok;
+#if FYX_ENABLE_PARALLEL
+        if (par && parallel_available()) {
+            unsigned depth = 1;
+            for (unsigned t = 2; t < global_pool().nworkers() * 2u && depth < 5; t *= 2) ++depth;
+            ok = kv16_vqsort_parallel_rec(p, 0, n, vqsort_budget(n), depth, key_hi, is_signed, *pr, 1u);
+        } else
+#else
+        (void)par;
+#endif
+        {
+            Kv16Fin<T, Comp> fin{pr.get(), 0};
+            ok = kv16_vqsort(static_cast<void*>(p), n, key_hi, is_signed, fin);
+        }
+        if (!ok || !pr->seams_ok()) return 2;
+        if (descending) std::reverse(p, p + n);
+        return 1;
+    }
+}
+
+// Early route for unordered 16-byte records keyed by a 64-bit field (AVX-512
+// hosts): the in-place record quicksort beats the profile -> counting / MSD
+// chain on every unordered shape measured (random, few-unique, sqrt, zipf),
+// so it runs before the probe stack -- after a 64-sample order gate (both
+// directions, frequent turns) that leaves presorted, few-run and pattern
+// shapes (organ pipe, rotations, sorted prefixes) to the adaptive paths.
+// Many short sorted runs pass the gate on purpose: at sqrt(n) runs the
+// quicksort beats run merging (1M: 18.1 vs 20.5 ms; 10k: 0.10 vs 0.49 ms).
+// true: sorted.  false: p holds a permutation of its input (maybe unchanged).
+// Equivalence of every element to p[0] (a strict weak order makes that
+// transitive): one load stream, OR-reduced per block.  AVX-512 target so a
+// portable build still vectorizes the inlined comparator 512 bits wide (only
+// called after use_avx512()).
+template <class T, class Comp>
+FYX_TARGET_AVX512 bool kv16_all_equiv_avx512(const T* p, std::size_t n, Comp& comp) {
+    constexpr std::size_t B = 2048;
+    const T ref = p[0];
+    for (std::size_t b = 1; b < n; b += B) {
+        const T* q = p + b;
+        const std::size_t m = std::min(n - b, B);
+        unsigned char bad = 0;
+        for (std::size_t i = 0; i < m; ++i)
+            bad |= static_cast<unsigned char>(comp(q[i], ref) | comp(ref, q[i]));
+        if (bad) return false;
+    }
+    return true;
+}
+
+template <class Field, class T, class Comp>
+inline int kv16_early_field(T* p, std::size_t n, Comp comp, std::size_t off, bool par) {
+    bool desc = false;
+    if (!trivial_field_candidate_order<Field>(p, n, comp, off, desc, 48)) return 0;
+    return trivial_field_kv16_vqsort<Field>(p, n, comp, off, desc, par);
+}
+
+template <class T, class Comp>
+inline bool try_kv16_early_sort(T* p, std::size_t n, Comp comp, bool par = false) {
+    if constexpr (sizeof(T) != 16 || !std::is_trivially_copyable<T>::value || std::is_arithmetic<T>::value) {
+        (void)p; (void)n; (void)comp; (void)par;
+        return false;
+    } else {
+        if (n < kKv16EarlyMinN || !use_avx512()) return false;
+        constexpr std::size_t S = 64;
+        std::size_t asc = 0, dsc = 0, turns = 0;
+        int last = 0;
+        const T* prev = p;
+        for (std::size_t j = 1; j < S; ++j) {
+            const T* cur = p + (j * (n - 1)) / (S - 1);
+            const bool up = comp(*prev, *cur), down = comp(*cur, *prev);
+            asc += up ? 1u : 0u;
+            dsc += down ? 1u : 0u;
+            const int dir = up ? 1 : (down ? -1 : 0);
+            turns += (dir != 0 && last != 0 && dir != last) ? 1u : 0u;
+            last = dir != 0 ? dir : last;
+            prev = cur;
+        }
+        if (asc == 0 && dsc == 0) {
+            // Every sample equivalent: prove the range all-equivalent (hence
+            // sorted) in one vectorizable pass, OR-reduced per block -- the
+            // profile's tracker scan costs ~3x more.
+            return kv16_all_equiv_avx512(p, n, comp);
+        }
+        // Both directions often, and alternating (organ pipes / bitonic
+        // shapes have both but turn once or twice).
+        if (asc < S / 5 || dsc < S / 5 || turns < S / 5) return false;
+        for (std::size_t off = 0; off <= 8; off += 8) {
+            int r = kv16_early_field<std::int64_t>(p, n, comp, off, par);
+            if (r == 0) r = kv16_early_field<std::uint64_t>(p, n, comp, off, par);
+            if (r != 0) return r == 1;
+        }
+        return false;
+    }
+}
+
 template <class Field, class T, class Comp>
 inline bool try_trivial_field_count_sort(T* p, std::size_t n, Comp comp,
                                          std::size_t offset, bool par = false) {
@@ -5122,6 +5425,11 @@ inline bool try_trivial_field_count_sort(T* p, std::size_t n, Comp comp,
     // Class-byte flag sort for sparse key domains with up to 255 sampled
     // classes (the scatter write-prefetches each stream, so 256 streams no
     // longer fall off the prefetchers' cliff).
+    if (sample_distinct <= 255) {
+        const int r = trivial_field_kv16_vqsort<Field>(p, n, comp, offset, descending,
+                                                       par && n >= kKv16EarlyParallelMinN);
+        if (r != 0) return r == 1;
+    }
     if constexpr (std::is_trivially_copyable<T>::value) if (sample_distinct <= 255) {
         // Sample span first: a sparse key domain (hashes, random 64-bit
         // palettes) can skip the dense-range min/max pass altogether.
@@ -5575,6 +5883,20 @@ inline bool record_msd_sort(T* p, std::size_t n, Comp comp, std::size_t offset,
     return true;
 }
 
+/// 512 strided key samples hold >= 32 repeats (distinct-key data: ~0).
+template <class Field, class T>
+inline bool trivial_field_dup_heavy(const T* p, std::size_t n, std::size_t offset) {
+    using Key = typename RadixTraits<Field>::Key;
+    if (!use_avx512() || n < 4096) return false;
+    constexpr std::size_t S = 512;
+    std::array<Key, S> k;
+    for (std::size_t j = 0; j < S; ++j) k[j] = load_trivial_field_key<Field>(p[(j * n) / S], offset);
+    std::sort(k.begin(), k.end());
+    std::size_t rep = 0;
+    for (std::size_t j = 1; j < S; ++j) rep += k[j] == k[j - 1] ? 1u : 0u;
+    return rep >= 32;
+}
+
 template <class Field, class T, class Comp>
 inline bool try_trivial_field_radix_sort(T* p, std::size_t n, Comp comp,
                                          std::size_t offset, bool par = false) {
@@ -5588,6 +5910,15 @@ inline bool try_trivial_field_radix_sort(T* p, std::size_t n, Comp comp,
 
         bool descending = false;
         if (!trivial_field_candidate_order<Field>(p, n, comp, offset, descending)) return false;
+        // Duplicate-heavy 16-byte records (sqrt-n / zipf-like key counts,
+        // past the counting paths' class limit): the in-place record
+        // quicksort finishes equal-key ranges without leaves and beats the
+        // MSD passes; distinct-key data stays on the radix path.
+        if (sizeof(T) == 16 && sizeof(Field) == 8 && trivial_field_dup_heavy<Field>(p, n, offset)) {
+            const int r = trivial_field_kv16_vqsort<Field>(p, n, comp, offset, descending,
+                                                           par && n >= kKv16EarlyParallelMinN);
+            if (r == 1) return true;
+        }
         if (FYX_RECORD_MSD) return record_msd_sort<Field>(p, n, comp, offset, descending, par);
 
         RadixHistogram<Passes> hist;
@@ -9447,38 +9778,163 @@ inline void sort_st(T* p, std::size_t n, Comp comp, bool descending,
 /// Finding the stretch is free.  Both scans walk inwards from an end and stop
 /// at the first inversion, so a range with no ordered head or tail costs two
 /// comparisons, and the cost of a range that has one is the length of it.
-#if FYX_ENABLE_PARALLEL
+#ifndef FYX_RUNS_KCHAIN
+#define FYX_RUNS_KCHAIN 8
+#endif
+
+// Co-rank: how many of the first k merged outputs come from A (ties: A
+// first, i.e. a stable merge of A then B).
+template <class T, class Less>
+inline std::size_t merge_corank(const T* A, std::size_t na, const T* B, std::size_t nb, std::size_t k,
+                                Less& before) {
+    std::size_t lo = k > nb ? k - nb : 0, hi = std::min(k, na);
+    while (lo < hi) {
+        const std::size_t i = lo + (hi - lo) / 2;
+        if (before(B[k - i - 1], A[i])) hi = i;
+        else lo = i + 1;
+    }
+    return lo;
+}
+
+// Stable merge of sorted A and B into out with K independent branchless
+// chains (output split by co-rank).  A two-way merge is latency-bound --
+// index -> load -> compare -> index, ~10 cycles a record -- so K chains in
+// one loop overlap K of those (measured 2x at 100k 16-byte records).  The
+// select is an address mask: GCC turns a value ternary on a record back into
+// a branch, which mispredicts half the time on interleaved runs.
+template <unsigned K, class T, class Less>
+inline void merge_runs_kchain(const T* A, std::size_t na, const T* B, std::size_t nb, T* out, Less& before) {
+    const std::size_t n = na + nb;
+    std::size_t i[K], j[K], ie[K], je[K], o[K];
+    std::size_t prev_i = 0, prev_k = 0;
+    for (unsigned c = 0; c < K; ++c) {
+        const std::size_t k1 = (n * (c + 1)) / K;
+        const std::size_t i1 = c + 1 == K ? na : merge_corank(A, na, B, nb, k1, before);
+        i[c] = prev_i; j[c] = prev_k - prev_i; o[c] = prev_k;
+        ie[c] = i1; je[c] = k1 - i1;
+        prev_i = i1; prev_k = k1;
+    }
+    while (true) {
+        std::size_t h = ~std::size_t(0);
+        for (unsigned c = 0; c < K; ++c) h = std::min(h, std::min(ie[c] - i[c], je[c] - j[c]));
+        if (h == 0) break;
+        for (std::size_t s = 0; s < h; ++s) {
+            for (unsigned c = 0; c < K; ++c) {
+                const T* pa = A + i[c];
+                const T* pb = B + j[c];
+                const std::size_t tb = before(*pb, *pa) ? 1u : 0u;
+                const std::uintptr_t mk = std::uintptr_t(0) - static_cast<std::uintptr_t>(tb);
+                const std::uintptr_t ua = reinterpret_cast<std::uintptr_t>(pa);
+                const std::uintptr_t ub = reinterpret_cast<std::uintptr_t>(pb);
+                out[o[c]++] = *reinterpret_cast<const T*>(ua ^ ((ua ^ ub) & mk));
+                j[c] += tb;
+                i[c] += 1 - tb;
+            }
+        }
+    }
+    for (unsigned c = 0; c < K; ++c) {
+        std::size_t x = i[c], y = j[c], w = o[c];
+        while (x < ie[c] && y < je[c]) {
+            if (before(B[y], A[x])) out[w++] = B[y++];
+            else                    out[w++] = A[x++];
+        }
+        while (x < ie[c]) out[w++] = A[x++];
+        while (y < je[c]) out[w++] = B[y++];
+    }
+}
+
 /// Records (trivially copyable, comparator-ordered) made of at most nine
-/// ordered runs -- concatenated sorted batches -- merged pairwise with the
-/// co-ranked parallel merge.  The scalar kernels have a radix-key version of
-/// this (try_proof_structured_sort_parallel); records had only the serial
-/// run merge.  A sampled-descent gate keeps random / tail-shuffled input to
-/// 64 comparisons; one-break wraps are left to the rotation path.  Declines
-/// without moving anything.
+/// ascending runs -- rotated sorted ranges, concatenated sorted batches.
+///  * one break and the second run wholly <= the first's head: rotated back
+///    through a buffer the size of the smaller run;
+///  * one break otherwise: trimmed (elements already final stay) and merged;
+///  * up to eight breaks: merged pairwise, ping-ponging with one buffer.
+/// Merges are co-ranked parallel merges when `par`, else K-chain merges.
+/// The break scan is a vectorized block reduction.  Gates, all before
+/// anything moves: 64 sampled adjacent pairs ordered, at most eight
+/// descents in the 64-point coarse sample, and every break a real run
+/// boundary -- an isolated dip or spike (far swaps, nearly sorted) belongs
+/// to the repair paths and is refused at the first break.
 template <class T, class Comp>
-inline bool try_record_runs_merge_parallel(T* p, std::size_t n, Comp comp) {
+inline bool try_record_runs_merge(T* p, std::size_t n, Comp comp, bool par) {
     if constexpr (!std::is_trivially_copyable<T>::value || std::is_arithmetic<T>::value) {
-        (void)p; (void)n; (void)comp;
+        (void)p; (void)n; (void)comp; (void)par;
         return false;
     } else {
-        if (n < (std::size_t(1) << 17) || !parallel_available()) return false;
+        if (n < 4096) return false;
+#if FYX_ENABLE_PARALLEL
+        par = par && n >= (std::size_t(1) << 17) && parallel_available();
+#else
+        par = false;
+#endif
         auto before = adaptive_order<T>(comp);
+        constexpr unsigned kMaxBreaks = 8;
+        unsigned coarse = 0;
         for (std::size_t j = 1; j <= 64; ++j) {
             const std::size_t i = (j * (n - 1)) / 65 + 1;
             if (before(p[i], p[i - 1])) return false;
+            const std::size_t a = ((j - 1) * (n - 1)) / 64, b = (j * (n - 1)) / 64;
+            if (before(p[b], p[a]) && ++coarse > kMaxBreaks) return false;
         }
-        constexpr unsigned kMaxBreaks = 8;
         std::size_t bounds[kMaxBreaks + 2];
         unsigned nb = 0;
         bounds[0] = 0;
-        for (std::size_t i = 1; i < n; ++i) {
-            if (before(p[i], p[i - 1])) {
+        constexpr std::size_t kBlk = 2048;
+        for (std::size_t b = 1; b < n; b += kBlk) {
+            const std::size_t e = std::min(n, b + kBlk);
+            if (!any_adjacent_pair(p, b, e, before, true)) continue;
+            for (std::size_t i = b; i < e; ++i) {
+                if (!before(p[i], p[i - 1])) continue;
                 if (nb == kMaxBreaks) return false;
+                // Dip (p[i] alone below its left neighbour) or spike (p[i-1]
+                // alone above both sides): not a boundary between runs.
+                if (i + 1 < n && !before(p[i + 1], p[i - 1])) return false;
+                if (i >= 2 && !before(p[i], p[i - 2])) return false;
                 bounds[++nb] = i;
             }
         }
         if (nb == 0) return true;
-        if (nb == 1 && !before(p[0], p[n - 1])) return false;   // a wrap: rotate instead
+        if (nb == 1) {
+            const std::size_t m = bounds[1];
+            if (!before(p[0], p[n - 1])) {
+                // Wrap: [m, n) <= p[0] <= [0, m) -> rotate.
+                const std::size_t na = m, nr = n - m;
+                ScratchLease<T> lease(std::min(na, nr));
+                if (!lease.valid()) return false;
+                T* t = lease.get();
+                if (na <= nr) {
+                    std::memcpy(static_cast<void*>(t), static_cast<const void*>(p), na * sizeof(T));
+                    std::memmove(static_cast<void*>(p), static_cast<const void*>(p + m), nr * sizeof(T));
+                    std::memcpy(static_cast<void*>(p + nr), static_cast<const void*>(t), na * sizeof(T));
+                } else {
+                    std::memcpy(static_cast<void*>(t), static_cast<const void*>(p + m), nr * sizeof(T));
+                    std::memmove(static_cast<void*>(p + nr), static_cast<const void*>(p), na * sizeof(T));
+                    std::memcpy(static_cast<void*>(p), static_cast<const void*>(t), nr * sizeof(T));
+                }
+                return true;
+            }
+            // Trim: [0, a) <= p[m] and [e, n) >= p[m-1] are already final.
+            const std::size_t a = static_cast<std::size_t>(std::upper_bound(p, p + m, p[m], before) - p);
+            const std::size_t e = static_cast<std::size_t>(std::lower_bound(p + m, p + n, p[m - 1], before) - p);
+            ScratchLease<T> lease(e - a);
+            if (!lease.valid()) return false;
+            T* t = lease.get();
+#if FYX_ENABLE_PARALLEL
+            if (par && e - a >= (std::size_t(1) << 17)) {
+                T* buf = t - a;
+                parallel_merge_to_buffer_rec(p, a, m, m, e, buf, a, before);
+                auto copy_job = [&](std::size_t lo, std::size_t hi) {
+                    std::memcpy(static_cast<void*>(p + lo), static_cast<const void*>(buf + lo),
+                                (hi - lo) * sizeof(T));
+                };
+                parallel_for_index(a, e, std::max<std::size_t>(std::size_t(1) << 16, (e - a) / 8), copy_job);
+                return true;
+            }
+#endif
+            merge_runs_kchain<FYX_RUNS_KCHAIN>(p + a, m - a, p + m, e - m, t, before);
+            std::memcpy(static_cast<void*>(p + a), static_cast<const void*>(t), (e - a) * sizeof(T));
+            return true;
+        }
         bounds[nb + 1] = n;
         unsigned r = nb + 1;
         ScratchLease<T> lease(n);
@@ -9491,7 +9947,11 @@ inline bool try_record_runs_merge_parallel(T* p, std::size_t n, Comp comp) {
                 const std::size_t lo = bounds[i];
                 if (i + 1 < r) {
                     const std::size_t mid = bounds[i + 1], hi = bounds[i + 2];
-                    parallel_merge_to_buffer_rec(src, lo, mid, mid, hi, dst, lo, before);
+#if FYX_ENABLE_PARALLEL
+                    if (par) parallel_merge_to_buffer_rec(src, lo, mid, mid, hi, dst, lo, before);
+                    else
+#endif
+                    merge_runs_kchain<FYX_RUNS_KCHAIN>(src + lo, mid - lo, src + mid, hi - mid, dst + lo, before);
                 } else {
                     std::memcpy(static_cast<void*>(dst + lo), static_cast<const void*>(src + lo),
                                 (bounds[i + 1] - lo) * sizeof(T));
@@ -9503,17 +9963,27 @@ inline bool try_record_runs_merge_parallel(T* p, std::size_t n, Comp comp) {
             T* t = src; src = dst; dst = t;
         }
         if (src != p) {
-            auto copy_job = [&](std::size_t lo, std::size_t hi) {
-                std::memcpy(static_cast<void*>(p + lo), static_cast<const void*>(src + lo),
-                            (hi - lo) * sizeof(T));
-            };
-            parallel_for_index(std::size_t(0), n,
-                               std::max<std::size_t>(std::size_t(1) << 16, n / 8), copy_job);
+#if FYX_ENABLE_PARALLEL
+            if (par) {
+                auto copy_job = [&](std::size_t lo, std::size_t hi) {
+                    std::memcpy(static_cast<void*>(p + lo), static_cast<const void*>(src + lo),
+                                (hi - lo) * sizeof(T));
+                };
+                parallel_for_index(std::size_t(0), n,
+                                   std::max<std::size_t>(std::size_t(1) << 16, n / 8), copy_job);
+                return true;
+            }
+#endif
+            std::memcpy(static_cast<void*>(p), static_cast<const void*>(src), n * sizeof(T));
         }
         return true;
     }
 }
-#endif
+
+} // namespace detail
+template <class T, class Comp>
+inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options& o);
+namespace detail {
 
 template <class T, class Comp>
 inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp, bool par = false) {
@@ -9528,10 +9998,29 @@ inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp, bool par = fal
         return false;
     } else {
         auto before = adaptive_order<T>(comp);
+        // Affix scans: vectorized block tests, then locate inside the block.
+        constexpr std::size_t kBlk = 1024;
         std::size_t head = 1;
+        {
+            OrderBreakHint& h = order_break_hint();
+            if (h.p == static_cast<const void*>(p) && h.n == n && h.head > 0 && h.head < n &&
+                before(p[h.head], p[h.head - 1]))
+                head = h.head;
+            h.p = nullptr;
+        }
+        while (head < n) {
+            const std::size_t e = std::min(n, head + kBlk);
+            if (any_adjacent_pair(p, head, e, before, true)) break;
+            head = e;
+        }
         while (head < n && !before(p[head], p[head - 1])) ++head;
         if (head == n) return true;                  // ordered already
         std::size_t tail = n - 1;
+        while (tail > head) {
+            const std::size_t b = tail > head + kBlk ? tail - kBlk : head + 1;
+            if (b >= tail || any_adjacent_pair(p, b, tail + 1, before, true)) break;
+            tail = b;
+        }
         while (tail > head && !before(p[tail], p[tail - 1])) --tail;
         // No room between the two affixes, or so little order that sorting the
         // middle and merging costs about as much as sorting the whole range.
@@ -9559,7 +10048,15 @@ inline bool try_sorted_affix_sort(T* p, std::size_t n, Comp comp, bool par = fal
         }
         // `descending` must follow comp: radix-key kernels sort ascending and
         // reverse for a ">" comparator (with NaN the order differs from comp).
-        sort_st(p + head, tail - head, comp, is_descending_v<Comp, T>);
+        if constexpr (std::is_arithmetic<T>::value) {
+            sort_st(p + head, tail - head, comp, is_descending_v<Comp, T>);
+        } else {
+            // Records: the full dispatcher (sort_st has no record kernels;
+            // 10k random 16-byte records: 0.10 ms there vs 0.51 ms here).
+            Options mo;
+            mo.parallel = par ? Tri::On : Tri::Off;
+            sort_pointer_core_impl(p + head, tail - head, comp, mo);
+        }
         if (tail < n) merge_adjacent_runs(p, head, tail, n, buf, before);
 #if FYX_ENABLE_PARALLEL
         if constexpr (std::is_trivially_copyable<T>::value) {
@@ -10735,6 +11232,15 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
     const detail::VqCleanMemoScope vq_clean_scope;
 
 #if FYX_ENABLE_FAST_PATHS
+#if FYX_ENABLE_PARALLEL
+    const bool kv16_par = n >= detail::kKv16EarlyParallelMinN && detail::dynamic_parallel_allowed<T>(n, o);
+#else
+    const bool kv16_par = false;
+#endif
+    if (detail::try_kv16_early_sort(p, n, comp, kv16_par)) {
+        detail::record_dispatch(detail::DispatchDecision::VectorQuick);
+        return;
+    }
     if (n > detail::kNetworkMax && detail::try_parallel_all_equal_exit(p, n, comp)) return;
     if (n > detail::kNetworkMax && detail::try_zigzag_organ_pipe_sort(p, n, comp)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
@@ -10812,16 +11318,24 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
     // concat2/rotated (natural-run's shapes) and random data fall through in
     // a few milliseconds or less, which is what keeps this win from taxing
     // them.
+    if (n > detail::kNetworkMax && detail::try_record_runs_merge(p, n, comp, rev_parallel_ok)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
+    // Records: the affix weapon straight after the run merge (neither moves
+    // anything when declining, so the order exit's break hint still holds),
+    // before insertion repair and the natural-run scan pay to rescan the head.
+    const bool affix_early = !std::is_arithmetic<T>::value;
+    if (affix_early && n > detail::kNetworkMax && detail::try_sorted_affix_sort(p, n, comp, rev_parallel_ok)) {
+        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+        return;
+    }
     if (n > detail::kNetworkMax && detail::try_bounded_insertion_repair(p, n, comp, true)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
     }
 #if FYX_ENABLE_PARALLEL
     const bool fd_par = detail::dynamic_parallel_allowed<T>(n, o);
-    if (fd_par && detail::try_record_runs_merge_parallel(p, n, comp)) {
-        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
-        return;
-    }
 #else
     const bool fd_par = false;
 #endif
@@ -10833,7 +11347,7 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
     // try_sorted_affix_sort.  Like the run merge this has to be reachable
     // before the parallel kernels are chosen, or a range that is three
     // quarters sorted pays for all of it on every worker.
-    if (n > detail::kNetworkMax && detail::try_sorted_affix_sort(p, n, comp, fd_par)) {
+    if (!affix_early && n > detail::kNetworkMax && detail::try_sorted_affix_sort(p, n, comp, fd_par)) {
         detail::record_dispatch(detail::DispatchDecision::PartialPdq);
         return;
     }
