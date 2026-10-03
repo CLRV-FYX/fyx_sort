@@ -1851,7 +1851,14 @@ inline std::uint64_t kv_pick_pivot(const std::uint64_t* a, std::size_t nr, bool&
     const std::size_t step = nr / S;
     // Signed keys sort as unsigned with the sign bit flipped (and back).
     constexpr std::uint64_t flip = Signed ? 0x8000000000000000ull : 0ull;
-    for (std::size_t i = 0; i < S; ++i) s[i] = O::key(a, i * step + (step >> 1)) ^ flip;
+    // One sample per stratum at a pseudo-random offset inside it: a fixed
+    // stride aliases with periodic inputs (runs of a length dividing into
+    // the stride sample the same run offsets -- the same quantiles).
+    std::uint64_t h = 0x9E3779B97F4A7C15ull * (static_cast<std::uint64_t>(nr) | 1u);
+    for (std::size_t i = 0; i < S; ++i) {
+        h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
+        s[i] = O::key(a, i * step + static_cast<std::size_t>((h >> 11) % step)) ^ flip;
+    }
     vnet_sort<std::uint64_t>(s, S);
     if constexpr (Signed) for (std::size_t i = 0; i < S; ++i) s[i] ^= flip;
     uniform = s[0] == s[S - 1];

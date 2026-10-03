@@ -664,6 +664,31 @@ static void check_record_structured() {
     }
 }
 
+// Periodic input straight into the record quicksort (no routing gates):
+// sorted runs whose length divides the pivot sampler's stride.
+static void check_kv16_periodic() {
+    std::mt19937_64 g(5);
+    for (std::size_t n : {100000ul, 300000ul}) {
+        for (std::size_t run : {1000ul, 625ul, 64ul}) {
+            std::vector<KvLo> v(n);
+            for (std::size_t i = 0; i < n; ++i) v[i] = KvLo{g(), i};
+            for (std::size_t b = 0; b < n; b += run)
+                std::sort(v.begin() + b, v.begin() + std::min(n, b + run),
+                          [](const KvLo& a, const KvLo& c) { return a.key < c.key; });
+            std::vector<KvLo> ref = v;
+            std::sort(ref.begin(), ref.end(), [](const KvLo& a, const KvLo& c) { return a.key < c.key; });
+            const int r = fyx::detail::trivial_field_kv16_vqsort<std::uint64_t>(
+                v.data(), n, [](const KvLo& a, const KvLo& c) { return a.key < c.key; }, 0, false);
+            if (r == 0) continue;                     // no AVX-512 here
+            bool ok = r == 1;
+            for (std::size_t i = 0; i < n && ok; ++i) ok = v[i].key == ref[i].key;
+            std::uint64_t sv = 0, sr = 0;
+            for (std::size_t i = 0; i < n; ++i) { sv += v[i].val * 0x9E3779B97F4A7C15ull; sr += ref[i].val * 0x9E3779B97F4A7C15ull; }
+            CHECK(ok && sv == sr, "kv16 periodic runs");
+        }
+    }
+}
+
 static void check_kv16_vqsort() {
     std::mt19937_64 g(77);
     const std::size_t sizes[] = {2049, 4096, 33333, 100000, 300000};
@@ -766,6 +791,7 @@ int main() {
     check_round_extract_and_chunks();
     check_round_strings();
     check_kv16_vqsort();
+    check_kv16_periodic();
     check_record_structured();
 
     std::printf("checks=%d failures=%d\n", checks, failures);
