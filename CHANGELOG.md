@@ -6,6 +6,21 @@ Date: 2026-09-16
 
 ### Added
 
+- **记录（16 字节 kv）并行化与修复（2026-10-03，同机 2 vCPU / GCC 12.2，1M，进程内最优 5 次）**：
+  - 记录 MSD radix 并行版（分块直方图 + 分块 scatter + 桶级任务，桶内验证）：kv16 random 并行
+    19→约 10 ms，zipf 20→约 11 ms，sqrt_unique 12→约 7 ms，sorted_runs（partial 分支同样传入并行）
+    19→约 9.5 ms。
+  - flag 计数排序：scatter 对每个目标流写预取（256 流不再掉出硬件预取器），类别上限 48→255，
+    few256 kv16 串行 16→约 11 ms；并行版（分块独立建类表、合并成全局有序类表、分块 scatter /
+    拷回验证）few16 约 4.9 ms、few256 约 7.7–9.5 ms。
+  - 记录的少量有序段（≤9 段，64 点抽样无下降才进入）并行两两归并；affix（有序头 + 乱序尾）在并行
+    模式下用 co-rank 并行归并。concat2 kv16 并行约 10→6.6 ms，sorted_tail 约 11→8 ms。
+  - **修复**：记录 radix 在比较器不是字段序（如 (key,val) 字典序）时于中途拒绝，后续桶仍留在
+    scratch 中导致元素丢失（上一轮引入，随机 fuzz 发现）；现拒绝前把剩余桶拷回。`t_adaptive` 新增
+    该回归形状及记录并行（升/降/字典序）测试。
+  - 试验未采用：flag scatter 4 路分道（无收益）、scratch arena 2 MiB 对齐 + MADV_HUGEPAGE（本机无
+    稳定收益）。
+
 - **记录 / 字符串 / 结构化输入第三轮（2026-10-03，Ice Lake-SP 2 vCPU / GCC 12.2 单机，1M 元素，
   本地 kvb 进程内对比，单次噪声约 ±15%；未在其它 CPU / 编译器上验证）**：
   - 16 字节记录（u64 键 + 载荷）按字段证明后走记录 MSD radix（`record_msd_sort`，
