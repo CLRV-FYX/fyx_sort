@@ -627,6 +627,40 @@ static void check_record_structured() {
         std::reverse(late.begin(), late.end());
         rec_check("reverse late break", late, true, false);
         rec_check("reverse late break as asc", late, false, false);
+        // Run merges: rotations, k concatenated sorted batches (ties across
+        // batches), sorted head + random tail, far swaps; serial and parallel.
+        std::vector<RecS> rnd(n);
+        for (auto& r : rnd) r = {rng(), static_cast<std::int64_t>(rng() % (n / 2 + 1))};
+        auto by_key = [](const RecS& a, const RecS& b) { return a.key < b.key; };
+        for (std::size_t k : {2ul, 3ul, 5ul, 9ul, 10ul}) {
+            std::vector<RecS> c = rnd;
+            for (std::size_t b = 0; b < k; ++b)
+                std::sort(c.begin() + (n * b) / k, c.begin() + (n * (b + 1)) / k, by_key);
+            rec_check("concat runs", c, false, false);
+            rec_check("concat runs par", c, false, true);
+        }
+        std::vector<RecS> rot = rnd;
+        std::sort(rot.begin(), rot.end(), by_key);
+        for (std::size_t sh : {std::size_t(1), n / 3, n - 1}) {
+            std::vector<RecS> r = rot;
+            std::rotate(r.begin(), r.begin() + sh, r.end());
+            rec_check("rotated", r, false, false);
+            rec_check("rotated par", r, false, true);
+        }
+        for (std::size_t tail : {n / 10, n / 3}) {
+            std::vector<RecS> t = rnd;
+            std::sort(t.begin(), t.end() - tail, by_key);
+            rec_check("sorted tail", t, false, false);
+            rec_check("sorted tail par", t, false, true);
+        }
+        std::vector<RecS> fs = rot;
+        for (int k = 0; k < 8; ++k) std::swap(fs[rng() % n], fs[rng() % n]);
+        rec_check("far swaps", fs, false, false);
+        rec_check("far swaps par", fs, false, true);
+        // A rotation whose break is a lone dip must still sort.
+        std::vector<RecS> dip = rot;
+        std::swap(dip[n / 2], dip[0]);
+        rec_check("dip", dip, false, false);
     }
 }
 
