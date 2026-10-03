@@ -392,9 +392,9 @@ static bool kv_ok(const std::vector<KV16>& in, const std::vector<KV16>& out, Com
 static void check_round_records() {
     const std::size_t sizes[] = {40000, 300000};
     for (std::size_t n : sizes) {
-        for (int shape = 0; shape < 8; ++shape) {
+        for (int shape = 0; shape < 11; ++shape) {
             std::vector<KV16> v(n);
-            const std::uint64_t mod = shape == 6 ? 16 : (shape == 7 ? 300 : ~0ull);
+            const std::uint64_t mod = shape == 6 ? 16 : (shape == 7 || shape == 8) ? 300 : ~0ull;
             for (std::size_t i = 0; i < n; ++i) v[i] = KV16{i, rng() % mod};
             if (shape == 1) {                                   // sqrt-length sorted runs
                 const std::size_t run = 547;
@@ -414,6 +414,19 @@ static void check_round_records() {
                 std::shuffle(blocks.begin(), blocks.end(), rng);
                 v.clear();
                 for (auto& b : blocks) { if (rng() % 3 == 0) std::reverse(b.begin(), b.end()); v.insert(v.end(), b.begin(), b.end()); }
+            } else if (shape == 8) {
+                // Regression: sorted by key then reversed, duplicate keys.  A
+                // (key, val) comparator makes the record radix decline after
+                // it has scattered -- it must still hand back a permutation.
+                std::sort(v.begin(), v.end(), KV16Less{});
+                std::reverse(v.begin(), v.end());
+            } else if (shape == 9) {                            // three concatenated sorted batches
+                std::sort(v.begin(), v.begin() + n / 3, KV16Less{});
+                std::sort(v.begin() + n / 3, v.begin() + 2 * (n / 3), KV16Less{});
+                std::sort(v.begin() + 2 * (n / 3), v.end(), KV16Less{});
+            } else if (shape == 10) {                           // sorted head, shuffled tail
+                std::sort(v.begin(), v.end(), KV16Less{});
+                std::shuffle(v.begin() + n - n / 10, v.end(), rng);
             } else if (shape == 5) {                            // single far-displaced elements
                 std::sort(v.begin(), v.end(), KV16Less{});
                 for (int k = 0; k < 12; ++k) {
@@ -428,6 +441,14 @@ static void check_round_records() {
             CHECK(kv_ok(v, b, KV16Greater{}), "kv16 descending");
             auto c = v; sort(c.data(), n, KV16Lex{});
             CHECK(kv_ok(v, c, KV16Lex{}), "kv16 lexicographic (key, val) -- field proof must not over-claim");
+            Options par;
+            par.parallel = Tri::On;
+            auto pa = v; sort(pa.data(), n, KV16Less{}, par);
+            CHECK(kv_ok(v, pa, KV16Less{}), "kv16 ascending, parallel");
+            auto pb = v; sort(pb.data(), n, KV16Greater{}, par);
+            CHECK(kv_ok(v, pb, KV16Greater{}), "kv16 descending, parallel");
+            auto pc = v; sort(pc.data(), n, KV16Lex{}, par);
+            CHECK(kv_ok(v, pc, KV16Lex{}), "kv16 lexicographic, parallel");
             auto d = v; std::sort(d.begin(), d.end(), KV16Less{});
             auto e = v;
             detail::record_msd_sort<std::uint64_t>(e.data(), n, KV16Less{}, 8, false);
