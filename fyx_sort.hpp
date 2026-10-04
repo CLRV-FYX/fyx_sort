@@ -5093,7 +5093,8 @@ FYX_FORCE_INLINE typename VOps<T>::mask vunclean_lanes(typename VOps<T>::reg v) 
 }
 
 template <class T>
-inline unsigned vsmall_prescan(const T* a, std::size_t n) {
+inline unsigned vsmall_prescan(const T* a, std::size_t n, std::size_t* settled = nullptr,
+                               unsigned* prior = nullptr) {
     using P = VOps<T>;
     using M = typename P::mask;
     constexpr std::size_t L = static_cast<std::size_t>(P::V);
@@ -5104,10 +5105,14 @@ inline unsigned vsmall_prescan(const T* a, std::size_t n) {
         for (; i + L + 1 <= n; i += L) {
             const auto v = P::loadu(a + i);
             const auto w = P::loadu(a + i + 1);
+            const unsigned before = (up ? 1u : 0u) | (dn ? 2u : 0u);
             up  = static_cast<M>(up | P::gt(w, v));
             dn  = static_cast<M>(dn | P::gt(v, w));
             bad = static_cast<M>(bad | vunclean_lanes<T>(v));
             if (up && dn) {
+                // Pairs (j, j+1), j < i, saw only the `before` direction(s).
+                if (settled) *settled = i;
+                if (prior) *prior = before;
                 // Order is settled; what is left is the cleanliness scan.
                 // Floating point: the rest of the cleanliness scan is left to
                 // the caller (bit 3), which needs it only if the structural
@@ -6120,10 +6125,15 @@ inline bool vqsort_range_clean(const T* p, std::size_t n) {
 /// meaningless -- hardware order differs from the library's total order);
 /// bit 3: cleanliness not established -- the scan stopped once both
 /// directions were seen (always with bits 0 and 1 set, bit 2 clear).
+/// settled / prior (optional): when the scan stopped early (bit 3, or the
+/// return value 3 for integers), the block start i where both directions
+/// were first seen and the order bits of pairs (j, j+1), j < i (the
+/// monotone prefix); untouched otherwise.
 template <class T>
-inline unsigned vqsort_small_prescan(const T* p, std::size_t n) {
-    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; return 4u; }
-    else return isa_avx512::vsmall_prescan<T>(p, n);
+inline unsigned vqsort_small_prescan(const T* p, std::size_t n, std::size_t* settled = nullptr,
+                                     unsigned* prior = nullptr) {
+    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; (void)settled; (void)prior; return 4u; }
+    else return isa_avx512::vsmall_prescan<T>(p, n, settled, prior);
 }
 
 template <class T, class C>
@@ -6225,7 +6235,7 @@ inline constexpr std::size_t vqsort_leaf() {
 
 #else  // no AVX-512 kernel compiled in
 
-template <class T> inline unsigned vqsort_small_prescan(const T*, std::size_t) { return 4u; }
+template <class T> inline unsigned vqsort_small_prescan(const T*, std::size_t, std::size_t* = nullptr, unsigned* = nullptr) { return 4u; }
 template <class T> inline bool   vqsort_serial_checked(T*, std::size_t) { return false; }
 template <class T> inline bool   vqsort_range_clean(const T*, std::size_t) { return false; }
 inline int                       vqsort_budget(std::size_t) { return 0; }
@@ -8844,13 +8854,13 @@ inline std::size_t radix_key_find_break(const T* p, std::size_t start, std::size
 // first descent (exact position: radix_key_find_break from there).
 template <class T>
 inline std::size_t count_descents_capped(const T* p, std::size_t n, bool descending,
-                                         std::size_t cap, std::size_t& first) {
+                                         std::size_t cap, std::size_t& first, std::size_t from = 1) {
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
     const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
     std::size_t d = 0;
     first = n;
-    for (std::size_t b = 1; b < n; b += 256) {
+    for (std::size_t b = from < 1 ? 1 : from; b < n; b += 256) {
         const std::size_t e = std::min(n, b + 256);
         Key bd = 0;                        // same lane width as the keys: vectorizes
         for (std::size_t j = b; j < e; ++j)
@@ -9235,7 +9245,7 @@ inline bool try_hash_count_sort(T* p, std::size_t n, bool descending) {
 // Detection is read-only and gives up past `max_runs` runs, so a declined
 // range is untouched; random data declines within a few dozen keys.
 template <class T>
-inline bool try_few_runs_merge(T* p, std::size_t n, bool descending) {
+inline bool try_few_runs_merge(T* p, std::size_t n, bool descending, std::size_t mono = 0) {
     constexpr std::size_t kMaxRuns = 8;
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
@@ -9244,20 +9254,65 @@ inline bool try_few_runs_merge(T* p, std::size_t n, bool descending) {
     std::size_t bnd[kMaxRuns + 1];
     bool rev[kMaxRuns];
     const std::size_t min_run = std::max<std::size_t>(32, n / 64);
+    // [lo, n) non-increasing?  Then reverse it in the same pass: blocks from
+    // both ends are checked (OR-reduced, vectorizes) and swapped.  A break
+    // swaps the done blocks back.  A strided sample gates the attempt.
+    auto fused_reverse_tail = [&](std::size_t lo) -> bool {
+        constexpr std::size_t S = 16, B = 64;
+        if (n - lo < 4 * B) return false;
+        Key prev = key(p[lo]);
+        for (std::size_t s = 1; s <= S; ++s) {
+            const Key kq = key(p[lo + (n - 1 - lo) * s / S]);
+            if (prev < kq) return false;
+            prev = kq;
+        }
+        std::size_t l = lo, r = n;
+        auto undo = [&]() {
+            for (std::size_t k = 0; k < l - lo; ++k) std::swap(p[lo + k], p[n - 1 - k]);
+        };
+        while (r - l >= 2 * B) {
+            Key bad = 0;
+            for (std::size_t k = 0; k < B; ++k)
+                bad = static_cast<Key>(bad | static_cast<Key>(key(p[l + k]) < key(p[l + k + 1])));
+            for (std::size_t k = 0; k < B; ++k)
+                bad = static_cast<Key>(bad | static_cast<Key>(key(p[r - B + k - 1]) < key(p[r - B + k])));
+            if (bad) { undo(); return false; }
+            for (std::size_t k = 0; k < B; ++k) std::swap(p[l + k], p[r - 1 - k]);
+            l += B;
+            r -= B;
+        }
+        for (std::size_t k = l; k + 1 < r; ++k)
+            if (key(p[k]) < key(p[k + 1])) { undo(); return false; }
+        std::reverse(p + l, p + r);
+        return true;
+    };
     std::size_t R = 0, i = 0;
     while (i < n) {
         if (R == kMaxRuns) return false;
-        const std::size_t start = i;
+        std::size_t start = i;
         std::size_t j = i + 1;
         const Key k0 = key(p[i]);
         while (j < n && key(p[j]) == k0) ++j;
         const bool down = j < n && key(p[j]) < k0;
+        // A peak (ascending run, then a descending one) joins the
+        // descending run: p[start - 1] >= p[start], so that run stays
+        // non-increasing, and once reversed it starts at the peak -- the
+        // classic organ pipe (sort, reverse the back half) then coalesces
+        // with no data movement.
+        if (down && R > 0 && !rev[R - 1] && start - bnd[R - 1] > min_run) --start;
+        bool done = false;
+        if (down && j < n && fused_reverse_tail(start)) { j = n; done = true; }
+        // mono: no descent among the first `mono` keys (caller's scan).
+        if (i == 0 && !down && j < mono) j = mono;
         // vectorised run end (non-strict in the run's own direction)
         if (j < n) j = radix_key_find_break(p, j, n, RT::encode(p[j - 1]), !down, descending);
         // Short runs mean local disorder (insertion's job) or noise.
-        if (j - start < min_run) return false;
+        if (j - start < min_run) {
+            if (done) std::reverse(p + start, p + n);   // leave a permutation of the input
+            return false;
+        }
         bnd[R] = start;
-        rev[R] = down;
+        rev[R] = down && !done;
         ++R;
         i = j;
     }
@@ -9265,6 +9320,97 @@ inline bool try_few_runs_merge(T* p, std::size_t n, bool descending) {
     if (R < 2) return false;
     for (std::size_t r = 0; r < R; ++r)
         if (rev[r]) std::reverse(p + bnd[r], p + bnd[r + 1]);
+    // Neighbours already in order (value-disjoint runs: organ pipe built by
+    // reversing a sorted half, concatenations of ascending blocks) coalesce
+    // for free; a pair in swapped order is one rotation.  Saves the merge
+    // pass and the copy-back.
+    {
+        std::size_t w = 1;
+        for (std::size_t r = 1; r < R; ++r) {
+            if (!(key(p[bnd[r]]) < key(p[bnd[r] - 1]))) continue;
+            bnd[w++] = bnd[r];
+        }
+        bnd[w] = n;
+        R = w;
+        if (R == 1) return true;
+        if (R == 2 && !(key(p[0]) < key(p[n - 1]))) {
+            // max(second) <= min(first): swap the blocks.
+            std::rotate(p, p + bnd[1], p + n);
+            return true;
+        }
+    }
+    if (R == 2) {
+        // Two runs: keys of the first run up to min(second) and of the
+        // second from max(first) on are already final (binary searches);
+        // merge only the overlap in place, buffering its smaller side.  An
+        // organ pipe whose peak landed in the first run overlaps in one
+        // key: one block move instead of merge-to-buffer plus copy-back.
+        const std::size_t mid = bnd[1];
+        const Key kb0 = key(p[mid]), ka1 = key(p[mid - 1]);
+        std::size_t lo = 0, hi = mid;                      // first key(p[i]) > kb0 in [0, mid)
+        while (lo < hi) { const std::size_t m = lo + (hi - lo) / 2; if (kb0 < key(p[m])) hi = m; else lo = m + 1; }
+        const std::size_t s = lo;
+        lo = mid; hi = n;                                  // first key(p[i]) >= ka1 in [mid, n)
+        while (lo < hi) { const std::size_t m = lo + (hi - lo) / 2; if (key(p[m]) < ka1) lo = m + 1; else hi = m; }
+        const std::size_t t = lo;
+        const std::size_t a = mid - s, b = t - mid;        // both >= 1 (runs did not coalesce)
+        const std::size_t m = std::min(a, b);
+        ScratchLease<T> lease(m);
+        std::unique_ptr<T[]> priv;
+        if (!lease.valid()) priv.reset(new T[m]);
+        T* tmp = lease.valid() ? lease.get() : priv.get();
+        auto lower = [&](std::size_t l, std::size_t h, Key k) {   // first key >= k
+            while (l < h) { const std::size_t q = l + (h - l) / 2; if (key(p[q]) < k) l = q + 1; else h = q; }
+            return l;
+        };
+        auto upper = [&](std::size_t l, std::size_t h, Key k) {   // first key > k
+            while (l < h) { const std::size_t q = l + (h - l) / 2; if (k < key(p[q])) h = q; else l = q + 1; }
+            return l;
+        };
+        const bool gallop = m * 16 < std::max(a, b);
+        if (a <= b) {
+            // Forward: write index o never passes the next unread B slot.
+            std::memcpy(static_cast<void*>(tmp), static_cast<const void*>(p + s), a * sizeof(T));
+            std::size_t o = s, i = 0, j = mid;
+            if (gallop) {
+                for (; i < a; ++i) {
+                    const std::size_t e = lower(j, t, key(tmp[i]));
+                    std::memmove(static_cast<void*>(p + o), static_cast<const void*>(p + j), (e - j) * sizeof(T));
+                    o += e - j; j = e;
+                    p[o++] = tmp[i];
+                }
+            } else {
+                while (i < a && j < t) {
+                    const bool tb = key(p[j]) < key(tmp[i]);
+                    p[o++] = tb ? p[j] : tmp[i];
+                    j += tb ? 1u : 0u;
+                    i += tb ? 0u : 1u;
+                }
+                if (i < a) std::memcpy(static_cast<void*>(p + o), static_cast<const void*>(tmp + i), (a - i) * sizeof(T));
+            }
+        } else {
+            // Backward: write index o never passes below the next unread A slot.
+            std::memcpy(static_cast<void*>(tmp), static_cast<const void*>(p + mid), b * sizeof(T));
+            std::size_t o = t, i = b, j = mid;              // counts / ends
+            if (gallop) {
+                for (; i > 0; --i) {
+                    const std::size_t e = upper(s, j, key(tmp[i - 1]));
+                    std::memmove(static_cast<void*>(p + o - (j - e)), static_cast<const void*>(p + e), (j - e) * sizeof(T));
+                    o -= j - e; j = e;
+                    p[--o] = tmp[i - 1];
+                }
+            } else {
+                while (i > 0 && j > s) {
+                    const bool ta = key(tmp[i - 1]) < key(p[j - 1]);
+                    p[--o] = ta ? p[j - 1] : tmp[i - 1];
+                    j -= ta ? 1u : 0u;
+                    i -= ta ? 0u : 1u;
+                }
+                if (i > 0) std::memcpy(static_cast<void*>(p + s), static_cast<const void*>(tmp), i * sizeof(T));
+            }
+        }
+        return true;
+    }
     ScratchLease<T> lease(n);
     std::unique_ptr<T[]> priv;
     if (!lease.valid()) priv.reset(new T[n]);
@@ -11243,6 +11389,24 @@ inline bool try_bitonic_runs_sort(T* p, std::size_t n, Comp comp) {
                 return false;
             }
         };
+        // Value-disjoint runs (organ pipe built as sort-then-reverse-half,
+        // and its mirror): after the descending run is reversed in place the
+        // range is sorted, or one rotation from sorted -- no merge pass.
+        // X = ascending run, Y = descending run; the test reads their ends.
+        {
+            const std::size_t xl = first_asc ? 0 : split, xh = first_asc ? split - 1 : n - 1;
+            const std::size_t yl = first_asc ? split : 0, yh = first_asc ? n - 1 : split - 1;
+            // Y's minimum is p[yh], its maximum p[yl].
+            const bool x_then_y = !before(p[yh], p[xh]);   // max X <= min Y
+            const bool y_then_x = !before(p[xl], p[yl]);   // max Y <= min X
+            if (x_then_y || y_then_x) {
+                std::reverse(p + yl, p + yh + 1);
+                if (first_asc ? y_then_x && !x_then_y : x_then_y && !y_then_x)
+                    std::rotate(p, p + split, p + n);
+                return true;
+            }
+        }
+
         if (try_arithmetic_organ_fill()) return true;
 
         if constexpr (std::is_trivially_copyable<T>::value) {
@@ -19518,8 +19682,16 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                 detail::record_dispatch(detail::DispatchDecision::ProfileAllEqual);
                 return;
             }
-            const unsigned pre = detail::vqsort_small_prescan(p, n);
+            std::size_t settled = 0;
+            unsigned prior = 0;
+            const unsigned pre = detail::vqsort_small_prescan(p, n, &settled, &prior);
             const bool clean = (pre & 4u) == 0;   // as far as scanned
+            // Keys before `mono` hold no descent in the sort direction (the
+            // prescan stopped in the block where its first one lies, and
+            // hardware order is the library's on the clean prefix), so the
+            // descent scans below start there instead of re-reading it.
+            const std::size_t mono =
+                (clean && (pre & 3u) == 3u && prior == (descending ? 2u : 1u)) ? settled : 0;
             detail::FastOrderKind k;
             if (clean) {
                 const bool up = (pre & 1u) != 0, dn = (pre & 2u) != 0;
@@ -19557,8 +19729,8 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             // only the few-run merge can use that; skipping the descent
             // count and the repairs saves a full pass before the quicksort.
             const bool runs_like = n > detail::vqsort_leaf<T>() &&
-                                   detail::descents_look_like_runs(p, n, 1, descending, 16, 4);
-            if (runs_like && detail::try_few_runs_merge(p, n, descending)) {
+                                   detail::descents_look_like_runs(p, n, mono > 1 ? mono : 1, descending, 16, 4);
+            if (runs_like && detail::try_few_runs_merge(p, n, descending, mono)) {
                 detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                 return;
             }
@@ -19581,7 +19753,7 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                 } else if (detail::descents_look_dense(p, n, descending)) {
                     D = n / 16 + 1;        // random-like: skip the n/8-pair count
                 } else {
-                    D = detail::count_descents_capped(p, n, descending, n / 16, brk);
+                    D = detail::count_descents_capped(p, n, descending, n / 16, brk, mono);
                 }
                 if (D == 1) {
                     // Two runs (concatenated sorted halves, a rotation).
@@ -19592,7 +19764,7 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                     return;
                 }
                 // A few monotone runs either way (organ pipe, block swaps).
-                if (detail::try_few_runs_merge(p, n, descending)) {
+                if (detail::try_few_runs_merge(p, n, descending, mono)) {
                     detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                     return;
                 }

@@ -1086,7 +1086,8 @@ FYX_FORCE_INLINE typename VOps<T>::mask vunclean_lanes(typename VOps<T>::reg v) 
 }
 
 template <class T>
-inline unsigned vsmall_prescan(const T* a, std::size_t n) {
+inline unsigned vsmall_prescan(const T* a, std::size_t n, std::size_t* settled = nullptr,
+                               unsigned* prior = nullptr) {
     using P = VOps<T>;
     using M = typename P::mask;
     constexpr std::size_t L = static_cast<std::size_t>(P::V);
@@ -1097,10 +1098,14 @@ inline unsigned vsmall_prescan(const T* a, std::size_t n) {
         for (; i + L + 1 <= n; i += L) {
             const auto v = P::loadu(a + i);
             const auto w = P::loadu(a + i + 1);
+            const unsigned before = (up ? 1u : 0u) | (dn ? 2u : 0u);
             up  = static_cast<M>(up | P::gt(w, v));
             dn  = static_cast<M>(dn | P::gt(v, w));
             bad = static_cast<M>(bad | vunclean_lanes<T>(v));
             if (up && dn) {
+                // Pairs (j, j+1), j < i, saw only the `before` direction(s).
+                if (settled) *settled = i;
+                if (prior) *prior = before;
                 // Order is settled; what is left is the cleanliness scan.
                 // Floating point: the rest of the cleanliness scan is left to
                 // the caller (bit 3), which needs it only if the structural
@@ -2113,10 +2118,15 @@ inline bool vqsort_range_clean(const T* p, std::size_t n) {
 /// meaningless -- hardware order differs from the library's total order);
 /// bit 3: cleanliness not established -- the scan stopped once both
 /// directions were seen (always with bits 0 and 1 set, bit 2 clear).
+/// settled / prior (optional): when the scan stopped early (bit 3, or the
+/// return value 3 for integers), the block start i where both directions
+/// were first seen and the order bits of pairs (j, j+1), j < i (the
+/// monotone prefix); untouched otherwise.
 template <class T>
-inline unsigned vqsort_small_prescan(const T* p, std::size_t n) {
-    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; return 4u; }
-    else return isa_avx512::vsmall_prescan<T>(p, n);
+inline unsigned vqsort_small_prescan(const T* p, std::size_t n, std::size_t* settled = nullptr,
+                                     unsigned* prior = nullptr) {
+    if constexpr (!vqsort_kernel_supported_v<T>) { (void)p; (void)n; (void)settled; (void)prior; return 4u; }
+    else return isa_avx512::vsmall_prescan<T>(p, n, settled, prior);
 }
 
 template <class T, class C>
@@ -2218,7 +2228,7 @@ inline constexpr std::size_t vqsort_leaf() {
 
 #else  // no AVX-512 kernel compiled in
 
-template <class T> inline unsigned vqsort_small_prescan(const T*, std::size_t) { return 4u; }
+template <class T> inline unsigned vqsort_small_prescan(const T*, std::size_t, std::size_t* = nullptr, unsigned* = nullptr) { return 4u; }
 template <class T> inline bool   vqsort_serial_checked(T*, std::size_t) { return false; }
 template <class T> inline bool   vqsort_range_clean(const T*, std::size_t) { return false; }
 inline int                       vqsort_budget(std::size_t) { return 0; }

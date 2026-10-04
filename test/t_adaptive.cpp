@@ -666,6 +666,110 @@ static void check_record_structured() {
 
 // Periodic input straight into the record quicksort (no routing gates):
 // sorted runs whose length divides the pivot sampler's stride.
+
+// Few-run numeric shapes (organ pipes with the peak in either run, V shapes,
+// rotations, overlapping two-run merges on the gallop and the branch-free
+// path, a descending run that breaks near its end -- the fused reverse must
+// undo -- and ties at the seams), through the public entry point and the
+// few-run merge directly (which must sort or decline with a permutation).
+template <class T>
+static void few_runs_case(const char* tname, const char* sname, std::vector<T> v) {
+    std::vector<T> ref = v;
+    std::sort(ref.begin(), ref.end());
+    auto ok_vs = [&](const std::vector<T>& got) {
+        if constexpr (std::is_same<T, double>::value) return double_ok(got, ref);
+        else return got == ref;
+    };
+    char msg[160];
+    std::vector<T> a = v;
+    fyx::Options o; o.parallel = fyx::Tri::Off;
+    fyx::sort(a.data(), a.size(), o);
+    std::snprintf(msg, sizeof msg, "few-runs %s %s n=%zu public", tname, sname, v.size());
+    CHECK(ok_vs(a), msg);
+    std::vector<T> d = v;
+    fyx::sort(d.data(), d.size(), std::greater<T>{});
+    std::reverse(d.begin(), d.end());
+    std::snprintf(msg, sizeof msg, "few-runs %s %s n=%zu greater", tname, sname, v.size());
+    if constexpr (!std::is_same<T, double>::value) CHECK(d == ref, msg);
+    std::vector<T> b = v;
+    const bool took = fyx::detail::try_few_runs_merge(b.data(), b.size(), false, 0);
+    std::snprintf(msg, sizeof msg, "few-runs %s %s n=%zu direct (took=%d)", tname, sname, v.size(), took ? 1 : 0);
+    CHECK(took ? ok_vs(b) : same_multiset(b, v), msg);
+    for (std::size_t hint : {std::size_t(64), v.size() / 3}) {
+        // A valid hint: no descent among the first `hint` keys.
+        std::size_t h = 1;
+        while (h < v.size() && !(v[h] < v[h - 1])) ++h;
+        if (hint > h) continue;
+        std::vector<T> c = v;
+        const bool t2 = fyx::detail::try_few_runs_merge(c.data(), c.size(), false, hint);
+        std::snprintf(msg, sizeof msg, "few-runs %s %s n=%zu hint=%zu", tname, sname, v.size(), hint);
+        CHECK(t2 ? ok_vs(c) : same_multiset(c, v), msg);
+    }
+}
+
+template <class T>
+static void check_few_runs_numeric(const char* tname) {
+    std::mt19937_64 g(77);
+    for (std::size_t n : {3000ul, 100000ul, 300001ul}) {
+        for (int dup = 0; dup < 2; ++dup) {
+            auto gen = [&]() {
+                std::vector<T> v(n);
+                for (auto& x : v) {
+                    const std::uint64_t r = dup ? g() % 97 : g();
+                    if constexpr (std::is_floating_point<T>::value) x = static_cast<T>(static_cast<double>(r % 2000003) - 1000000.0) / 7;
+                    else x = static_cast<T>(r);
+                }
+                return v;
+            };
+            const std::size_t h = n / 2;
+            {   // classic organ pipe: sort, reverse the back half (peak in the front run)
+                auto v = gen(); std::sort(v.begin(), v.end()); std::reverse(v.begin() + h, v.end());
+                few_runs_case(tname, "organ", v);
+                std::reverse(v.begin(), v.begin() + h); std::reverse(v.begin() + h, v.end());
+                few_runs_case(tname, "valley", v);   // low half descending, high half ascending
+            }
+            {   // interleaved organ: both halves random, front ascending, back descending
+                auto v = gen(); std::sort(v.begin(), v.begin() + h); std::sort(v.begin() + h, v.end());
+                std::reverse(v.begin() + h, v.end());
+                few_runs_case(tname, "organ-overlap", v);
+                std::reverse(v.begin(), v.end());
+                few_runs_case(tname, "v-overlap", v);
+            }
+            {   // V shape, value-disjoint either way
+                auto v = gen(); std::sort(v.begin(), v.end());
+                auto w = v; std::reverse(w.begin(), w.begin() + h);
+                few_runs_case(tname, "v-disjoint", w);
+                std::rotate(v.begin(), v.begin() + h, v.end());
+                std::reverse(v.begin() + (n - h), v.end());
+                few_runs_case(tname, "rot-desc", v);
+            }
+            for (std::size_t ov : {std::size_t(1), std::size_t(5), n / 40, n / 3}) {
+                // two ascending runs whose value ranges overlap by about ov keys
+                auto v = gen(); std::sort(v.begin(), v.end());
+                const std::size_t c = std::min(h, ov);
+                std::vector<T> A(v.begin(), v.begin() + h), B(v.begin() + h, v.end());
+                for (std::size_t k = 0; k < c && k < B.size(); ++k) std::swap(A[h - 1 - k], B[k]);
+                std::sort(A.begin(), A.end()); std::sort(B.begin(), B.end());
+                std::vector<T> w(A); w.insert(w.end(), B.begin(), B.end());
+                few_runs_case(tname, "two-asc-overlap", w);
+                std::vector<T> u(B); u.insert(u.end(), A.begin(), A.end());
+                few_runs_case(tname, "two-asc-swapped", u);
+                // same with the back run descending (fused reverse path)
+                std::reverse(w.begin() + h, w.end());
+                few_runs_case(tname, "asc-desc-overlap", w);
+            }
+            for (std::size_t tail : {std::size_t(3), std::size_t(300), n / 4}) {
+                // descending back run that breaks before the end
+                auto v = gen(); std::sort(v.begin(), v.end()); std::reverse(v.begin() + h, v.end());
+                std::sort(v.end() - static_cast<std::ptrdiff_t>(tail), v.end());
+                few_runs_case(tname, "desc-breaks", v);
+                auto w = v; std::swap(w[h + (n - h) / 2], w[h + (n - h) / 2 + 1]);
+                few_runs_case(tname, "desc-mid-swap", w);
+            }
+        }
+    }
+}
+
 static void check_kv16_periodic() {
     std::mt19937_64 g(5);
     for (std::size_t n : {100000ul, 300000ul}) {
@@ -792,6 +896,10 @@ int main() {
     check_round_strings();
     check_kv16_vqsort();
     check_kv16_periodic();
+    check_few_runs_numeric<std::int32_t>("int32");
+    check_few_runs_numeric<std::uint64_t>("uint64");
+    check_few_runs_numeric<std::int64_t>("int64");
+    check_few_runs_numeric<double>("double");
     check_record_structured();
 
     std::printf("checks=%d failures=%d\n", checks, failures);
