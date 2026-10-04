@@ -1794,10 +1794,12 @@ inline bool kv_fin_equal(Fin& fin, std::size_t lo, std::size_t cnt) {
     return kv_fin_equiv(fin, lo, lo, cnt);
 }
 
-/// Uniform-sample check: 1 when every key in records [lo, lo + nr) equals
-/// `key` and fin proved the range, 2 when fin rejected it, 0 when some key
-/// differs.  Read-only, block by block, with fin.verify run on each block
-/// while it is in L1 (one memory pass for both proofs).
+/// Uniform-sample check: 1 when records [lo, lo + nr) are proven sorted
+/// (all equivalent to the first under fin's comparator), 2 when fin rejected
+/// a block whose keys all equal `key`, 0 when some key differs (partition
+/// on).  Block by block in L1.  The comparator proof runs first: when it
+/// passes the block is final whatever its keys are, so the key scan is paid
+/// only on a failing block, to tell "keys differ" from "comparator rejects".
 template <bool KeyHi, bool Signed, class Fin>
 inline int kv_all_equal_fin(const std::uint64_t* base, std::size_t lo, std::size_t nr, std::uint64_t key,
                             Fin& fin) {
@@ -1805,28 +1807,21 @@ inline int kv_all_equal_fin(const std::uint64_t* base, std::size_t lo, std::size
     const __m512i kv = _mm512_set1_epi64(static_cast<long long>(key));
     const __mmask8 km = static_cast<__mmask8>(O::KM);
     constexpr std::size_t B = 128;                       // records per block
-    bool ok = true;
     for (std::size_t b = 0; b < nr; b += B) {
         const std::size_t e = nr - b < B ? nr : b + B;
+        if (kv_fin_equiv(fin, lo, lo + b, e - b)) continue;
         const std::uint64_t* a = base + 2 * (lo + b);
         const std::size_t n = 2 * (e - b);
-        std::size_t i = 0;
         __mmask8 d = 0;
-        for (; i + 32 <= n; i += 32) {
-            d |= _mm512_mask_cmpneq_epi64_mask(km, _mm512_loadu_si512(a + i), kv);
-            d |= _mm512_mask_cmpneq_epi64_mask(km, _mm512_loadu_si512(a + i + 8), kv);
-            d |= _mm512_mask_cmpneq_epi64_mask(km, _mm512_loadu_si512(a + i + 16), kv);
-            d |= _mm512_mask_cmpneq_epi64_mask(km, _mm512_loadu_si512(a + i + 24), kv);
-        }
-        for (; i < n; i += 8) {
+        for (std::size_t i = 0; i < n; i += 8) {
             const std::size_t m = n - i < 8 ? n - i : 8;
             const __mmask8 v = static_cast<__mmask8>((1u << m) - 1u);
             d |= _mm512_mask_cmpneq_epi64_mask(static_cast<__mmask8>(km & v), _mm512_maskz_loadu_epi64(v, a + i), kv);
         }
-        if (d != 0) return 0;
-        ok &= kv_fin_equiv(fin, lo, lo + b, e - b);
+        // A differing key may also sit in an earlier block that comp let
+        // pass: harmless, those blocks are equivalent to the reference.
+        return d != 0 ? 0 : 2;
     }
-    if (!ok) return 2;
     fin.seam(lo);
     return 1;
 }
