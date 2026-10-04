@@ -5779,6 +5779,28 @@ inline void kv_insertion(std::uint64_t* a, std::size_t nr) {
     }
 }
 
+/// Proof for a range whose keys are bit-identical: every record equivalent
+/// to the reference record `ref` (a strict weak order makes that transitive,
+/// hence sorted).  One load stream against a broadcast reference vectorizes
+/// ~2x faster than the adjacent-pair proof (0.56 vs 1.0 cycles / record, L1).
+/// Fin types without equiv() fall back to the adjacent-pair verify.
+template <class Fin, class = void>
+struct kv_fin_has_equiv : std::false_type {};
+template <class Fin>
+struct kv_fin_has_equiv<Fin, decltype(void(std::declval<Fin&>().equiv(std::size_t(), std::size_t(), std::size_t())))>
+    : std::true_type {};
+template <class Fin>
+inline bool kv_fin_equiv(Fin& fin, std::size_t ref, std::size_t lo, std::size_t cnt) {
+    if constexpr (kv_fin_has_equiv<Fin>::value) return fin.equiv(ref, lo, cnt);
+    else return fin.verify(lo, cnt, lo != ref);
+}
+/// A final range of equal keys: seam plus equivalence proof.
+template <class Fin>
+inline bool kv_fin_equal(Fin& fin, std::size_t lo, std::size_t cnt) {
+    fin.seam(lo);
+    return kv_fin_equiv(fin, lo, lo, cnt);
+}
+
 /// Uniform-sample check: 1 when every key in records [lo, lo + nr) equals
 /// `key` and fin proved the range, 2 when fin rejected it, 0 when some key
 /// differs.  Read-only, block by block, with fin.verify run on each block
@@ -5809,7 +5831,7 @@ inline int kv_all_equal_fin(const std::uint64_t* base, std::size_t lo, std::size
             d |= _mm512_mask_cmpneq_epi64_mask(static_cast<__mmask8>(km & v), _mm512_maskz_loadu_epi64(v, a + i), kv);
         }
         if (d != 0) return 0;
-        ok &= fin.verify(lo + b, e - b, b != 0);
+        ok &= kv_fin_equiv(fin, lo, lo + b, e - b);
     }
     if (!ok) return 2;
     fin.seam(lo);
@@ -5899,14 +5921,14 @@ inline int kvq_step(std::uint64_t* base, std::size_t& lo, std::size_t& nr, std::
     const std::size_t s = kv_partition<KeyHi, Signed, true>(a, nr, pivot, mn);
     if (s == nr) {
         // pivot >= every key (only via a misleading uniform sample).
-        if (mn == pivot) return fin(lo, nr) ? 0 : -1;
+        if (mn == pivot) return kv_fin_equal(fin, lo, nr) ? 0 : -1;
         const std::size_t lt = kv_partition<KeyHi, Signed, false>(a, nr, pivot, mn);
-        if (!fin(lo + lt, nr - lt)) return -1;           // all == pivot
+        if (!kv_fin_equal(fin, lo + lt, nr - lt)) return -1;   // all == pivot
         nr = lt;
         return 1;
     }
     if (mn == pivot) {                                   // low side all == pivot
-        if (!fin(lo, s)) return -1;
+        if (!kv_fin_equal(fin, lo, s)) return -1;
         lo += s;
         nr -= s;
         return 1;
@@ -13700,6 +13722,15 @@ struct Kv16Proof {
         else            for (std::size_t i = 0; i < m; ++i) bad |= static_cast<unsigned char>(c(q[i + 1], q[i]));
         return bad == 0;
     }
+    bool equiv(std::size_t ref, std::size_t lo, std::size_t cnt) const {
+        const T r = p[ref];
+        const T* q = p + lo;
+        const Comp& c = *comp;
+        unsigned char bad = 0;
+        for (std::size_t i = 0; i < cnt; ++i)
+            bad |= static_cast<unsigned char>(c(q[i], r) | c(r, q[i]));
+        return bad == 0;
+    }
     bool seams_ok() const {
         for (unsigned s = 0; s < kSlots; ++s)
             for (const std::size_t i : seams[s])
@@ -13713,6 +13744,7 @@ struct Kv16Fin {
     Kv16Proof<T, Comp>* pr;
     unsigned slot;
     bool verify(std::size_t lo, std::size_t cnt, bool with_prev) { return pr->verify(lo, cnt, with_prev); }
+    bool equiv(std::size_t ref, std::size_t lo, std::size_t cnt) { return pr->equiv(ref, lo, cnt); }
     void seam(std::size_t lo) { if (lo != 0) pr->seams[slot].push_back(lo); }
     bool operator()(std::size_t lo, std::size_t cnt) {
         seam(lo);

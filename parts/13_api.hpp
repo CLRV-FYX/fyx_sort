@@ -5255,6 +5255,15 @@ struct Kv16Proof {
         else            for (std::size_t i = 0; i < m; ++i) bad |= static_cast<unsigned char>(c(q[i + 1], q[i]));
         return bad == 0;
     }
+    bool equiv(std::size_t ref, std::size_t lo, std::size_t cnt) const {
+        const T r = p[ref];
+        const T* q = p + lo;
+        const Comp& c = *comp;
+        unsigned char bad = 0;
+        for (std::size_t i = 0; i < cnt; ++i)
+            bad |= static_cast<unsigned char>(c(q[i], r) | c(r, q[i]));
+        return bad == 0;
+    }
     bool seams_ok() const {
         for (unsigned s = 0; s < kSlots; ++s)
             for (const std::size_t i : seams[s])
@@ -5268,6 +5277,7 @@ struct Kv16Fin {
     Kv16Proof<T, Comp>* pr;
     unsigned slot;
     bool verify(std::size_t lo, std::size_t cnt, bool with_prev) { return pr->verify(lo, cnt, with_prev); }
+    bool equiv(std::size_t ref, std::size_t lo, std::size_t cnt) { return pr->equiv(ref, lo, cnt); }
     void seam(std::size_t lo) { if (lo != 0) pr->seams[slot].push_back(lo); }
     bool operator()(std::size_t lo, std::size_t cnt) {
         seam(lo);
