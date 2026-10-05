@@ -1230,6 +1230,17 @@ template <class T> struct YOps {
         else if constexpr (fp) return _mm256_loadu_pd(reinterpret_cast<const double*>(p));
         else return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
     }
+    // lane order reversed (a member: lambdas do not inherit the target)
+    FYX_FORCE_INLINE static reg rev(reg x) {
+        if constexpr (w4) {
+            const __m256i idx = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+            if constexpr (fp) return _mm256_permutevar8x32_ps(x, idx);
+            else return _mm256_permutevar8x32_epi32(x, idx);
+        } else {
+            if constexpr (fp) return _mm256_permute4x64_pd(x, 0x1B);
+            else return _mm256_permute4x64_epi64(x, 0x1B);
+        }
+    }
     FYX_FORCE_INLINE static __mmask8 unclean(reg v) {
         if constexpr (fp && w4) return _mm256_fpclass_ps_mask(v, kFpClassUnclean);
         else if constexpr (fp) return _mm256_fpclass_pd_mask(v, kFpClassUnclean);
@@ -1238,30 +1249,32 @@ template <class T> struct YOps {
 };
 
 /// Single-stream ymm order scan of the pairs (j, j + 1), j in [from, to),
-/// to <= n - 1.  Accumulates into up / dn / bad; on a mixed block stores
+/// to <= n - 1.  Accumulates into up / dn; on a mixed block stores
 /// settled = block start, prior = flags before it, returns false.
+/// Floats need no NaN / -0 screen here: min / max return their second
+/// operand on unordered or +-0 pairs, so a pair of differing bit patterns
+/// that is neither < nor > raises both flags.  Hence "only up" means every
+/// pair is bitwise equal or increasing in key order (the library's order),
+/// and the sorted / reverse / all-equal verdicts are exact without bit 2.
 template <class T>
 inline bool vprescan_ymm_run(const T* a, std::size_t from, std::size_t to, unsigned& up,
-                             unsigned& dn, unsigned& bad, std::size_t* settled, unsigned* prior) {
+                             unsigned& dn, std::size_t* settled, unsigned* prior) {
     using Y = YOps<T>;
     constexpr std::size_t L = Y::V, BL = 8 * L;
     constexpr bool fp = std::is_floating_point<T>::value;
     std::size_t i = from;
     for (; i + BL <= to; i += BL) {
         __m256i xu = _mm256_setzero_si256(), xd = xu;
-        __mmask8 bb = 0;
         FYX_VQ_UNROLL for (std::size_t k = 0; k < BL; k += L) {
             const auto v = Y::loadu(a + i + k);
             const auto w = Y::loadu(a + i + k + 1);
             const __m256i bv = Y::bits(v);
             xd = _mm256_or_si256(xd, _mm256_xor_si256(Y::bits(Y::vmin(v, w)), bv));   // v > w somewhere
             xu = _mm256_or_si256(xu, _mm256_xor_si256(Y::bits(Y::vmax(v, w)), bv));   // v < w somewhere
-            if constexpr (fp) bb = static_cast<__mmask8>(bb | Y::unclean(v));
         }
         const unsigned before = (up ? 1u : 0u) | (dn ? 2u : 0u);
         up |= _mm256_testz_si256(xu, xu) ? 0u : 1u;
         dn |= _mm256_testz_si256(xd, xd) ? 0u : 1u;
-        bad |= bb;
         if (up && dn) {
             if (settled) *settled = i;
             if (prior) *prior = before;
@@ -1270,9 +1283,11 @@ inline bool vprescan_ymm_run(const T* a, std::size_t from, std::size_t to, unsig
     }
     for (; i < to; ++i) {
         const unsigned before = (up ? 1u : 0u) | (dn ? 2u : 0u);
-        up |= a[i] < a[i + 1] ? 1u : 0u;
-        dn |= a[i + 1] < a[i] ? 1u : 0u;
-        if constexpr (fp) bad |= (std::isnan(a[i]) || (a[i] == T(0) && std::signbit(a[i]))) ? 1u : 0u;
+        const bool lt = a[i] < a[i + 1], gt = a[i + 1] < a[i];
+        up |= lt ? 1u : 0u;
+        dn |= gt ? 1u : 0u;
+        if constexpr (fp)   // unordered / +-0 pair of differing bits: both, as min / max above
+            if (!lt && !gt && std::memcmp(&a[i], &a[i + 1], sizeof(T)) != 0) up = dn = 1u;
         if (up && dn) {
             if (settled) *settled = i;
             if (prior) *prior = before;
@@ -1280,6 +1295,62 @@ inline bool vprescan_ymm_run(const T* a, std::size_t from, std::size_t to, unsig
         }
     }
     return true;
+}
+
+/// [lo, n) non-increasing in sort order (no p[k] < p[k+1] ascending, no
+/// p[k] > p[k+1] descending)?  Then reverse it, checking and swapping blocks
+/// from both ends in one pass (ymm: streaming, no 512-bit warm-up).
+/// 0: reversed.  1: order break, input restored.  2 (floats): a violation in
+/// hardware order -- possibly only a NaN / +-0 pair, which min / max flag
+/// like a break -- so the caller's key-order scalar path decides; input
+/// restored.  No NaN / -0 screen otherwise: a pass means every pair is
+/// bitwise equal or strictly ordered, i.e. ordered in key order too.
+template <class T>
+inline int vreverse_tail_checked(T* p, std::size_t lo, std::size_t n, bool descending) {
+    using Y = YOps<T>;
+    constexpr std::size_t L = Y::V, B = 8 * L;
+    constexpr bool fp = std::is_floating_point<T>::value;
+    std::size_t l = lo, r = n;
+    auto undo = [&]() {
+        for (std::size_t k = 0; k < l - lo; ++k) std::swap(p[lo + k], p[n - 1 - k]);
+    };
+    while (r - l >= 2 * B) {
+        __m256i x = _mm256_setzero_si256();
+        FYX_VQ_UNROLL for (std::size_t k = 0; k < B; k += L) {
+            const auto v1 = Y::loadu(p + l + k), w1 = Y::loadu(p + l + k + 1);
+            const auto v2 = Y::loadu(p + r - B - 1 + k), w2 = Y::loadu(p + r - B + k);
+            // ascending sort forbids v < w (max(v, w) != v), descending v > w
+            const auto m1 = descending ? Y::vmin(v1, w1) : Y::vmax(v1, w1);
+            const auto m2 = descending ? Y::vmin(v2, w2) : Y::vmax(v2, w2);
+            x = _mm256_or_si256(x, _mm256_or_si256(_mm256_xor_si256(Y::bits(m1), Y::bits(v1)),
+                                                   _mm256_xor_si256(Y::bits(m2), Y::bits(v2))));
+        }
+        if (!_mm256_testz_si256(x, x)) { undo(); return fp ? 2 : 1; }
+        FYX_VQ_UNROLL for (std::size_t k = 0; k < B; k += L) {
+            const auto a = Y::loadu(p + l + k), b = Y::loadu(p + r - L - k);
+            if constexpr (fp && sizeof(T) == 4) {
+                _mm256_storeu_ps(reinterpret_cast<float*>(p + l + k), Y::rev(b));
+                _mm256_storeu_ps(reinterpret_cast<float*>(p + r - L - k), Y::rev(a));
+            } else if constexpr (fp) {
+                _mm256_storeu_pd(reinterpret_cast<double*>(p + l + k), Y::rev(b));
+                _mm256_storeu_pd(reinterpret_cast<double*>(p + r - L - k), Y::rev(a));
+            } else {
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(p + l + k), Y::rev(b));
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(p + r - L - k), Y::rev(a));
+            }
+        }
+        l += B;
+        r -= B;
+    }
+    for (std::size_t k = l; k + 1 < r; ++k) {
+        const bool bad = descending ? p[k + 1] < p[k] : p[k] < p[k + 1];
+        if constexpr (fp) {
+            const bool ord = descending ? p[k] < p[k + 1] : p[k + 1] < p[k];
+            if (bad || (!ord && std::memcmp(&p[k], &p[k + 1], sizeof(T)) != 0)) { undo(); return 2; }
+        } else if (bad) { undo(); return 1; }
+    }
+    std::reverse(p + l, p + r);
+    return 0;
 }
 
 /// vsmall_prescan on ymm lanes (same result bits, same settled / prior).
@@ -1293,57 +1364,49 @@ inline unsigned vsmall_prescan_ymm(const T* a, std::size_t n, std::size_t* settl
     using Y = YOps<T>;
     constexpr std::size_t L = Y::V, SB = 4 * L;
     constexpr bool fp = std::is_floating_point<T>::value;
-    const auto finish = [&](unsigned up, unsigned dn, unsigned bad) -> unsigned {
-        if constexpr (fp) bad |= (std::isnan(a[n - 1]) || (a[n - 1] == T(0) && std::signbit(a[n - 1]))) ? 1u : 0u;
-        return (up ? 1u : 0u) | (dn ? 2u : 0u) | (bad ? 4u : 0u);
-    };
-    const auto mixed = [&](unsigned bad) -> unsigned {
-        if constexpr (!fp) { (void)bad; return 3u; }
-        else return bad ? 7u : 11u;
-    };
+    // Bit 2 never set (see vprescan_ymm_run): a full scan's order bits are
+    // exact in key order; a mixed float range reports 11 (cleanliness left to
+    // the checked quicksort).
+    constexpr unsigned kMixed = fp ? 11u : 3u;
     const std::size_t q = ((n - 1) / 4) / SB * SB;
     __m256i U[4], D[4];
-    __mmask8 B[4] = {0, 0, 0, 0};
     for (int t = 0; t < 4; ++t) U[t] = D[t] = _mm256_setzero_si256();
     std::size_t i = 0;
     for (; i < q; i += SB) {
         __m256i nu[4], nd[4];
-        __mmask8 nb[4];
         FYX_VQ_UNROLL for (int t = 0; t < 4; ++t) {
             const T* p = a + std::size_t(t) * q + i;
-            nu[t] = U[t]; nd[t] = D[t]; nb[t] = B[t];
+            nu[t] = U[t]; nd[t] = D[t];
             FYX_VQ_UNROLL for (std::size_t k = 0; k < SB; k += L) {
                 const auto v = Y::loadu(p + k);
                 const auto w = Y::loadu(p + k + 1);
                 const __m256i bv = Y::bits(v);
                 nd[t] = _mm256_or_si256(nd[t], _mm256_xor_si256(Y::bits(Y::vmin(v, w)), bv));
                 nu[t] = _mm256_or_si256(nu[t], _mm256_xor_si256(Y::bits(Y::vmax(v, w)), bv));
-                if constexpr (fp) nb[t] = static_cast<__mmask8>(nb[t] | Y::unclean(v));
             }
         }
         const __m256i au = _mm256_or_si256(_mm256_or_si256(nu[0], nu[1]), _mm256_or_si256(nu[2], nu[3]));
         const __m256i ad = _mm256_or_si256(_mm256_or_si256(nd[0], nd[1]), _mm256_or_si256(nd[2], nd[3]));
         if (!_mm256_testz_si256(au, au) && !_mm256_testz_si256(ad, ad)) break;
-        for (int t = 0; t < 4; ++t) { U[t] = nu[t]; D[t] = nd[t]; B[t] = nb[t]; }
+        for (int t = 0; t < 4; ++t) { U[t] = nu[t]; D[t] = nd[t]; }
     }
     // Sequential rebuild: stream t verified [t*q, t*q + i); gaps scanned.
-    unsigned up = 0, dn = 0, bad = 0;
-    if constexpr (fp) bad = (B[0] | B[1] | B[2] | B[3]) ? 1u : 0u;   // unclean anywhere is still unclean
+    unsigned up = 0, dn = 0;
     for (std::size_t t = 0; t < 4; ++t) {
         const std::size_t s0 = t * q, e = (t == 3) ? n - 1 : (t + 1) * q;
         if (i > 0) {
             const unsigned fu = _mm256_testz_si256(U[t], U[t]) ? 0u : 1u;
             const unsigned fd = _mm256_testz_si256(D[t], D[t]) ? 0u : 1u;
             if (((up | fu) != 0) && ((dn | fd) != 0)) {
-                if (!vprescan_ymm_run<T>(a, s0, s0 + i, up, dn, bad, settled, prior)) return mixed(bad);
+                if (!vprescan_ymm_run<T>(a, s0, s0 + i, up, dn, settled, prior)) return kMixed;
             } else {
                 up |= fu;
                 dn |= fd;
             }
         }
-        if (!vprescan_ymm_run<T>(a, s0 + i, e, up, dn, bad, settled, prior)) return mixed(bad);
+        if (!vprescan_ymm_run<T>(a, s0 + i, e, up, dn, settled, prior)) return kMixed;
     }
-    return finish(up, dn, bad);
+    return (up ? 1u : 0u) | (dn ? 2u : 0u);
 }
 
 template <class T>
@@ -2272,6 +2335,19 @@ inline bool range_bitwise_all_equal(const T* p, std::size_t n) {
     }
 #endif
     return n < 2 || std::memcmp(static_cast<const void*>(p), static_cast<const void*>(p + 1), (n - 1) * sizeof(T)) == 0;
+}
+
+/// Checked tail reverse (see isa_avx512::vreverse_tail_checked); 2 (caller
+/// decides) where no kernel applies.
+template <class T>
+inline int reverse_tail_checked(T* p, std::size_t lo, std::size_t n, bool descending) {
+#if FYX_HAS_AVX512_CODE
+    if constexpr (radix_supported_v<T> && (sizeof(T) == 4 || sizeof(T) == 8)) {
+        if (use_avx512()) return isa_avx512::vreverse_tail_checked(p, lo, n, descending);
+    }
+#endif
+    (void)p; (void)lo; (void)n; (void)descending;
+    return 2;
 }
 
 /// Descent positions (see isa_avx512::vdescent_positions); scalar elsewhere.

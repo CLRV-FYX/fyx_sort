@@ -794,6 +794,10 @@ inline bool try_few_runs_merge(T* p, std::size_t n, bool descending, std::size_t
             if (prev < kq) return false;
             prev = kq;
         }
+        // Vector kernel: hardware order on clean keys; a NaN / -0 hands
+        // back to the key-order loop below (input restored).
+        const int vk = reverse_tail_checked(p, lo, n, descending);
+        if (vk != 2) return vk == 0;
         std::size_t l = lo, r = n;
         auto undo = [&]() {
             for (std::size_t k = 0; k < l - lo; ++k) std::swap(p[lo + k], p[n - 1 - k]);

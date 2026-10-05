@@ -304,6 +304,14 @@ static void run_leaf_and_prescan(const char* tname) {
     // sequential settled / prior rebuilt from per-stream flags.  Breaks in
     // every quarter, at the stream junctions and inside verified chunks;
     // prior must be the exact order bits of the pairs before settled.
+    // Pair flags as the scan defines them: < up, > down, neither with
+    // differing bits (NaN, +-0) both -- exact in key order without a NaN / -0
+    // screen, so bit 2 may stay clear on unclean floats.
+    auto pf = [](T x, T y) -> unsigned {
+        if (x < y) return 1u;
+        if (y < x) return 2u;
+        return std::memcmp(&x, &y, sizeof(T)) != 0 ? 3u : 0u;
+    };
     {
         const std::size_t thr = fd::isa_avx512::kPrescanYmmBytes / sizeof(T);
         for (std::size_t n : {thr + 1, thr + 37, 3 * thr + 5}) {
@@ -314,22 +322,38 @@ static void run_leaf_and_prescan(const char* tname) {
             for (int r = 0; r < 6; ++r) spots.push_back(rng() % (n - 1));
             for (std::size_t b : spots) {
                 if (b + 1 >= n) continue;
-                for (int mode = 0; mode < 5; ++mode) {
+                for (int mode = 0; mode < 8; ++mode) {
+                    if (mode >= 5 && !std::is_floating_point<T>::value) continue;
                     std::vector<T> v(n);
                     // ascending with equal runs; mode 1/3 descending base
-                    for (std::size_t j = 0; j < n; ++j) v[j] = from_u64<T>(j / 3);
+                    // (from_u64 is not monotone for floats: exact small
+                    // integers crossing +0 instead)
+                    for (std::size_t j = 0; j < n; ++j)
+                        v[j] = std::is_floating_point<T>::value
+                                   ? static_cast<T>(static_cast<double>(j / 3) - static_cast<double>(n / 6))
+                                   : from_u64<T>(j / 3);
                     if (mode == 1 || mode == 3) std::reverse(v.begin(), v.end());
                     if (mode <= 1) std::swap(v[b], v[b + 1 < n ? b + 1 : b]);   // one local break (may be equal)
                     if (mode == 0 || mode == 1) { v[b + 1] = v[0 + (mode == 0 ? 0 : n - 1)]; }
                     if (mode == 2 || mode == 3) std::reverse(v.begin() + static_cast<std::ptrdiff_t>(b), v.end());   // organ at b
                     if (mode == 4) std::fill(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(b + 1), v[b + 1]);   // flat prefix, then ascending
                     if constexpr (std::is_floating_point<T>::value)
+                    {
                         if (b % 3 == 0 && mode == 4) v[n - 1] = T(-0.0);
+                        // -0 prefix before +0 / positive keys
+                        if (mode == 5) std::fill(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(b + 1), T(-0.0));
+                        if (mode == 6) v[b] = std::numeric_limits<T>::quiet_NaN();
+                        if (mode == 7) {   // descending, -0 tail after +0 keys
+                            std::reverse(v.begin(), v.end());
+                            std::fill(v.begin() + static_cast<std::ptrdiff_t>(b), v.end(), T(-0.0));
+                        }
+                    }
                     unsigned up = 0, dn = 0;
                     std::size_t m = n;   // first pair index where both directions are seen
                     for (std::size_t j = 0; j + 1 < n; ++j) {
-                        up |= v[j] < v[j + 1];
-                        dn |= v[j + 1] < v[j];
+                        const unsigned f = pf(v[j], v[j + 1]);
+                        up |= f & 1u;
+                        dn |= f >> 1;
                         if (up && dn && m == n) m = j;
                     }
                     bool bad = false;
@@ -340,14 +364,14 @@ static void run_leaf_and_prescan(const char* tname) {
                     const unsigned got = fd::vqsort_small_prescan(v.data(), n, &settled, &prior);
                     bool ok;
                     if (m == n) {
-                        ok = (got & 8u) == 0 && ((got & 4u) != 0) == bad &&
-                             (bad || (got & 3u) == (up | (dn << 1)));
+                        ok = (got & 8u) == 0 && ((got & 4u) == 0 || bad) &&
+                             ((got & 4u) != 0 || (got & 3u) == (up | (dn << 1)));
                     } else {
                         ok = (got & 3u) == 3u && ((got & 4u) == 0 || bad) && !((got & 4u) && (got & 8u)) &&
                              settled <= m && m - settled < 1024;
                         if (ok) {
                             unsigned pu = 0, pd = 0;
-                            for (std::size_t j = 0; j < settled; ++j) { pu |= v[j] < v[j + 1]; pd |= v[j + 1] < v[j]; }
+                            for (std::size_t j = 0; j < settled; ++j) { const unsigned f = pf(v[j], v[j + 1]); pu |= f & 1u; pd |= f >> 1; }
                             ok = prior == (pu | (pd << 1));
                         }
                     }
@@ -737,6 +761,95 @@ static void run_few_valued(const char* tname) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Checked tail reverse (few-run merge's descending tail): the ymm kernel's
+// three outcomes and undo, and whole organ pipes with +-0 / NaN tails
+// against the key order (radix totalOrder: -0 before +0, NaN last).
+// ---------------------------------------------------------------------------
+template <class T>
+static void run_reverse_tail(const char* tname) {
+    constexpr bool fp = std::is_floating_point<T>::value;
+    using RT = fd::RadixTraits<T>;
+    auto bits_eq = [](const std::vector<T>& a, const std::vector<T>& b) {
+        return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
+    };
+    for (std::size_t n : {std::size_t(200), std::size_t(1000), std::size_t(4097), std::size_t(70001)}) {
+        for (std::size_t lo : {std::size_t(0), std::size_t(7), n / 2}) {
+            for (int desc = 0; desc < 2; ++desc) {
+                for (int mode = 0; mode < 6; ++mode) {
+                    if (mode >= 3 && !fp) continue;
+                    std::vector<T> v(n);
+                    for (std::size_t j = 0; j < n; ++j) v[j] = from_u64<T>(rng() % 1000);
+                    // tail non-increasing in sort order (non-decreasing if desc)
+                    std::sort(v.begin() + static_cast<std::ptrdiff_t>(lo), v.end());
+                    if (!desc) std::reverse(v.begin() + static_cast<std::ptrdiff_t>(lo), v.end());
+                    const std::size_t m = n - lo;
+                    const std::size_t b = lo + rng() % (m - 1);
+                    if (mode == 1) std::swap(v[b], v[b + 1]);                                      // maybe a break
+                    if (mode == 2) v[lo + (rng() % 2 ? 0 : m - 1)] = desc ? from_u64<T>(5000) : from_u64<T>(0);   // end break
+                    if constexpr (fp) {
+                        if (mode == 3) {   // a run of +0 then -0 (key order valid for the ascending sort)
+                            const std::size_t z = std::min<std::size_t>(m / 2, 40);
+                            for (std::size_t k = 0; k < z; ++k) v[n - 1 - k] = (k < z / 2) == !desc ? T(-0.0) : T(0.0);
+                            for (std::size_t k = lo; k + z < n; ++k) v[k] = desc ? -std::fabs(v[k]) - 1 : std::fabs(v[k]) + 1;
+                            if (desc) std::sort(v.begin() + static_cast<std::ptrdiff_t>(lo), v.end() - static_cast<std::ptrdiff_t>(z));
+                            else std::sort(v.begin() + static_cast<std::ptrdiff_t>(lo), v.end() - static_cast<std::ptrdiff_t>(z), std::greater<T>());
+                        }
+                        if (mode == 4) v[desc ? n - 1 : lo] = std::numeric_limits<T>::quiet_NaN();   // NaN at the key-max end
+                        if (mode == 5) v[b] = std::numeric_limits<T>::quiet_NaN();                    // NaN inside
+                    }
+                    // key-order verdict
+                    bool keyok = true;
+                    for (std::size_t k = lo; k + 1 < n; ++k) {
+                        const auto a = RT::encode(v[k]), c = RT::encode(v[k + 1]);
+                        if (desc ? (c < a) : (a < c)) keyok = false;
+                    }
+                    const std::vector<T> orig = v;
+                    const int r = fd::reverse_tail_checked(v.data(), lo, n, desc != 0);
+                    bool ok;
+                    if (r == 0) {
+                        std::vector<T> want = orig;
+                        std::reverse(want.begin() + static_cast<std::ptrdiff_t>(lo), want.end());
+                        ok = keyok && bits_eq(v, want);
+                    } else {
+                        ok = bits_eq(v, orig) && (r == 2 ? (fp || !fd::use_avx512()) : !keyok);
+                    }
+                    if (!ok) {
+                        std::printf("  FAIL: %s reverse_tail n=%zu lo=%zu desc=%d mode=%d r=%d keyok=%d\n", tname, n, lo,
+                                    desc, mode, r, static_cast<int>(keyok));
+                        ++failures;
+                    }
+                    ++checks;
+                }
+            }
+        }
+    }
+    if constexpr (fp) {
+        // Whole organ pipes: ascending (key order) front, reversed back half
+        // holding the top keys incl. +-0 / NaN -- bitwise against key order.
+        for (std::size_t n : {std::size_t(1000), std::size_t(100000), std::size_t(300001)}) {
+            for (int mode = 0; mode < 3; ++mode) {
+                std::vector<T> v(n);
+                for (std::size_t j = 0; j < n; ++j) v[j] = from_u64<T>(rng() % 100000) - T(50000);
+                if (mode >= 1) for (std::size_t j = 0; j < n; j += 7) v[j] = (j / 7) % 2 ? T(0.0) : T(-0.0);
+                if (mode == 2) for (std::size_t j = 3; j < n; j += 997) v[j] = std::numeric_limits<T>::quiet_NaN();
+                std::sort(v.begin(), v.end(), [](T a, T c) { return RT::encode(a) < RT::encode(c); });
+                const std::vector<T> want = v;
+                std::reverse(v.begin() + static_cast<std::ptrdiff_t>(n / 2), v.end());
+                fyx::Options o;
+                o.parallel = fyx::Tri::Off;
+                fyx::sort(v.data(), n, o);
+                if (!bits_eq(v, want)) {
+                    std::printf("  FAIL: %s organ +-0/NaN n=%zu mode=%d\n", tname, n, mode);
+                    ++failures;
+                }
+                ++checks;
+            }
+        }
+    }
+    std::printf("  %-8s checked tail reverse ok\n", tname);
+}
+
 int main() {
     std::printf("t_vsort: AVX-512 vectorised quicksort\n");
     std::printf("  kernel present for int32=%d, usable at 70000=%d\n",
@@ -749,6 +862,12 @@ int main() {
     run_type<std::uint64_t>("uint64");
     run_type<float>("float");
     run_type<double>("double");
+    run_reverse_tail<std::int32_t>("int32");
+    run_reverse_tail<std::uint32_t>("uint32");
+    run_reverse_tail<std::int64_t>("int64");
+    run_reverse_tail<std::uint64_t>("uint64");
+    run_reverse_tail<float>("float");
+    run_reverse_tail<double>("double");
 
     run_float_edge<float>("float");
     run_float_edge<double>("double");
