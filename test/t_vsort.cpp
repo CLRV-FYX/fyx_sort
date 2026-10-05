@@ -641,6 +641,41 @@ static void run_new_small_paths(const char* tname) {
     std::printf("  %-8s new small-n paths ok (%d cases)\n", tname, cases);
 }
 
+
+// Few-valued ranges through the vq directly: leaf screen (one / two values
+// rewritten from counts, three or more fall through to the network) and the
+// uniform-sample exit (single-valued ranges above leaf size), at sizes
+// around the leaf and partition boundaries, with values placed so the
+// minimum / maximum / a middle value dominate in turn.
+template <class T>
+static void run_few_valued(const char* tname) {
+    if (!fd::vqsort_usable<T>(100000)) return;
+    std::mt19937_64 g(11);
+    char msg[128];
+    for (std::size_t n : {64ul, 65ul, 100ul, 255ul, 256ul, 257ul, 511ul, 512ul, 513ul, 700ul,
+                          1500ul, 4100ul, 30000ul, 200000ul}) {
+        for (int k : {1, 2, 3, 5, 40}) {
+            for (int skew = 0; skew < 3; ++skew) {
+                std::vector<T> vals(static_cast<std::size_t>(k));
+                for (auto& x : vals) x = from_u64<T>(g());
+                std::vector<T> v(n);
+                for (auto& x : v) {
+                    std::size_t idx = static_cast<std::size_t>(g() % static_cast<std::uint64_t>(k));
+                    // skew 1: 90% the first value; skew 2: one value is rare
+                    if (skew == 1 && g() % 10 != 0) idx = 0;
+                    if (skew == 2 && k > 1 && idx == 0 && g() % 50 != 0) idx = 1;
+                    x = vals[idx];
+                }
+                std::vector<T> ref = v;
+                std::sort(ref.begin(), ref.end());
+                fd::vqsort_serial(v.data(), v.size());
+                std::snprintf(msg, sizeof msg, "few-valued vq %s n=%zu k=%d skew=%d", tname, n, k, skew);
+                CHECK(v == ref, msg);
+            }
+        }
+    }
+}
+
 int main() {
     std::printf("t_vsort: AVX-512 vectorised quicksort\n");
     std::printf("  kernel present for int32=%d, usable at 70000=%d\n",
@@ -675,6 +710,13 @@ int main() {
     run_new_small_paths<std::uint64_t>("uint64");
     run_new_small_paths<float>("float");
     run_new_small_paths<double>("double");
+
+    run_few_valued<std::int32_t>("int32");
+    run_few_valued<std::uint32_t>("uint32");
+    run_few_valued<std::int64_t>("int64");
+    run_few_valued<std::uint64_t>("uint64");
+    run_few_valued<float>("float");
+    run_few_valued<double>("double");
 
     std::printf("checks=%d failures=%d\n", checks, failures);
     if (failures) { std::printf("VSORT TEST FAILURES=%d\n", failures); return 1; }

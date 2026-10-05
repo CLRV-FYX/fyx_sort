@@ -4947,6 +4947,44 @@ inline T vpick_pivot(const T* a, std::size_t n) {
     return s[S / 2];
 }
 
+/// vpick_pivot plus `uniform`: every sample equal (then the range is likely
+/// single-valued -- vall_equal_to decides with one read-only pass).
+template <class T>
+inline T vpick_pivot_u(const T* a, std::size_t n, bool& uniform) {
+#ifndef FYX_VQ_PIVOT_VECS
+    constexpr int S = 2 * VOps<T>::V;
+#else
+    constexpr int S = FYX_VQ_PIVOT_VECS * VOps<T>::V;
+#endif
+    T s[S];
+    const std::size_t step = n / S;
+    for (int i = 0; i < S; ++i) s[i] = a[static_cast<std::size_t>(i) * step + (step >> 1)];
+    vnet_sort<T>(s, static_cast<std::size_t>(S));
+    uniform = !(s[0] < s[S - 1]);
+    return s[S / 2];
+}
+
+/// Every element equal to x (early exit on the first mismatching vector).
+template <class T>
+FYX_FORCE_INLINE bool vall_equal_to(const T* a, std::size_t n, T x) {
+    using P = VOps<T>;
+    using reg = typename P::reg;
+    constexpr std::size_t V = static_cast<std::size_t>(P::V);
+    const reg vx = P::set1(x);
+    std::size_t i = 0;
+    for (; i + 4 * V <= n; i += 4 * V) {
+        const reg a0 = P::loadu(a + i), a1 = P::loadu(a + i + V);
+        const reg a2 = P::loadu(a + i + 2 * V), a3 = P::loadu(a + i + 3 * V);
+        // x <= v <= x per lane, folded: max(v) and min(v) against x
+        const reg mx = P::max(P::max(a0, a1), P::max(a2, a3));
+        const reg mn = P::min(P::min(a0, a1), P::min(a2, a3));
+        if (P::gt(mx, vx) | P::gt(vx, mn)) return false;
+    }
+    for (; i < n; ++i)
+        if (a[i] < x || x < a[i]) return false;
+    return true;
+}
+
 /// Leaf size: 32 vectors, i.e. 512 elements for 4-byte types and 256 for
 /// 8-byte ones.  With the column-network leaf (VColLeaf) a 32-register leaf
 /// beat 16 registers for every width in the standalone kernel benchmark; the
@@ -4959,6 +4997,46 @@ struct VqLeaf {
     static constexpr std::size_t value = static_cast<std::size_t>(FYX_VQ_LEAF_VECS) * static_cast<std::size_t>(VOps<T>::V);
 };
 
+/// Leaf screen for duplicate-heavy inputs: one min/max pass (in L1).  A
+/// single-valued leaf is done; a two-valued one (every key equals the min
+/// or the max) is rewritten from its count.  Few-distinct inputs (a few
+/// hundred keys, each repeated hundreds of times) end most partitions in
+/// such leaves, where the sorting network did thousands of vector ops for
+/// nothing.  True: the leaf is sorted.  Needs n >= V.
+template <class T>
+FYX_FORCE_INLINE bool vleaf_few_values(T* a, std::size_t n) {
+    using P = VOps<T>;
+    using reg = typename P::reg;
+    constexpr std::size_t V = static_cast<std::size_t>(P::V);
+    reg mn = P::loadu(a + n - V), mx = mn;
+    for (std::size_t i = 0; i + V <= n; i += V) {
+        const reg v = P::loadu(a + i);
+        mn = P::min(mn, v);
+        mx = P::max(mx, v);
+    }
+    const T lo = P::reduce_min(mn), hi = P::reduce_max(mx);
+    if (!(lo < hi)) return true;
+    const reg vlo = P::set1(lo), vhi = P::set1(hi);
+    std::size_t nlo = 0, i = 0;
+    for (; i + V <= n; i += V) {
+        const reg v = P::loadu(a + i);
+        // a middle value (lo < v < hi) means three or more keys
+        if (P::gt(v, vlo) & P::gt(vhi, v)) return false;
+        nlo += popcount64(static_cast<std::uint64_t>(static_cast<typename P::mask>(~P::gt(v, vlo))));
+    }
+    for (; i < n; ++i) {
+        if (lo < a[i] && a[i] < hi) return false;
+        nlo += !(lo < a[i]);
+    }
+    std::size_t k = 0;
+    for (; k + V <= nlo; k += V) P::storeu(a + k, vlo);
+    for (; k < nlo; ++k) a[k] = lo;
+    for (; k < n && (k % V) != 0; ++k) a[k] = hi;
+    for (; k + V <= n; k += V) P::storeu(a + k, vhi);
+    for (; k < n; ++k) a[k] = hi;
+    return true;
+}
+
 template <class T>
 inline void vqsort_rec(T* a, std::size_t n, int budget) {
     while (n > VqLeaf<T>::value) {
@@ -4967,7 +5045,12 @@ inline void vqsort_rec(T* a, std::size_t n, int budget) {
             return;
         }
         --budget;
-        const T pivot = vpick_pivot<T>(a, n);
+        bool uniform = false;
+        const T pivot = vpick_pivot_u<T>(a, n, uniform);
+        // All samples equal: on few-distinct inputs most ranges below the
+        // top levels are single-valued, and a read-only check is far cheaper
+        // than the partition pass that would otherwise discover it.
+        if (uniform && vall_equal_to<T>(a, n, pivot)) return;
         // Lean partition: the hot loop tracks only the range maximum (one
         // vector op per partitioned vector, not the two that min+max cost).
         // The minimum is redundant -- `split == 0` proves the pivot is the
@@ -5006,6 +5089,7 @@ inline void vqsort_rec(T* a, std::size_t n, int budget) {
             n = split;
         }
     }
+    if (n >= 4 * static_cast<std::size_t>(VOps<T>::V) && vleaf_few_values<T>(a, n)) return;
     vnet_sort<T>(a, n);
 }
 
@@ -19854,9 +19938,12 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                     return;
                 }
             }
-            // A few hundred to ~2000 distinct keys: hash counting (its gate
-            // routes 4-byte keys with few values per leaf back to the vq).
-            if (detail::try_hash_count_sort(p, n, descending)) {
+            // A few hundred to ~2000 distinct keys: hash counting for 8-byte
+            // keys.  Clean 4-byte ranges stay with the vq: with its leaf
+            // screen (one- / two-valued leaves skip the network) it beats
+            // the table at every measured n and key count (100k x 256 keys:
+            // 1.24 against 2.27 ns/key; 1000 keys: 2.63 against 2.95).
+            if ((sizeof(T) != 4 || !clean) && detail::try_hash_count_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::LowCardinality);
                 return;
             }

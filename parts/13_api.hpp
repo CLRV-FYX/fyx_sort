@@ -11382,9 +11382,12 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                     return;
                 }
             }
-            // A few hundred to ~2000 distinct keys: hash counting (its gate
-            // routes 4-byte keys with few values per leaf back to the vq).
-            if (detail::try_hash_count_sort(p, n, descending)) {
+            // A few hundred to ~2000 distinct keys: hash counting for 8-byte
+            // keys.  Clean 4-byte ranges stay with the vq: with its leaf
+            // screen (one- / two-valued leaves skip the network) it beats
+            // the table at every measured n and key count (100k x 256 keys:
+            // 1.24 against 2.27 ns/key; 1000 keys: 2.63 against 2.95).
+            if ((sizeof(T) != 4 || !clean) && detail::try_hash_count_sort(p, n, descending)) {
                 detail::record_dispatch(detail::DispatchDecision::LowCardinality);
                 return;
             }
