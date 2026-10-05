@@ -805,6 +805,27 @@ static void run_reverse_tail(const char* tname) {
                         if (desc ? (c < a) : (a < c)) keyok = false;
                     }
                     const std::vector<T> orig = v;
+                    {   // no-undo instance: same verdict; else a permutation
+                        std::vector<T> u = v;
+                        const int ru = fd::reverse_tail_checked<T, false>(u.data(), lo, n, desc != 0);
+                        std::vector<T> su = u, so = orig;
+                        auto kl = [](T a, T c) { return RT::encode(a) < RT::encode(c); };
+                        std::sort(su.begin(), su.end(), kl);
+                        std::sort(so.begin(), so.end(), kl);
+                        bool okp = bits_eq(su, so) && std::equal(u.begin(), u.begin() + static_cast<std::ptrdiff_t>(lo), orig.begin());
+                        if (ru == 0) {
+                            std::vector<T> want = orig;
+                            std::reverse(want.begin() + static_cast<std::ptrdiff_t>(lo), want.end());
+                            okp = okp && keyok && bits_eq(u, want);
+                        } else {
+                            okp = okp && (ru == 2 ? (fp || !fd::use_avx512()) : !keyok);
+                        }
+                        if (!okp) {
+                            std::printf("  FAIL: %s reverse_tail no-undo n=%zu lo=%zu desc=%d mode=%d r=%d\n", tname, n, lo, desc, mode, ru);
+                            ++failures;
+                        }
+                        ++checks;
+                    }
                     const int r = fd::reverse_tail_checked(v.data(), lo, n, desc != 0);
                     bool ok;
                     if (r == 0) {
@@ -821,6 +842,45 @@ static void run_reverse_tail(const char* tname) {
                     }
                     ++checks;
                 }
+            }
+        }
+    }
+    // Whole sorts of reverse-like ranges (the dispatcher's fused reverse:
+    // exact reverses, breaks near either end and mid-way, equal runs,
+    // +-0 / NaN), ascending and descending, bitwise against key order.
+    for (std::size_t n : {std::size_t(20000), std::size_t(100000), std::size_t(300001)}) {
+        for (int shape = 0; shape < 8; ++shape) {
+            if (shape >= 6 && !fp) continue;
+            for (int desc = 0; desc < 2; ++desc) {
+                if (desc && shape == 7) continue;   // NaN placement is specified for the ascending order
+                std::vector<T> v(n);
+                for (std::size_t j = 0; j < n; ++j) v[j] = from_u64<T>(rng() % (shape == 1 ? 50 : 1000000));
+                auto kl = [](T a, T c) { return RT::encode(a) < RT::encode(c); };
+                if (shape == 6) for (std::size_t j = 0; j < n; j += 5) v[j] = (j / 5) % 2 ? T(0.0) : T(-0.0);
+                if (shape == 7) for (std::size_t j = 0; j < n; j += 1001) v[j] = std::numeric_limits<T>::quiet_NaN();
+                std::sort(v.begin(), v.end(), kl);
+                if (!desc) std::reverse(v.begin(), v.end());   // input reversed w.r.t. the sort order
+                if (shape == 2) std::swap(v[n / 2], v[n / 2 + 1]);
+                if (shape == 3) std::swap(v[3], v[n - 5]);
+                if (shape == 4) std::swap(v[n - 2], v[n - 1]);
+                if (shape == 5) for (int k = 0; k < 8; ++k) std::swap(v[rng() % n], v[rng() % n]);
+                std::vector<T> want = v;
+                std::sort(want.begin(), want.end(), kl);
+                if (desc) std::reverse(want.begin(), want.end());
+                fyx::Options o;
+                o.parallel = fyx::Tri::Off;
+                if (desc) fyx::sort(v.data(), n, std::greater<T>(), o);
+                else fyx::sort(v.data(), n, o);
+                // equal keys (+-0 aside, which key order separates) may permute: compare keys
+                bool ok = v.size() == want.size();
+                for (std::size_t j = 0; ok && j < n; ++j)
+                    ok = RT::encode(v[j]) == RT::encode(want[j]) || (v[j] != v[j] && want[j] != want[j]) ||
+                         (desc && v[j] == want[j]);   // std::greater leaves +-0 unordered
+                if (!ok) {
+                    std::printf("  FAIL: %s fused reverse sort n=%zu shape=%d desc=%d\n", tname, n, shape, desc);
+                    ++failures;
+                }
+                ++checks;
             }
         }
     }

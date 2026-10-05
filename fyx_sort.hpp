@@ -5312,13 +5312,17 @@ inline bool vprescan_ymm_run(const T* a, std::size_t from, std::size_t to, unsig
 /// like a break -- so the caller's key-order scalar path decides; input
 /// restored.  No NaN / -0 screen otherwise: a pass means every pair is
 /// bitwise equal or strictly ordered, i.e. ordered in key order too.
-template <class T>
+/// Undo = false: on 1 / 2 the blocks already swapped stay swapped (still a
+/// permutation of the input -- for callers that sort it anyway).  A template
+/// parameter, so the few-run merge's instance is unchanged code.
+template <class T, bool Undo = true>
 inline int vreverse_tail_checked(T* p, std::size_t lo, std::size_t n, bool descending) {
     using Y = YOps<T>;
     constexpr std::size_t L = Y::V, B = 8 * L;
     constexpr bool fp = std::is_floating_point<T>::value;
     std::size_t l = lo, r = n;
     auto undo = [&]() {
+        if constexpr (!Undo) return;
         for (std::size_t k = 0; k < l - lo; ++k) std::swap(p[lo + k], p[n - 1 - k]);
     };
     while (r - l >= 2 * B) {
@@ -6346,11 +6350,11 @@ inline bool range_bitwise_all_equal(const T* p, std::size_t n) {
 
 /// Checked tail reverse (see isa_avx512::vreverse_tail_checked); 2 (caller
 /// decides) where no kernel applies.
-template <class T>
+template <class T, bool Undo = true>
 inline int reverse_tail_checked(T* p, std::size_t lo, std::size_t n, bool descending) {
 #if FYX_HAS_AVX512_CODE
     if constexpr (radix_supported_v<T> && (sizeof(T) == 4 || sizeof(T) == 8)) {
-        if (use_avx512()) return isa_avx512::vreverse_tail_checked(p, lo, n, descending);
+        if (use_avx512()) return isa_avx512::vreverse_tail_checked<T, Undo>(p, lo, n, descending);
     }
 #endif
     (void)p; (void)lo; (void)n; (void)descending;
@@ -9602,6 +9606,45 @@ inline bool try_hash_count_sort(T* p, std::size_t n, bool descending) {
         }
         return true;
     }
+}
+
+#ifndef FYX_FUSED_REVERSE_MIN_BYTES
+#define FYX_FUSED_REVERSE_MIN_BYTES (std::size_t(64) << 10)
+#endif
+inline constexpr std::size_t kFusedReverseMinBytes = FYX_FUSED_REVERSE_MIN_BYTES;
+
+/// First key strictly above the last in sort order and 16 strided samples
+/// non-increasing: worth a fused verify+reverse attempt.
+template <class T>
+inline bool looks_reversed(const T* p, std::size_t n, bool descending) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+    if (n < 64 || !(key(p[n - 1]) < key(p[0]))) return false;
+    constexpr std::size_t S = 16;
+    Key prev = key(p[0]);
+    for (std::size_t s = 1; s <= S; ++s) {
+        const Key k = key(p[(n - 1) * s / S]);
+        if (prev < k) return false;
+        prev = k;
+    }
+    return true;
+}
+
+/// Front probe of the small-vq dispatcher: 1 bitwise all-equal; 2 reversed
+/// in place (looks_reversed, then the checked two-ended reverse without
+/// undo -- a break leaves a permutation); 0 neither.  Out of line, one call
+/// in place of the inlined all-equal test: an extra call site in the
+/// dispatcher shifted GCC's inlining of the paths after it (i32 two-run / V
+/// shapes 15-20% slower with the reverse attempt never taken).
+template <class T>
+FYX_NOINLINE int front_order_probe(T* p, std::size_t n, bool descending) {
+    if (range_bitwise_all_equal(p, n)) return 1;
+    if (n * sizeof(T) >= kFusedReverseMinBytes && looks_reversed(p, n, descending) &&
+        reverse_tail_checked<T, false>(p, 0, n, descending) == 0)
+        return 2;
+    return 0;
 }
 
 // A handful of monotone runs (organ pipe, block swaps, concatenations, a
@@ -20048,8 +20091,15 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             // the radix-key scan decides.
             // Bitwise all-equal first: random input differs in the first
             // bytes, and an all-equal range costs one memcmp.
-            if (detail::range_bitwise_all_equal(p, n)) {
-                detail::record_dispatch(detail::DispatchDecision::ProfileAllEqual);
+            // Then a reverse-shaped range (first key above the last in sort
+            // order, 16 strided samples non-increasing) is verified and
+            // reversed in one two-ended pass instead of an order scan plus a
+            // reverse pass (1M uint64: one read + write instead of two reads
+            // + write).  A break leaves the swapped blocks in place -- a
+            // permutation the paths below sort like any other input.
+            if (const int fp = detail::front_order_probe(p, n, descending)) {
+                detail::record_dispatch(fp == 1 ? detail::DispatchDecision::ProfileAllEqual
+                                                : detail::DispatchDecision::ProfileReverse);
                 return;
             }
             std::size_t settled = 0;

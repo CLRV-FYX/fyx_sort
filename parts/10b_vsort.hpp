@@ -1305,13 +1305,17 @@ inline bool vprescan_ymm_run(const T* a, std::size_t from, std::size_t to, unsig
 /// like a break -- so the caller's key-order scalar path decides; input
 /// restored.  No NaN / -0 screen otherwise: a pass means every pair is
 /// bitwise equal or strictly ordered, i.e. ordered in key order too.
-template <class T>
+/// Undo = false: on 1 / 2 the blocks already swapped stay swapped (still a
+/// permutation of the input -- for callers that sort it anyway).  A template
+/// parameter, so the few-run merge's instance is unchanged code.
+template <class T, bool Undo = true>
 inline int vreverse_tail_checked(T* p, std::size_t lo, std::size_t n, bool descending) {
     using Y = YOps<T>;
     constexpr std::size_t L = Y::V, B = 8 * L;
     constexpr bool fp = std::is_floating_point<T>::value;
     std::size_t l = lo, r = n;
     auto undo = [&]() {
+        if constexpr (!Undo) return;
         for (std::size_t k = 0; k < l - lo; ++k) std::swap(p[lo + k], p[n - 1 - k]);
     };
     while (r - l >= 2 * B) {
@@ -2339,11 +2343,11 @@ inline bool range_bitwise_all_equal(const T* p, std::size_t n) {
 
 /// Checked tail reverse (see isa_avx512::vreverse_tail_checked); 2 (caller
 /// decides) where no kernel applies.
-template <class T>
+template <class T, bool Undo = true>
 inline int reverse_tail_checked(T* p, std::size_t lo, std::size_t n, bool descending) {
 #if FYX_HAS_AVX512_CODE
     if constexpr (radix_supported_v<T> && (sizeof(T) == 4 || sizeof(T) == 8)) {
-        if (use_avx512()) return isa_avx512::vreverse_tail_checked(p, lo, n, descending);
+        if (use_avx512()) return isa_avx512::vreverse_tail_checked<T, Undo>(p, lo, n, descending);
     }
 #endif
     (void)p; (void)lo; (void)n; (void)descending;

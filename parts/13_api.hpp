@@ -766,6 +766,45 @@ inline bool try_hash_count_sort(T* p, std::size_t n, bool descending) {
     }
 }
 
+#ifndef FYX_FUSED_REVERSE_MIN_BYTES
+#define FYX_FUSED_REVERSE_MIN_BYTES (std::size_t(64) << 10)
+#endif
+inline constexpr std::size_t kFusedReverseMinBytes = FYX_FUSED_REVERSE_MIN_BYTES;
+
+/// First key strictly above the last in sort order and 16 strided samples
+/// non-increasing: worth a fused verify+reverse attempt.
+template <class T>
+inline bool looks_reversed(const T* p, std::size_t n, bool descending) {
+    using RT  = RadixTraits<T>;
+    using Key = typename RT::Key;
+    const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
+    auto key = [flip](const T& x) -> Key { return static_cast<Key>(RT::encode(x) ^ flip); };
+    if (n < 64 || !(key(p[n - 1]) < key(p[0]))) return false;
+    constexpr std::size_t S = 16;
+    Key prev = key(p[0]);
+    for (std::size_t s = 1; s <= S; ++s) {
+        const Key k = key(p[(n - 1) * s / S]);
+        if (prev < k) return false;
+        prev = k;
+    }
+    return true;
+}
+
+/// Front probe of the small-vq dispatcher: 1 bitwise all-equal; 2 reversed
+/// in place (looks_reversed, then the checked two-ended reverse without
+/// undo -- a break leaves a permutation); 0 neither.  Out of line, one call
+/// in place of the inlined all-equal test: an extra call site in the
+/// dispatcher shifted GCC's inlining of the paths after it (i32 two-run / V
+/// shapes 15-20% slower with the reverse attempt never taken).
+template <class T>
+FYX_NOINLINE int front_order_probe(T* p, std::size_t n, bool descending) {
+    if (range_bitwise_all_equal(p, n)) return 1;
+    if (n * sizeof(T) >= kFusedReverseMinBytes && looks_reversed(p, n, descending) &&
+        reverse_tail_checked<T, false>(p, 0, n, descending) == 0)
+        return 2;
+    return 0;
+}
+
 // A handful of monotone runs (organ pipe, block swaps, concatenations, a
 // rotation, mixed ascending / descending stretches): split into maximal runs
 // (descending ones reversed), then pairwise merges ping-ponging through one
@@ -11210,8 +11249,15 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
             // the radix-key scan decides.
             // Bitwise all-equal first: random input differs in the first
             // bytes, and an all-equal range costs one memcmp.
-            if (detail::range_bitwise_all_equal(p, n)) {
-                detail::record_dispatch(detail::DispatchDecision::ProfileAllEqual);
+            // Then a reverse-shaped range (first key above the last in sort
+            // order, 16 strided samples non-increasing) is verified and
+            // reversed in one two-ended pass instead of an order scan plus a
+            // reverse pass (1M uint64: one read + write instead of two reads
+            // + write).  A break leaves the swapped blocks in place -- a
+            // permutation the paths below sort like any other input.
+            if (const int fp = detail::front_order_probe(p, n, descending)) {
+                detail::record_dispatch(fp == 1 ? detail::DispatchDecision::ProfileAllEqual
+                                                : detail::DispatchDecision::ProfileReverse);
                 return;
             }
             std::size_t settled = 0;
