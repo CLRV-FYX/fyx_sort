@@ -300,6 +300,67 @@ static void run_leaf_and_prescan(const char* tname) {
             ++checks;
         }
     }
+    // Past the ymm threshold: four interleaved quarter streams, the
+    // sequential settled / prior rebuilt from per-stream flags.  Breaks in
+    // every quarter, at the stream junctions and inside verified chunks;
+    // prior must be the exact order bits of the pairs before settled.
+    {
+        const std::size_t thr = fd::isa_avx512::kPrescanYmmBytes / sizeof(T);
+        for (std::size_t n : {thr + 1, thr + 37, 3 * thr + 5}) {
+            const std::size_t q = (n - 1) / 4;
+            std::vector<std::size_t> spots = {0, 1, 63, q - 1, q, q + 1, q + 17, 2 * q - 1, 2 * q,
+                                              2 * q + 300, 3 * q - 2, 3 * q, 3 * q + 5, 4 * q - 1,
+                                              4 * q, n - 3, n - 2, q / 2, q + q / 3, 3 * q + q / 2};
+            for (int r = 0; r < 6; ++r) spots.push_back(rng() % (n - 1));
+            for (std::size_t b : spots) {
+                if (b + 1 >= n) continue;
+                for (int mode = 0; mode < 5; ++mode) {
+                    std::vector<T> v(n);
+                    // ascending with equal runs; mode 1/3 descending base
+                    for (std::size_t j = 0; j < n; ++j) v[j] = from_u64<T>(j / 3);
+                    if (mode == 1 || mode == 3) std::reverse(v.begin(), v.end());
+                    if (mode <= 1) std::swap(v[b], v[b + 1 < n ? b + 1 : b]);   // one local break (may be equal)
+                    if (mode == 0 || mode == 1) { v[b + 1] = v[0 + (mode == 0 ? 0 : n - 1)]; }
+                    if (mode == 2 || mode == 3) std::reverse(v.begin() + static_cast<std::ptrdiff_t>(b), v.end());   // organ at b
+                    if (mode == 4) std::fill(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(b + 1), v[b + 1]);   // flat prefix, then ascending
+                    if constexpr (std::is_floating_point<T>::value)
+                        if (b % 3 == 0 && mode == 4) v[n - 1] = T(-0.0);
+                    unsigned up = 0, dn = 0;
+                    std::size_t m = n;   // first pair index where both directions are seen
+                    for (std::size_t j = 0; j + 1 < n; ++j) {
+                        up |= v[j] < v[j + 1];
+                        dn |= v[j + 1] < v[j];
+                        if (up && dn && m == n) m = j;
+                    }
+                    bool bad = false;
+                    if constexpr (std::is_floating_point<T>::value)
+                        for (T x : v) bad |= (x != x) || (x == T(0) && std::signbit(x));
+                    std::size_t settled = ~std::size_t(0);
+                    unsigned prior = 99;
+                    const unsigned got = fd::vqsort_small_prescan(v.data(), n, &settled, &prior);
+                    bool ok;
+                    if (m == n) {
+                        ok = (got & 8u) == 0 && ((got & 4u) != 0) == bad &&
+                             (bad || (got & 3u) == (up | (dn << 1)));
+                    } else {
+                        ok = (got & 3u) == 3u && ((got & 4u) == 0 || bad) && !((got & 4u) && (got & 8u)) &&
+                             settled <= m && m - settled < 1024;
+                        if (ok) {
+                            unsigned pu = 0, pd = 0;
+                            for (std::size_t j = 0; j < settled; ++j) { pu |= v[j] < v[j + 1]; pd |= v[j + 1] < v[j]; }
+                            ok = prior == (pu | (pd << 1));
+                        }
+                    }
+                    if (!ok) {
+                        std::printf("  FAIL: %s prescan big n=%zu b=%zu mode=%d got=%u settled=%zu m=%zu prior=%u\n",
+                                    tname, n, b, mode, got, settled, m, prior);
+                        ++failures;
+                    }
+                    ++checks;
+                }
+            }
+        }
+    }
     std::printf("  %-8s leaf + prescan ok\n", tname);
 #else
     (void)tname;

@@ -1169,9 +1169,187 @@ FYX_FORCE_INLINE typename VOps<T>::mask vunclean_lanes(typename VOps<T>::reg v) 
     }
 }
 
+/// Lanes 1..V-1 of cur followed by lane 0 of nx: the right neighbours of
+/// cur's lanes from a single new load (valignd / valignq).
+template <class T, class R>
+FYX_FORCE_INLINE R vnext_lanes(R nx, R cur) {
+    if constexpr (std::is_same<T, float>::value)
+        return _mm512_castsi512_ps(_mm512_alignr_epi32(_mm512_castps_si512(nx), _mm512_castps_si512(cur), 1));
+    else if constexpr (std::is_same<T, double>::value)
+        return _mm512_castsi512_pd(_mm512_alignr_epi64(_mm512_castpd_si512(nx), _mm512_castpd_si512(cur), 1));
+    else if constexpr (sizeof(T) == 4)
+        return _mm512_alignr_epi32(nx, cur, 1);
+    else
+        return _mm512_alignr_epi64(nx, cur, 1);
+}
+
+// 256-bit (EVEX ymm) lanes for streaming order scans past L2: a 512-bit
+// loop entered after a few hundred microseconds of non-512-bit work (a copy,
+// the caller's own code) runs its first ~50 us at reduced throughput while
+// the upper vector half powers up -- 1M sorted int32 measured 186 us cold
+// against 128 for the same scan on ymm.  Memory-bound, the narrower lanes
+// cost nothing there; inside L2 the warm 512-bit loop stays faster.  Half
+// a typical L2: 100k uint64 (800 KB, batch-copied) 26.6 -> 21.8 us on ymm;
+// 100k int32 (400 KB) stays faster at 512 bits.
+#ifndef FYX_PRESCAN_YMM_BYTES
+#define FYX_PRESCAN_YMM_BYTES (std::size_t(1) << 19)
+#endif
+inline constexpr std::size_t kPrescanYmmBytes = FYX_PRESCAN_YMM_BYTES;
+
+// Register type by (floating, width) via specialisation: std::conditional
+// over vector types trips -Wignored-attributes.
+template <bool F, std::size_t W> struct YReg { using type = __m256i; };
+template <> struct YReg<true, 4> { using type = __m256; };
+template <> struct YReg<true, 8> { using type = __m256d; };
+
+// Order flags without compare-into-mask (port 5 only on Ice Lake, like
+// valign): min(v, w) ^ v is nonzero exactly where v > w (max: v < w);
+// min / max / xor / or issue on three ports.
+template <class T> struct YOps {
+    static constexpr bool fp = std::is_floating_point<T>::value;
+    static constexpr bool w4 = sizeof(T) == 4;
+    static constexpr std::size_t V = 32 / sizeof(T);
+    using reg = typename YReg<fp, sizeof(T)>::type;
+    FYX_FORCE_INLINE static __m256i bits(__m256i v) { return v; }
+    FYX_FORCE_INLINE static __m256i bits(__m256 v) { return _mm256_castps_si256(v); }
+    FYX_FORCE_INLINE static __m256i bits(__m256d v) { return _mm256_castpd_si256(v); }
+    FYX_FORCE_INLINE static __m256 vmin(__m256 a, __m256 b) { return _mm256_min_ps(a, b); }
+    FYX_FORCE_INLINE static __m256 vmax(__m256 a, __m256 b) { return _mm256_max_ps(a, b); }
+    FYX_FORCE_INLINE static __m256d vmin(__m256d a, __m256d b) { return _mm256_min_pd(a, b); }
+    FYX_FORCE_INLINE static __m256d vmax(__m256d a, __m256d b) { return _mm256_max_pd(a, b); }
+    FYX_FORCE_INLINE static __m256i vmin(__m256i a, __m256i b) {
+        if constexpr (w4) return std::is_signed<T>::value ? _mm256_min_epi32(a, b) : _mm256_min_epu32(a, b);
+        else return std::is_signed<T>::value ? _mm256_min_epi64(a, b) : _mm256_min_epu64(a, b);
+    }
+    FYX_FORCE_INLINE static __m256i vmax(__m256i a, __m256i b) {
+        if constexpr (w4) return std::is_signed<T>::value ? _mm256_max_epi32(a, b) : _mm256_max_epu32(a, b);
+        else return std::is_signed<T>::value ? _mm256_max_epi64(a, b) : _mm256_max_epu64(a, b);
+    }
+    FYX_FORCE_INLINE static reg loadu(const T* p) {
+        if constexpr (fp && w4) return _mm256_loadu_ps(reinterpret_cast<const float*>(p));
+        else if constexpr (fp) return _mm256_loadu_pd(reinterpret_cast<const double*>(p));
+        else return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    }
+    FYX_FORCE_INLINE static __mmask8 unclean(reg v) {
+        if constexpr (fp && w4) return _mm256_fpclass_ps_mask(v, kFpClassUnclean);
+        else if constexpr (fp) return _mm256_fpclass_pd_mask(v, kFpClassUnclean);
+        else { (void)v; return 0; }
+    }
+};
+
+/// Single-stream ymm order scan of the pairs (j, j + 1), j in [from, to),
+/// to <= n - 1.  Accumulates into up / dn / bad; on a mixed block stores
+/// settled = block start, prior = flags before it, returns false.
+template <class T>
+inline bool vprescan_ymm_run(const T* a, std::size_t from, std::size_t to, unsigned& up,
+                             unsigned& dn, unsigned& bad, std::size_t* settled, unsigned* prior) {
+    using Y = YOps<T>;
+    constexpr std::size_t L = Y::V, BL = 8 * L;
+    constexpr bool fp = std::is_floating_point<T>::value;
+    std::size_t i = from;
+    for (; i + BL <= to; i += BL) {
+        __m256i xu = _mm256_setzero_si256(), xd = xu;
+        __mmask8 bb = 0;
+        FYX_VQ_UNROLL for (std::size_t k = 0; k < BL; k += L) {
+            const auto v = Y::loadu(a + i + k);
+            const auto w = Y::loadu(a + i + k + 1);
+            const __m256i bv = Y::bits(v);
+            xd = _mm256_or_si256(xd, _mm256_xor_si256(Y::bits(Y::vmin(v, w)), bv));   // v > w somewhere
+            xu = _mm256_or_si256(xu, _mm256_xor_si256(Y::bits(Y::vmax(v, w)), bv));   // v < w somewhere
+            if constexpr (fp) bb = static_cast<__mmask8>(bb | Y::unclean(v));
+        }
+        const unsigned before = (up ? 1u : 0u) | (dn ? 2u : 0u);
+        up |= _mm256_testz_si256(xu, xu) ? 0u : 1u;
+        dn |= _mm256_testz_si256(xd, xd) ? 0u : 1u;
+        bad |= bb;
+        if (up && dn) {
+            if (settled) *settled = i;
+            if (prior) *prior = before;
+            return false;
+        }
+    }
+    for (; i < to; ++i) {
+        const unsigned before = (up ? 1u : 0u) | (dn ? 2u : 0u);
+        up |= a[i] < a[i + 1] ? 1u : 0u;
+        dn |= a[i + 1] < a[i] ? 1u : 0u;
+        if constexpr (fp) bad |= (std::isnan(a[i]) || (a[i] == T(0) && std::signbit(a[i]))) ? 1u : 0u;
+        if (up && dn) {
+            if (settled) *settled = i;
+            if (prior) *prior = before;
+            return false;
+        }
+    }
+    return true;
+}
+
+/// vsmall_prescan on ymm lanes (same result bits, same settled / prior).
+/// Past L2 the scan is fetch-bound: four interleaved quarter streams keep
+/// more prefetches in flight (1M uint64 sorted, Ice Lake: 262 -> 237 us; one
+/// stream at 512 bits after a copy: ~268 us, 512-bit warm-up penalty).  On a
+/// mixed block the exact sequential settled / prior is rebuilt from the
+/// per-stream flags, scanning only the unverified gaps.
+template <class T>
+inline unsigned vsmall_prescan_ymm(const T* a, std::size_t n, std::size_t* settled, unsigned* prior) {
+    using Y = YOps<T>;
+    constexpr std::size_t L = Y::V, SB = 4 * L;
+    constexpr bool fp = std::is_floating_point<T>::value;
+    const auto finish = [&](unsigned up, unsigned dn, unsigned bad) -> unsigned {
+        if constexpr (fp) bad |= (std::isnan(a[n - 1]) || (a[n - 1] == T(0) && std::signbit(a[n - 1]))) ? 1u : 0u;
+        return (up ? 1u : 0u) | (dn ? 2u : 0u) | (bad ? 4u : 0u);
+    };
+    const auto mixed = [&](unsigned bad) -> unsigned {
+        if constexpr (!fp) { (void)bad; return 3u; }
+        else return bad ? 7u : 11u;
+    };
+    const std::size_t q = ((n - 1) / 4) / SB * SB;
+    __m256i U[4], D[4];
+    __mmask8 B[4] = {0, 0, 0, 0};
+    for (int t = 0; t < 4; ++t) U[t] = D[t] = _mm256_setzero_si256();
+    std::size_t i = 0;
+    for (; i < q; i += SB) {
+        __m256i nu[4], nd[4];
+        __mmask8 nb[4];
+        FYX_VQ_UNROLL for (int t = 0; t < 4; ++t) {
+            const T* p = a + std::size_t(t) * q + i;
+            nu[t] = U[t]; nd[t] = D[t]; nb[t] = B[t];
+            FYX_VQ_UNROLL for (std::size_t k = 0; k < SB; k += L) {
+                const auto v = Y::loadu(p + k);
+                const auto w = Y::loadu(p + k + 1);
+                const __m256i bv = Y::bits(v);
+                nd[t] = _mm256_or_si256(nd[t], _mm256_xor_si256(Y::bits(Y::vmin(v, w)), bv));
+                nu[t] = _mm256_or_si256(nu[t], _mm256_xor_si256(Y::bits(Y::vmax(v, w)), bv));
+                if constexpr (fp) nb[t] = static_cast<__mmask8>(nb[t] | Y::unclean(v));
+            }
+        }
+        const __m256i au = _mm256_or_si256(_mm256_or_si256(nu[0], nu[1]), _mm256_or_si256(nu[2], nu[3]));
+        const __m256i ad = _mm256_or_si256(_mm256_or_si256(nd[0], nd[1]), _mm256_or_si256(nd[2], nd[3]));
+        if (!_mm256_testz_si256(au, au) && !_mm256_testz_si256(ad, ad)) break;
+        for (int t = 0; t < 4; ++t) { U[t] = nu[t]; D[t] = nd[t]; B[t] = nb[t]; }
+    }
+    // Sequential rebuild: stream t verified [t*q, t*q + i); gaps scanned.
+    unsigned up = 0, dn = 0, bad = 0;
+    if constexpr (fp) bad = (B[0] | B[1] | B[2] | B[3]) ? 1u : 0u;   // unclean anywhere is still unclean
+    for (std::size_t t = 0; t < 4; ++t) {
+        const std::size_t s0 = t * q, e = (t == 3) ? n - 1 : (t + 1) * q;
+        if (i > 0) {
+            const unsigned fu = _mm256_testz_si256(U[t], U[t]) ? 0u : 1u;
+            const unsigned fd = _mm256_testz_si256(D[t], D[t]) ? 0u : 1u;
+            if (((up | fu) != 0) && ((dn | fd) != 0)) {
+                if (!vprescan_ymm_run<T>(a, s0, s0 + i, up, dn, bad, settled, prior)) return mixed(bad);
+            } else {
+                up |= fu;
+                dn |= fd;
+            }
+        }
+        if (!vprescan_ymm_run<T>(a, s0 + i, e, up, dn, bad, settled, prior)) return mixed(bad);
+    }
+    return finish(up, dn, bad);
+}
+
 template <class T>
 inline unsigned vsmall_prescan(const T* a, std::size_t n, std::size_t* settled = nullptr,
                                unsigned* prior = nullptr) {
+    if (n * sizeof(T) >= kPrescanYmmBytes) return vsmall_prescan_ymm<T>(a, n, settled, prior);
     using P = VOps<T>;
     using M = typename P::mask;
     constexpr std::size_t L = static_cast<std::size_t>(P::V);
@@ -1179,6 +1357,34 @@ inline unsigned vsmall_prescan(const T* a, std::size_t n, std::size_t* settled =
     M up = 0, dn = 0, bad = 0;
     std::size_t i = 0;
     if (n >= 2) {
+        // Blocks of 8 vectors, settled test once per block: the per-vector
+        // test-and-branch held a sorted scan ~20-25% under the plain stream
+        // (100k int32: 15.6 -> 10.5 us; 1M uint64: 332 -> 267 us).
+        // One load per vector: the neighbour vector is cur shifted by a lane
+        // with the next load's first lane (100k uint64: 27 -> 25 us).
+        constexpr std::size_t BL = 8 * L;
+        auto cur = P::loadu(a);
+        for (; i + BL + L <= n; i += BL) {
+            M bu = 0, bd = 0, bb = 0;
+            FYX_VQ_UNROLL for (std::size_t k = 0; k < BL; k += L) {
+                const auto nx = P::loadu(a + i + k + L);
+                const auto w = vnext_lanes<T>(nx, cur);
+                bu = static_cast<M>(bu | P::gt(w, cur));
+                bd = static_cast<M>(bd | P::gt(cur, w));
+                if constexpr (fp) bb = static_cast<M>(bb | vunclean_lanes<T>(cur));
+                cur = nx;
+            }
+            const unsigned before = (up ? 1u : 0u) | (dn ? 2u : 0u);
+            up  = static_cast<M>(up | bu);
+            dn  = static_cast<M>(dn | bd);
+            bad = static_cast<M>(bad | bb);
+            if (up && dn) {
+                if (settled) *settled = i;
+                if (prior) *prior = before;
+                if constexpr (!fp) return 3u;
+                else return bad ? 7u : 11u;
+            }
+        }
         for (; i + L + 1 <= n; i += L) {
             const auto v = P::loadu(a + i);
             const auto w = P::loadu(a + i + 1);
