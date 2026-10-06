@@ -1845,29 +1845,82 @@ inline unsigned vfew_sample(const T* p, std::size_t n, unsigned cap1, std::size_
 // Bitwise all-equal test: one read stream against a broadcast of p[0]
 // (memcmp(p, p + 1) reads two misaligned streams).  Stops at the first
 // differing vector.
+// Bitwise all-equal test against a broadcast of p[0]; stops at the first
+// differing group.  One unaligned vector first (random input leaves there),
+// then aligned loads from the next vector boundary: an unaligned zmm load
+// splits a cache line every time (100k int32 from a 16-byte aligned
+// buffer: 5.9 -> 3.1 us).  x |= v ^ b is one ternlog (no compare-to-mask on
+// port 5), two independent accumulators, one test per 16 vectors.  Past
+// kPrescanYmmBytes the scan is fetch-bound: ymm (no 512-bit warm-up), four
+// interleaved quarter streams, one accumulator each (800 KB uint64:
+// 17.1 -> 15.8 us).
+#define FYX_ORXOR256(a, v, b) _mm256_ternarylogic_epi32((a), (v), (b), 0xF6)
+#define FYX_ORXOR512(a, v, b) _mm512_ternarylogic_epi32((a), (v), (b), 0xF6)
 template <class T>
 inline bool vall_equal(const T* p, std::size_t n) {
-    constexpr bool k64 = sizeof(T) == 8;
     constexpr std::size_t V = 64 / sizeof(T);
     if (n < V) {
         for (std::size_t i = 1; i < n; ++i) if (std::memcmp(p + i, p, sizeof(T)) != 0) return false;
         return true;
     }
-    __m512i b;
-    if constexpr (k64) { std::uint64_t x; std::memcpy(&x, p, 8); b = _mm512_set1_epi64(static_cast<long long>(x)); }
-    else { std::uint32_t x; std::memcpy(&x, p, 4); b = _mm512_set1_epi32(static_cast<int>(x)); }
-    auto ne = [&](std::size_t i) -> unsigned {
-        const __m512i v = _mm512_loadu_si512(reinterpret_cast<const void*>(p + i));
-        if constexpr (k64) return _mm512_cmpneq_epi64_mask(v, b); else return _mm512_cmpneq_epi32_mask(v, b);
-    };
-    if (ne(0)) return false;               // random input: one vector
-    std::size_t i = V;
-    for (; i + 4 * V <= n; i += 4 * V)
-        if ((ne(i) | ne(i + V) | ne(i + 2 * V) | ne(i + 3 * V)) != 0) return false;
-    for (; i + V <= n; i += V)
-        if (ne(i)) return false;
-    return i == n || ne(n - V) == 0;
+    const auto addr = reinterpret_cast<std::uintptr_t>(p);
+    if (n * sizeof(T) < kPrescanYmmBytes) {
+        __m512i b;
+        if constexpr (sizeof(T) == 8) { std::uint64_t x; std::memcpy(&x, p, 8); b = _mm512_set1_epi64(static_cast<long long>(x)); }
+        else { std::uint32_t x; std::memcpy(&x, p, 4); b = _mm512_set1_epi32(static_cast<int>(x)); }
+        {
+            const __m512i x = _mm512_xor_si512(_mm512_loadu_si512(reinterpret_cast<const void*>(p)), b);
+            if (_mm512_test_epi64_mask(x, x)) return false;
+        }
+        // next 64-byte boundary (element-aligned buffers; else unaligned
+        // loads from V on, still correct)
+        std::size_t i = (addr % sizeof(T)) ? V : ((((addr + 64) & ~std::uintptr_t(63)) - addr) / sizeof(T));
+        __m512i a0 = _mm512_setzero_si512(), a1 = a0;
+        for (; i + 16 * V <= n; i += 16 * V) {
+            FYX_VQ_UNROLL for (std::size_t k = 0; k < 16 * V; k += 2 * V) {
+                a0 = FYX_ORXOR512(a0, _mm512_loadu_si512(reinterpret_cast<const void*>(p + i + k)), b);
+                a1 = FYX_ORXOR512(a1, _mm512_loadu_si512(reinterpret_cast<const void*>(p + i + k + V)), b);
+            }
+            const __m512i x = _mm512_or_si512(a0, a1);
+            if (_mm512_test_epi64_mask(x, x)) return false;
+        }
+        __m512i x = _mm512_or_si512(a0, a1);
+        for (; i + V <= n; i += V) x = FYX_ORXOR512(x, _mm512_loadu_si512(reinterpret_cast<const void*>(p + i)), b);
+        if (i < n) x = FYX_ORXOR512(x, _mm512_loadu_si512(reinterpret_cast<const void*>(p + n - V)), b);
+        return _mm512_test_epi64_mask(x, x) == 0;
+    }
+    constexpr std::size_t L = 32 / sizeof(T), SB = 8 * L;
+    __m256i b;
+    if constexpr (sizeof(T) == 8) { std::uint64_t x; std::memcpy(&x, p, 8); b = _mm256_set1_epi64x(static_cast<long long>(x)); }
+    else { std::uint32_t x; std::memcpy(&x, p, 4); b = _mm256_set1_epi32(static_cast<int>(x)); }
+#define FYX_YLD(i) _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + (i)))
+    {
+        const __m256i x = _mm256_xor_si256(FYX_YLD(0), b);
+        if (!_mm256_testz_si256(x, x)) return false;
+    }
+    // aligned stream starts: h on a 32-byte boundary, q a multiple of SB
+    const std::size_t h = (addr % sizeof(T)) ? L : ((((addr + 32) & ~std::uintptr_t(31)) - addr) / sizeof(T));
+    const std::size_t q = (n - h) / 4 / SB * SB;
+    __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+    for (std::size_t i = h; i < h + q; i += SB) {
+        FYX_VQ_UNROLL for (std::size_t k = 0; k < SB; k += L) {
+            a0 = FYX_ORXOR256(a0, FYX_YLD(i + k), b);
+            a1 = FYX_ORXOR256(a1, FYX_YLD(q + i + k), b);
+            a2 = FYX_ORXOR256(a2, FYX_YLD(2 * q + i + k), b);
+            a3 = FYX_ORXOR256(a3, FYX_YLD(3 * q + i + k), b);
+        }
+        const __m256i x = _mm256_or_si256(_mm256_or_si256(a0, a1), _mm256_or_si256(a2, a3));
+        if (!_mm256_testz_si256(x, x)) return false;
+    }
+    __m256i x = _mm256_or_si256(_mm256_or_si256(a0, a1), _mm256_or_si256(a2, a3));
+    std::size_t i = h + 4 * q;
+    for (; i + L <= n; i += L) x = FYX_ORXOR256(x, FYX_YLD(i), b);
+    if (i < n) x = FYX_ORXOR256(x, FYX_YLD(n - L), b);
+#undef FYX_YLD
+    return _mm256_testz_si256(x, x);
 }
+#undef FYX_ORXOR256
+#undef FYX_ORXOR512
 
 // Positions j in [from, n) with key(p[j]) < key(p[j-1]) in target order,
 // keys encoded as the radix total order (so NaN / -0 agree with the scalar

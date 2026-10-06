@@ -379,14 +379,19 @@ inline std::size_t radix_key_find_break(const T* p, std::size_t start, std::size
 // Neighbour descents (in target order) over the whole range, counted in
 // branch-free 256-pair blocks; stops once the count exceeds `cap` and then
 // returns cap + 1.  `first` gets the start of the 256-pair block holding the
-// first descent (exact position: radix_key_find_break from there).
+// first descent (exact position: radix_key_find_break from there).  With
+// `blk`, the starts of the first blk_cap blocks holding a descent go there
+// (*nblk of them): every such block when the result is <= blk_cap, so a
+// caller can extract the positions from those blocks alone.
 template <class T>
 inline std::size_t count_descents_capped(const T* p, std::size_t n, bool descending,
-                                         std::size_t cap, std::size_t& first, std::size_t from = 1) {
+                                         std::size_t cap, std::size_t& first, std::size_t from = 1,
+                                         std::uint32_t* blk = nullptr, std::size_t blk_cap = 0,
+                                         std::size_t* nblk = nullptr) {
     using RT  = RadixTraits<T>;
     using Key = typename RT::Key;
     const Key flip = descending ? static_cast<Key>(~Key(0)) : Key(0);
-    std::size_t d = 0;
+    std::size_t d = 0, nb = 0;
     first = n;
     for (std::size_t b = from < 1 ? 1 : from; b < n; b += 256) {
         const std::size_t e = std::min(n, b + 256);
@@ -394,11 +399,31 @@ inline std::size_t count_descents_capped(const T* p, std::size_t n, bool descend
         for (std::size_t j = b; j < e; ++j)
             bd = static_cast<Key>(bd + static_cast<Key>(static_cast<Key>(RT::encode(p[j]) ^ flip) <
                                                         static_cast<Key>(RT::encode(p[j - 1]) ^ flip)));
-        if (bd != 0 && first == n) first = b;       // block of the first descent
+        if (bd != 0) {
+            if (first == n) first = b;     // block of the first descent
+            if (nb < blk_cap) blk[nb++] = static_cast<std::uint32_t>(b);
+        }
         d += bd;
-        if (d > cap) return cap + 1;
+        if (d > cap) break;
     }
-    return d;
+    if (nblk != nullptr) *nblk = nb;
+    return d > cap ? cap + 1 : d;
+}
+
+// Positions of all D descents from the nblk block starts that
+// count_descents_capped left in io[] (overwritten with the positions).  Out
+// of line: inlined, the extra call site shifts GCC's inlining of the
+// numeric dispatcher (1M uint32 nearly-sorted 1.7x slower).
+template <class T>
+FYX_NOINLINE bool descent_positions_in_blocks(const T* p, std::size_t n, bool descending,
+                                              std::uint32_t* io, std::size_t nblk, std::size_t D) {
+    std::uint32_t blk[32];
+    if (nblk > 32) return false;
+    std::memcpy(blk, io, nblk * sizeof(std::uint32_t));
+    std::size_t m = 0;
+    for (std::size_t t = 0; t < nblk && m < D; ++t)
+        m += descent_positions(p, blk[t], std::min<std::size_t>(n, blk[t] + 256u), descending, io + m, D - m);
+    return m == D;
 }
 
 // Cheap stand-in for "more than n/16 descents" on random-like input: three
@@ -1193,17 +1218,9 @@ inline bool sparse_outlier_repair_at(T* p, std::size_t n, const std::uint32_t* p
         if (lo > 0 && hi + 1 < n && key(p[hi + 1]) < key(p[lo - 1])) return false;
         q = q2 + 1;
     }
-    // Compact the kept keys to the front, outliers to a small buffer.
+    // Outliers to a small buffer, insertion-sorted by key.
     T out[kMaxD];
-    std::size_t w = rem[0];
-    for (std::size_t q = 0; q < r; ++q) {
-        out[q] = p[rem[q]];
-        const std::size_t s0 = rem[q] + 1;
-        const std::size_t s1 = q + 1 < r ? rem[q + 1] : n;
-        if (s1 > s0) std::memmove(static_cast<void*>(p + w), static_cast<const void*>(p + s0), (s1 - s0) * sizeof(T));
-        w += s1 - s0;
-    }
-    // Insertion-sort the outliers by key.
+    for (std::size_t q = 0; q < r; ++q) out[q] = p[rem[q]];
     for (std::size_t a = 1; a < r; ++a) {
         const T x = out[a];
         const Key kx = key(x);
@@ -1211,9 +1228,14 @@ inline bool sparse_outlier_repair_at(T* p, std::size_t n, const std::uint32_t* p
         while (b > 0 && kx < key(out[b - 1])) { out[b] = out[b - 1]; --b; }
         out[b] = x;
     }
+    // Kept keys are addressed in place: kept index k lives at k plus the
+    // number of removed indices at or before it (rem[] ascending, few).
+    auto orig = [&](std::size_t k) {
+        for (std::size_t q = 0; q < r && rem[q] <= k; ++q) ++k;
+        return k;
+    };
     // Insertion slots (first kept index with key > outlier), all searches
-    // in lockstep: independent branch-free searches overlap their load
-    // latency instead of paying ~log2(n) dependent loads one after another.
+    // in lockstep so their load latencies overlap.
     const std::size_t kept = n - r;
     std::size_t slot[kMaxD];
     Key okey[kMaxD];
@@ -1222,19 +1244,54 @@ inline bool sparse_outlier_repair_at(T* p, std::size_t n, const std::uint32_t* p
     while (len > 1) {
         const std::size_t half = len / 2;
         for (std::size_t b = 0; b < r; ++b)
-            slot[b] += (std::size_t(0) - static_cast<std::size_t>(!(okey[b] < key(p[slot[b] + half])))) & half;
+            slot[b] += (std::size_t(0) - static_cast<std::size_t>(!(okey[b] < key(p[orig(slot[b] + half)])))) & half;
         len -= half;
     }
     if (len == 1)
-        for (std::size_t b = 0; b < r; ++b) slot[b] += static_cast<std::size_t>(!(okey[b] < key(p[slot[b]])));
-    // Insert from the back: each kept key moves once.
-    std::size_t hi = kept;
-    for (std::size_t b = r; b-- > 0;) {
-        const std::size_t lo = slot[b];
-        shift_up_small(p + lo, hi - lo, b + 1);
-        p[lo + b] = out[b];
-        hi = lo;
+        for (std::size_t b = 0; b < r; ++b) slot[b] += static_cast<std::size_t>(!(okey[b] < key(p[orig(slot[b])])));
+    // Kept key k moves from k + R(k) (removed before it) to k + C(k)
+    // (outliers placed before it): piecewise constant between the
+    // breakpoints rem[q] - q and slot[b].  Segments with no net shift --
+    // everything between the two ends of a far swap -- stay where they
+    // are; left-moving segments go left to right, then right-moving ones
+    // right to left (C, R non-decreasing: no move overwrites a source that
+    // is still to be read).
+    std::size_t bp[2 * kMaxD + 2];
+    std::size_t nb = 0;
+    for (std::size_t q = 0; q < r; ++q) {
+        const std::size_t x[2] = {rem[q] - q, slot[q]};
+        for (std::size_t x1 : x) {
+            if (x1 == 0 || x1 >= kept) continue;
+            std::size_t j = nb++;
+            while (j > 0 && bp[j - 1] > x1) { bp[j] = bp[j - 1]; --j; }
+            bp[j] = x1;
+        }
     }
+    {
+        std::size_t u = 0;
+        for (std::size_t j = 0; j < nb; ++j) if (u == 0 || bp[u - 1] != bp[j]) bp[u++] = bp[j];
+        nb = u;
+    }
+    struct Seg { std::size_t k0, len, src, dst; };
+    Seg seg[2 * kMaxD + 2];
+    std::size_t ns = 0;
+    {
+        std::size_t k0 = 0, R = 0, C = 0;
+        for (std::size_t t = 0; t <= nb; ++t) {
+            const std::size_t k1 = t < nb ? bp[t] : kept;
+            while (R < r && rem[R] - R <= k0) ++R;
+            while (C < r && slot[C] <= k0) ++C;
+            if (k1 > k0) seg[ns++] = Seg{k0, k1 - k0, k0 + R, k0 + C};
+            k0 = k1;
+        }
+    }
+    for (std::size_t t = 0; t < ns; ++t)
+        if (seg[t].dst < seg[t].src)
+            std::memmove(static_cast<void*>(p + seg[t].dst), static_cast<const void*>(p + seg[t].src), seg[t].len * sizeof(T));
+    for (std::size_t t = ns; t-- > 0;)
+        if (seg[t].dst > seg[t].src)
+            std::memmove(static_cast<void*>(p + seg[t].dst), static_cast<const void*>(p + seg[t].src), seg[t].len * sizeof(T));
+    for (std::size_t b = 0; b < r; ++b) p[slot[b] + b] = out[b];
     return true;
 }
 
@@ -11331,8 +11388,15 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                 } else if (detail::descents_look_dense(p, n, descending)) {
                     D = n / 16 + 1;        // random-like: skip the n/8-pair count
                 } else {
-                    D = detail::count_descents_capped(p, n, descending, n / 16, brk, mono);
+                    // (block starts of the first descents: positions for the
+                    // outlier repair come from those blocks alone)
+                    std::size_t nblk = 0;
+                    D = detail::count_descents_capped(p, n, descending, n / 16, brk, mono,
+                                                      n <= 0xFFFFFFFFull ? dpos : nullptr, 32, &nblk);
+                    if (D <= 32 && nblk != 0 && !detail::descent_positions_in_blocks(p, n, descending, dpos, nblk, D))
+                        D = 33;                    // (cannot happen) no repair then
                 }
+                const bool pos_ok = have_pos || (D <= 32 && n <= 0xFFFFFFFFull);   // dpos holds all D
                 if (D == 1) {
                     // Two runs (concatenated sorted halves, a rotation).
                     brk = detail::radix_key_find_break(p, brk, n, detail::RadixTraits<T>::encode(p[brk - 1]),
@@ -11360,8 +11424,16 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                     // Sparse descents: mostly sorted.  Local displacements go
                     // to bounded insertion, permuted blocks to the structural
                     // proof, a minority of far / tail keys to extract-merge.
+                    // Up to 32 isolated outliers (far swaps, a few misplaced
+                    // keys): the outlier repair is about one scan and leaves
+                    // the range untouched when it declines -- before the
+                    // insertion repair, which a far key exhausts only after
+                    // n / 4 moves (1M double far swaps: 2.0 -> ~0.3 ms).
+                    if (D <= 32 && pos_ok && detail::sparse_outlier_repair_at(p, n, dpos, D, descending)) {
+                        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
+                        return;
+                    }
                     const std::size_t head = std::min<std::size_t>(n - 1, 256);
-                    bool pos_fresh = have_pos;
                     if (D <= n / 128 &&
                         detail::head_inversions_within(p, n, descending, head, head / 32) &&
                         detail::descents_look_local(p, n, brk, descending, 96, 4)) {
@@ -11369,15 +11441,9 @@ inline void sort_pointer_core_impl(T* p, std::size_t n, Comp comp, const Options
                             detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                             return;
                         }
-                        pos_fresh = false;     // a declined repair leaves a permutation
                     }
                     if (detail::try_proof_structured_sort(p, n, descending)) {
                         detail::record_dispatch(detail::DispatchDecision::ProfileSorted);
-                        return;
-                    }
-                    if (D <= 32 && (pos_fresh ? detail::sparse_outlier_repair_at(p, n, dpos, D, descending)
-                                              : detail::try_sparse_outlier_repair(p, n, 1, descending))) {
-                        detail::record_dispatch(detail::DispatchDecision::PartialPdq);
                         return;
                     }
                     // Sorted prefix of at least half the range, disorder only

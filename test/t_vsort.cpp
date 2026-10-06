@@ -762,6 +762,54 @@ static void run_few_valued(const char* tname) {
 }
 
 // ---------------------------------------------------------------------------
+// Bitwise all-equal scan: both paths (aligned zmm below kPrescanYmmBytes,
+// four aligned ymm streams past it), element-misaligned starts, and one
+// differing element at the head, around the alignment point, at stream
+// starts / ends and in the tail.
+// ---------------------------------------------------------------------------
+template <class T>
+static void run_all_equal_scan(const char* tname) {
+#if FYX_HAS_AVX512_CODE
+    if (!fd::use_avx512()) return;
+    const std::size_t thr = fd::isa_avx512::kPrescanYmmBytes / sizeof(T);
+    for (std::size_t n : {std::size_t(1), std::size_t(15), std::size_t(17), std::size_t(300), std::size_t(4099),
+                          thr - 1, thr, thr + 77, 2 * thr + 3}) {
+        for (std::size_t off = 0; off < 4; ++off) {
+            std::vector<T> buf(n + 8);
+            T* p = buf.data() + off;
+            const T base = from_u64<T>(12345);
+            std::fill(p, p + n, base);
+            bool ok = fd::isa_avx512::vall_equal(p, n);
+            const std::size_t q = n / 4;
+            std::vector<std::size_t> spots = {0, 1, n / 2, n - 1, 15, 16, 17, 31, 32, 33, q - 1, q, q + 1,
+                                              2 * q, 3 * q - 1, 3 * q, 4 * q - 1, 4 * q, n - 2, n - 9};
+            for (int r = 0; r < 8; ++r) spots.push_back(rng() % n);
+            for (std::size_t j : spots) {
+                if (j >= n || n < 2) continue;   // one key is all-equal whatever it is
+                T alt = from_u64<T>(777);
+                if constexpr (std::is_floating_point<T>::value)
+                    if (j % 2) { std::fill(p, p + n, T(0.0)); alt = T(-0.0); }   // bitwise, not ==
+                const T keep = p[j];
+                p[j] = alt;
+                ok = ok && !fd::isa_avx512::vall_equal(p, n);
+                p[j] = keep;
+                ok = ok && fd::isa_avx512::vall_equal(p, n);
+                std::fill(p, p + n, base);
+            }
+            if (!ok) {
+                std::printf("  FAIL: %s vall_equal n=%zu off=%zu\n", tname, n, off);
+                ++failures;
+            }
+            ++checks;
+        }
+    }
+    std::printf("  %-8s all-equal scan ok\n", tname);
+#else
+    (void)tname;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Checked tail reverse (few-run merge's descending tail): the ymm kernel's
 // three outcomes and undo, and whole organ pipes with +-0 / NaN tails
 // against the key order (radix totalOrder: -0 before +0, NaN last).
@@ -922,6 +970,12 @@ int main() {
     run_type<std::uint64_t>("uint64");
     run_type<float>("float");
     run_type<double>("double");
+    run_all_equal_scan<std::int32_t>("int32");
+    run_all_equal_scan<std::uint32_t>("uint32");
+    run_all_equal_scan<std::int64_t>("int64");
+    run_all_equal_scan<std::uint64_t>("uint64");
+    run_all_equal_scan<float>("float");
+    run_all_equal_scan<double>("double");
     run_reverse_tail<std::int32_t>("int32");
     run_reverse_tail<std::uint32_t>("uint32");
     run_reverse_tail<std::int64_t>("int64");

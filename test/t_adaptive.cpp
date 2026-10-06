@@ -865,6 +865,79 @@ static void check_kv16_vqsort() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// 4. sparse-outlier repair (segment moves): random swap counts, clustered,
+//    end and duplicate-heavy cases, both position sources; direct calls must
+//    sort or decline untouched, the public entry must sort either direction.
+// ---------------------------------------------------------------------------
+template <class T>
+static T sparse_val(std::uint64_t i, bool dup) {
+    const std::uint64_t k = dup ? i / 7 : i * 3;
+    if constexpr (std::is_floating_point<T>::value) return static_cast<T>(static_cast<double>(k) - 5000.0);
+    else return static_cast<T>(k);
+}
+template <class T>
+static void check_sparse_outliers(const char* tname) {
+    int bad = 0;
+    for (std::size_t n : {std::size_t(64), std::size_t(100), std::size_t(1000), std::size_t(4095),
+                          std::size_t(4097), std::size_t(10000), std::size_t(100000)}) {
+        for (int trial = 0; trial < 40; ++trial) {
+            const bool dup = trial % 3 == 0;
+            std::vector<T> v(n);
+            for (std::size_t i = 0; i < n; ++i) v[i] = sparse_val<T>(i, dup);
+            const int swaps = 1 + static_cast<int>(rng() % 24);
+            const int mode = trial % 6;
+            for (int k = 0; k < swaps && mode >= 4; ++k) {
+                // single-key moves: net shifts of either sign between the
+                // removal and insertion points (mode 5: all moved left)
+                std::size_t x = rng() % n, y = rng() % n;
+                if (mode == 5 && y > x) std::swap(x, y);
+                const T t = v[x];
+                v.erase(v.begin() + static_cast<std::ptrdiff_t>(x));
+                v.insert(v.begin() + static_cast<std::ptrdiff_t>(y), t);
+            }
+            for (int k = 0; k < swaps && mode < 4; ++k) {
+                std::size_t i = rng() % n, j = rng() % n;
+                if (mode == 1) j = std::min(n - 1, i + 1 + rng() % 3);          // clustered
+                if (mode == 2) { i = (k & 1) ? 0 : n - 1; j = rng() % n; }      // ends
+                if (mode == 3) j = std::min(n - 1, i + rng() % 40);             // near
+                std::swap(v[i], v[j]);
+            }
+            std::vector<T> expect = v;
+            std::sort(expect.begin(), expect.end());
+            std::uint32_t pos[64];
+            const std::size_t D = fyx::detail::descent_positions(v.data(), 1, n, false, pos, 33);
+            if (D <= 32) {
+                std::uint32_t pos2[32];
+                std::size_t first = 0;
+                std::size_t nblk = 0;
+                const std::size_t D2 = fyx::detail::count_descents_capped(v.data(), n, false, n, first, 1, pos2, 32, &nblk);
+                const bool got = D2 == D && (D == 0 || fyx::detail::descent_positions_in_blocks(v.data(), n, false, pos2, nblk, D));
+                if (!got || !std::equal(pos, pos + D, pos2)) { ++bad; std::printf("  FAIL: %s count positions n=%zu\n", tname, n); }
+                std::vector<T> w = v;
+                const bool fired = fyx::detail::sparse_outlier_repair_at(w.data(), n, pos, D, false);
+                if (fired ? (w != expect) : (w != v)) {
+                    ++bad;
+                    std::printf("  FAIL: %s sparse repair n=%zu swaps=%d mode=%d fired=%d\n", tname, n, swaps, mode, (int)fired);
+                }
+            }
+            for (int dir = 0; dir < 2; ++dir) {
+                std::vector<T> w = v;
+                fyx::Options o;
+                o.parallel = fyx::Tri::Off;
+                if (dir) fyx::sort(w.begin(), w.end(), std::greater<T>(), o);
+                else fyx::sort(w.begin(), w.end(), o);
+                std::vector<T> e = expect;
+                if (dir) std::reverse(e.begin(), e.end());
+                if (w != e) { ++bad; std::printf("  FAIL: %s sparse sort n=%zu dir=%d\n", tname, n, dir); }
+            }
+            ++checks;
+        }
+    }
+    failures += bad;
+    std::printf("  %-8s sparse outliers %s\n", tname, bad ? "FAILED" : "ok");
+}
+
 int main() {
     std::printf("adaptive: public entry point, every shape\n");
     check_shapes<std::int32_t>("int32", 300000, nullptr);
@@ -882,6 +955,9 @@ int main() {
 
     std::printf("adaptive: cheap rejection on high-entropy input\n");
     check_random_declines();
+    check_sparse_outliers<std::int32_t>("int32");
+    check_sparse_outliers<std::uint64_t>("uint64");
+    check_sparse_outliers<double>("double");
 
     std::printf("adaptive: floating point total order\n");
     check_float_order();
